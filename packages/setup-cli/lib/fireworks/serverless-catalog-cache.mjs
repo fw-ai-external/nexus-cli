@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { writeFileAtomicSync } from "../io/atomic-write.mjs";
+import { ensurePrivateParent } from "../io/private-files.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -41,6 +43,10 @@ export function scopedCacheFilePath(filename, home = process.env.HOME ?? os.home
 
 function cacheFilePath(home) {
   return scopedCacheFilePath("catalog-cache.json", home);
+}
+
+export function ensureCacheParent(file) {
+  ensurePrivateParent(file);
 }
 
 function pairs(map) {
@@ -137,12 +143,12 @@ function persistSnapshot(snapshot, keyFingerprint) {
       rmSync(file, { force: true });
       return cachedAt;
     }
-    mkdirSync(path.dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({
+    ensureCacheParent(file);
+    writeFileAtomicSync(file, JSON.stringify({
       cachedAt,
       ...(keyFingerprint ? { keyFingerprint } : {}),
       snapshot: serializeSnapshot(snapshot),
-    }));
+    }), { mode: 0o600 });
   } catch {
     // Best-effort — a failed persist must never break catalog loading.
   }
@@ -221,7 +227,8 @@ export function expireCatalogCache(home) {
   try {
     const file = cacheFilePath(home);
     const value = JSON.parse(readFileSync(file, "utf8"));
-    writeFileSync(file, JSON.stringify({ ...value, cachedAt: 0 }));
+    ensureCacheParent(file);
+    writeFileAtomicSync(file, JSON.stringify({ ...value, cachedAt: 0 }), { mode: 0o600 });
   } catch {
     // Best-effort, like every other cache write.
   }

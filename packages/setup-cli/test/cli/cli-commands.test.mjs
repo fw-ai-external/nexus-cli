@@ -284,6 +284,7 @@ describe("fireconnect version", () => {
     const { code, stderr, json } = await runCliJson(["--version", "--json"]);
     assert.equal(code, 0, stderr);
     assert.equal(json.version, pkg.version);
+    assert.deepEqual(json.capabilities, ["login-account-type-v1", "login-json", "logout-json", "login-json-key-expiry", "login-json-previous-key", "key-actions-v1", "paste-code"]);
   });
 
   test("supports -V --json", async () => {

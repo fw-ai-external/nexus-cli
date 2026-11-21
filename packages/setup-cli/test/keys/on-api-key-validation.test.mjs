@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { access, readFile } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import path from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";

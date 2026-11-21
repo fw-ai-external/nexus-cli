@@ -83,15 +83,19 @@ export const TOKEN_COLUMNS = [
 export const TOKEN_COLUMNS_WIDTH = TOKEN_COLUMNS.reduce((n, c) => n + c.width, 0)
   + (TOKEN_COLUMNS.length - 1);
 
-/** Model badge column — 8 fits "GLM5.2" and "Opus5" but not two models joined. */
-export const MODEL_COL = 8;
+/**
+ * Model badge column — 12 fits full Fireworks and OpenAI badges ("GLM5.3Fast",
+ * "GPT-6.2Sol", "nexus/auto") as well as Claude's ("Opus4.6"). Keep equal to
+ * `BADGE_MAX` in meter-model.mjs, which can't import from this module.
+ */
+export const MODEL_COL = 12;
 
 /**
- * Footer model-name column — full priced labels ("GLM 5.3 Flash (US)"), not the
- * compact turn-badge width. Footer rows start their numeric block further right
- * than turn rows so names stay readable without colliding with "GLM 5.3".
+ * Footer model-name column — full priced labels ("GLM 5.3 Fast (Latest)"), not
+ * the compact turn-badge width. Footer rows start their numeric block further
+ * right than turn rows so names stay readable without colliding with "GLM 5.3".
  */
-export const FOOTER_MODEL_COL = 18;
+export const FOOTER_MODEL_COL = 22;
 
 /** Cost column — wide enough for "$1234.5678". */
 export const COST_COL = 10;
@@ -110,16 +114,6 @@ export const TURN_NO_PREFIX = `    ${"#".padStart(TURN_NO_WIDTH)} `;
 
 /** Footer share column ("100%"). */
 export const SHARE_COL = 5;
-
-/**
- * Width of everything left of the numeric block, shared by the header, turn
- * rows, and footer rows.
- *
- * The footer's `● label` prefix is narrower than the header's `# model`, so
- * without a common width its numbers sit three columns left of the headings they
- * are read against.
- */
-export const LABEL_BLOCK = TURN_NO_PREFIX.length + MODEL_COL;
 
 /** Gutter + coloured dot that opens a footer model row, before its label. */
 export const FOOTER_LABEL_INDENT = 4;

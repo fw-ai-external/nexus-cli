@@ -15,12 +15,14 @@ import {
 } from "../../lib/demo/demo-models.mjs";
 import { setServerlessCatalogSnapshot } from "../../lib/fireworks/serverless-catalog-cache.mjs";
 import { buildServerlessCatalogSnapshot } from "../../lib/fireworks/models.mjs";
-import { mockServerlessModel } from "../helpers.mjs";
+import { mockServerlessModel, mockServerlessModelRows } from "../helpers.mjs";
 
 // Alias routers (`glm-latest`, `kimi-fast-latest`, …) are API-reported per-row
 // `aliases` now, so warm a snapshot to populate the offline demo picker.
+// Each alias sits on a model whose matching serving mode is listed (a
+// `-fast-latest` alias needs the fast row).
 const DEMO_ALIAS_ROWS = [
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/glm-5p2",
     aliases: [
       "accounts/fireworks/routers/glm-latest",
@@ -29,6 +31,7 @@ const DEMO_ALIAS_ROWS = [
   }),
   mockServerlessModel({
     name: "accounts/fireworks/models/kimi-k3",
+    serverless_mode: "fast",
     usage_identifier: "accounts/fireworks/routers/kimi-k3-fast",
     aliases: ["accounts/fireworks/routers/kimi-fast-latest"],
   }),
@@ -212,9 +215,31 @@ test("demoModelRates: anthropic slot ignores the live slot mapping — always re
   }
 });
 
+test("the default Fireworks side comes from the served catalog", () => {
+  withDemoCatalog(() => {
+    assert.equal(defaultRightModel(), "glm-fast-latest");
+  });
+  // The preferred default isn't served (its mode is blocked, say): the first
+  // served picker model stands in.
+  setServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([DEMO_ALIAS_ROWS[0], DEMO_ALIAS_ROWS[2]]));
+  refreshDemoPickerFromServerlessCatalog();
+  try {
+    assert.equal(defaultRightModel(), "glm-latest");
+  } finally {
+    setServerlessCatalogSnapshot(null);
+    refreshDemoPickerFromServerlessCatalog();
+  }
+  // No catalog at all (cold cache, offline): only the always-served auto mix,
+  // never a static alias list.
+  assert.equal(defaultRightModel(), "auto");
+  assert.deepEqual(
+    demoModelCatalog().filter((entry) => entry.kind !== "anthropic").map((entry) => entry.id),
+    ["auto"],
+  );
+});
+
 test("defaults and display labels", () => {
   assert.equal(defaultLeftModel(), "opus");
-  assert.equal(defaultRightModel(), "glm-fast-latest");
   assert.match(demoSideDisplayLabel("opus"), /^Anthropic · /);
   assert.match(demoSideDisplayLabel("glm-fast-latest"), /^Fireworks · /);
   assert.equal(demoModelLabel("opus"), "Claude Opus 5");

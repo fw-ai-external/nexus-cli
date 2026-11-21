@@ -40,11 +40,6 @@ export function curatedDemoModels() {
   return demoModelCatalog();
 }
 
-/** @deprecated */
-export function curatedChallengers() {
-  return demoModelCatalog().filter((m) => m.kind !== "anthropic");
-}
-
 /**
  * @param {{ defaults: object }} args
  */

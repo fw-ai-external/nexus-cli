@@ -1,10 +1,8 @@
 import { ensureIdeStopped, isIdeRunning, quitInstruction } from "../../io/ide-running.mjs";
 import {
   applyItemTableWrites,
-  deleteItemTableValue,
   ensureItemTable,
   readItemTableValue,
-  writeItemTableValue,
 } from "../vscode/vscdb-sqlite.mjs";
 
 /* -------------------------------------------------------------------------- */
@@ -14,8 +12,6 @@ import {
 /* -------------------------------------------------------------------------- */
 
 export const readCursorValue = readItemTableValue;
-export const writeCursorValue = writeItemTableValue;
-export const deleteCursorValue = deleteItemTableValue;
 export const applyCursorWrites = applyItemTableWrites;
 export const ensureCursorTable = ensureItemTable;
 

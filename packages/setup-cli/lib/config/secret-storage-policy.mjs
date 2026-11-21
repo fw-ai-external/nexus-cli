@@ -11,18 +11,21 @@ import { readKeyStorageOverride } from "../keys/storage-env.mjs";
 /**
  * On Linux SSH/WSL, prefer encrypted-file storage over libsecret. Secret
  * Service is often detected (secret-tool installed) but unusable without an
- * unlocked session keyring.
+ * unlocked session keyring. A desktop session uses the file too once it holds
+ * a key (`fileKeyPresent`), so the desktop and SSH sessions on one machine
+ * read and write the same copy.
  *
+ * @param {{ fileKeyPresent?: boolean }} [opts]
  * @returns {boolean}
  */
-export function shouldPreferFileBackendOnLinux() {
+export function shouldPreferFileBackendOnLinux({ fileKeyPresent = false } = {}) {
   if (process.platform !== "linux") {
     return false;
   }
   if (readKeyStorageOverride()) {
     return false;
   }
-  return isRemoteContext();
+  return isRemoteContext() || fileKeyPresent;
 }
 
 /**

@@ -111,6 +111,46 @@ describe("claudeFireconnectIntent", () => {
     assert.equal(intent?.mode, "direct");
     assert.equal(intent?.mapping.main, "claude-sonnet-5");
   });
+
+  const routedV1 = "https://api.fireworks.ai/inference/v1";
+
+  it("does not read a blank header line as Nexus telemetry", () => {
+    const settings = { env: { ANTHROPIC_BASE_URL: routedV1, ANTHROPIC_CUSTOM_HEADERS: "x-custom: 1\n" } };
+    assert.equal(claudeFireconnectIntent(settings), null);
+  });
+
+  it("still reads the X-Title telemetry line as Nexus wiring", () => {
+    const settings = { env: { ANTHROPIC_BASE_URL: routedV1, ANTHROPIC_CUSTOM_HEADERS: "x-custom: 1\nX-Title: Claude Code\n" } };
+    assert.equal(claudeFireconnectIntent(settings)?.hostname, "api.fireworks.ai");
+  });
+
+  it("treats a retired Fire Pass key header with a mapping as Nexus wiring", () => {
+    const settings = {
+      env: {
+        ANTHROPIC_BASE_URL: routedV1,
+        ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fpk_synthetic",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "example-model",
+      },
+    };
+    assert.equal(claudeFireconnectIntent(settings)?.mapping.sonnet, "example-model");
+  });
+
+  it("treats the pre-0.9 router key header as Nexus wiring", () => {
+    const settings = {
+      env: { ANTHROPIC_BASE_URL: routedV1, ANTHROPIC_CUSTOM_HEADERS: "x-firerouter-fireworks-key: fw_synthetic" },
+    };
+    assert.equal(claudeFireconnectIntent(settings)?.hostname, "api.fireworks.ai");
+  });
+});
+
+describe("stripFireworksOwnedEnv legacy router header", () => {
+  it("removes the pre-0.9 router key line and keeps the user's lines", () => {
+    const { env, changed } = stripFireworksOwnedEnv({
+      ANTHROPIC_CUSTOM_HEADERS: "x-firerouter-fireworks-key: fw_synthetic\nX-Custom: keep",
+    });
+    assert.equal(changed, true);
+    assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, "X-Custom: keep");
+  });
 });
 
 describe("disableFireworksProvider legacy backup header restore", () => {

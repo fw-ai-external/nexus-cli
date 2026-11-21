@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
@@ -12,8 +12,11 @@ import {
   opencodeBackupPath,
   opencodeConfigPath,
   opencodeDataDir,
+  shouldSnapshotOpencodeConfig,
 } from "../../../lib/harnesses/opencode/core.mjs";
+import { opencodeV2ProviderEntry } from "../../../lib/harnesses/opencode/providers-v2.mjs";
 import { readJsonIfExists } from "../../../lib/io/json.mjs";
+import { writeGlobalConfig } from "../../../lib/config/global-config.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import {
   cacheServerlessCatalogSnapshot,
@@ -82,7 +85,7 @@ describe("opencode harness integration", () => {
     // Alias routers resolve from API-reported `aliases`; seed the GLM 5.2 row
     // the flat catalog reports for glm-fast-latest.
     seedServerlessCatalogRows(home, [
-      mockServerlessModel({
+      ...mockServerlessModelRows({
         aliases: ["accounts/fireworks/routers/glm-fast-latest"],
       }),
     ]);
@@ -464,6 +467,186 @@ describe("opencode harness integration", () => {
     assert.equal(await readFile(configPath, "utf8"), original);
   });
 
+  it("re-on after Nexus state is lost does not snapshot Nexus routing; off strips it", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-lost-state-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = {
+      theme: "example-theme",
+      provider: { user: { options: { baseURL: "https://user.example/v1" } } },
+    };
+    await writeFile(configPath, `${JSON.stringify(original, null, 2)}\n`);
+    const login = () => runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+
+    await login();
+    const first = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(first.code, 0, first.stderr);
+
+    // Nexus's data dir (backup + enabled flag) is gone, but opencode.json
+    // still carries the routing Nexus wrote.
+    await rm(path.join(home, ".nexus"), { recursive: true, force: true });
+    await login();
+    const reOn = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(reOn.code, 0, reOn.stderr);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    assert.equal((await readJsonIfExists(backupPath)).snapshot, undefined);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    const after = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(after.provider?.[OPENCODE_FIREWORKS_PROVIDER_ID], undefined);
+    assert.deepEqual(after, original);
+  });
+
+  it("re-on after Nexus state is lost snapshots a hand-edited v2 providers entry; off restores it", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-lost-state-v2-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    // A `providers` map makes `on` mirror its v1 entry into v2.
+    await writeFile(configPath, `${JSON.stringify({ providers: {} }, null, 2)}\n`);
+    const login = () => runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+
+    await login();
+    const first = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(first.code, 0, first.stderr);
+
+    // The user edits the v2 entry OpenCode actually reads, then Nexus's
+    // data dir (backup + enabled flag) is lost.
+    const routed = JSON.parse(await readFile(configPath, "utf8"));
+    routed.providers[OPENCODE_FIREWORKS_PROVIDER_ID].models.mine = { name: "Mine" };
+    const edited = `${JSON.stringify(routed, null, 4)}\n`;
+    await writeFile(configPath, edited);
+    await rm(path.join(home, ".nexus"), { recursive: true, force: true });
+    await login();
+    const reOn = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(reOn.code, 0, reOn.stderr);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    assert.equal((await readJsonIfExists(backupPath)).snapshot?.raw, edited);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    assert.equal(await readFile(configPath, "utf8"), edited);
+  });
+
+  for (const [label, nexusEntry] of [
+    [OPENCODE_AZURE_PROVIDER_ID, { options: { baseURL: "https://foundry.example/openai/v1", apiKey: "az-test" } }],
+    ["fireworks", { options: { headers: { "HTTP-Referer": "nexus/v1.0.0" } } }],
+  ]) {
+    it(`off without a backup removes Nexus's ${label} entry but keeps the user's own fireworks-ai beside it`, async () => {
+      const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-mixed-"));
+      const configPath = opencodeConfigPath(home);
+      await mkdir(path.dirname(configPath), { recursive: true });
+      const own = { options: { apiKey: "{env:FIREWORKS_API_KEY}" } };
+      await writeFile(configPath, `${JSON.stringify({
+        model: "fireworks-ai/accounts/fireworks/models/example-model",
+        provider: { "fireworks-ai": own, [label]: nexusEntry },
+      }, null, 2)}\n`);
+
+      const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+      assert.equal(off.code, 0, off.stderr);
+      assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
+        model: "fireworks-ai/accounts/fireworks/models/example-model",
+        provider: { "fireworks-ai": own },
+      });
+    });
+  }
+
+  it("on snapshots the user's own fireworks-ai beside a Nexus fireworks-azure entry despite a stale enabled flag", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-mixed-stale-flag-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = `${JSON.stringify({
+      model: "fireworks-ai/accounts/fireworks/models/example-model",
+      provider: {
+        "fireworks-ai": { options: { apiKey: "{env:FIREWORKS_API_KEY}" } },
+        [OPENCODE_AZURE_PROVIDER_ID]: { options: { baseURL: "https://foundry.example/openai/v1", apiKey: "az-test" } },
+      },
+    }, null, 2)}\n`;
+    await writeFile(configPath, original);
+
+    await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+    await writeGlobalConfig(home, { harnesses: { opencode: { enabled: true } } });
+    const on = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(on.code, 0, on.stderr);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    assert.equal((await readJsonIfExists(backupPath)).snapshot?.raw, original);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  });
+
+  it("off leaves the user's own fireworks-ai provider alone when Nexus never turned it on", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-own-off-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = `${JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      model: "fireworks-ai/accounts/fireworks/models/example-model",
+      provider: { "fireworks-ai": { options: { apiKey: "{env:FIREWORKS_API_KEY}" } } },
+    }, null, 2)}\n`;
+    await writeFile(configPath, original);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    assert.match(off.stdout, /was not connected/);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  });
+
+  it("on over the user's own fireworks-ai provider snapshots it despite a stale enabled flag", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-native-stale-flag-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = `${JSON.stringify({
+      model: "fireworks-ai/accounts/fireworks/models/example-model",
+      provider: { "fireworks-ai": { options: { apiKey: "{env:FIREWORKS_API_KEY}" } } },
+    }, null, 2)}\n`;
+    await writeFile(configPath, original);
+
+    await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+    // An earlier `off` restored the file but stopped before clearing the flag.
+    await writeGlobalConfig(home, { harnesses: { opencode: { enabled: true } } });
+    const on = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(on.code, 0, on.stderr);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    assert.equal((await readJsonIfExists(backupPath)).snapshot?.raw, original);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  });
+
+  it("first on over the user's own fireworks-ai provider snapshots it; off restores it byte-for-byte", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-opencode-native-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    // No Nexus attribution: a provider the user set up by hand. A generic
+    // `X-Title` header alone is not a Nexus marker.
+    const original = `{
+    "model": "fireworks-ai/accounts/fireworks/routers/glm-fast-latest",
+    "provider": {
+        "fireworks-ai": {
+            "options": {
+                "apiKey": "{env:FIREWORKS_API_KEY}",
+                "headers": { "X-Title": "example-client" }
+            }
+        }
+    }
+}
+`;
+    await writeFile(configPath, original);
+
+    await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+    const on = await runFireconnect(["opencode", "on"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(on.code, 0, on.stderr);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    assert.equal((await readJsonIfExists(backupPath)).snapshot?.raw, original);
+
+    const off = await runFireconnect(["opencode", "off"], { HOME: home, FIREWORKS_API_KEY: "" });
+    assert.equal(off.code, 0, off.stderr);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  });
+
   it("does not attach provider BYOK when firerouter is auto-cataloged but not selected", async () => {
     const { createServer } = await import("node:http");
     const gateway = await new Promise((resolve) => {
@@ -515,5 +698,68 @@ describe("opencode harness integration", () => {
     } finally {
       gateway.server.close();
     }
+  });
+});
+
+// One real config per routing case, so the JS classification
+// (`opencodeProviderStatus`, attribution header, v2 mirror) agrees on where a
+// snapshot is taken.
+describe("shouldSnapshotOpencodeConfig across routing cases", () => {
+  const nexusHeaders = { "X-Title": "OpenCode", "HTTP-Referer": FIRECONNECT_REFERER };
+  const fireworks = (headers) => ({
+    model: `${OPENCODE_FIREWORKS_PROVIDER_ID}/auto`,
+    provider: { [OPENCODE_FIREWORKS_PROVIDER_ID]: { options: { apiKey: OPENCODE_API_KEY_ENV_REF, headers } } },
+  });
+  const legacy = {
+    model: "fireworks/accounts/fireworks/models/example-model",
+    provider: { fireworks: { options: { headers: nexusHeaders } } },
+  };
+  const azure = {
+    model: `${OPENCODE_AZURE_PROVIDER_ID}/example-deployment`,
+    provider: { [OPENCODE_AZURE_PROVIDER_ID]: { options: { baseURL: "https://example-resource.example.com" } } },
+  };
+  const withV2 = (config, id, entry) => ({ ...config, providers: { [id]: entry } });
+  const fresh = { hasBackup: false, wasGloballyEnabled: false };
+
+  it("classifies each Routing case like the model", () => {
+    const cases = [
+      // ⟨.fireworks, attributed, mirrored⟩ with no Nexus state: owned, not snapshotted
+      [fireworks(nexusHeaders), false],
+      [legacy, false],
+      // ⟨.fireworks, not attributed, mirrored⟩: the user's own provider, snapshotted
+      [fireworks(undefined), true],
+      [fireworks({ "X-Title": "example-client" }), true],
+      // ⟨.fireworks, attributed, not mirrored⟩: edited v2 entry, snapshotted
+      [withV2(fireworks(nexusHeaders), OPENCODE_FIREWORKS_PROVIDER_ID, {
+        ...opencodeV2ProviderEntry(fireworks(nexusHeaders).provider[OPENCODE_FIREWORKS_PROVIDER_ID]),
+        models: { mine: { name: "Mine" } },
+      }), true],
+      // ⟨.azure, _, mirrored⟩: Nexus-only id, owned
+      [azure, false],
+      [withV2(azure, OPENCODE_AZURE_PROVIDER_ID, opencodeV2ProviderEntry(azure.provider[OPENCODE_AZURE_PROVIDER_ID])), false],
+      // ⟨.azure, _, not mirrored⟩: snapshotted
+      [withV2(azure, OPENCODE_AZURE_PROVIDER_ID, { settings: { baseURL: "https://other.example.com" } }), true],
+      // ⟨.default⟩ / ⟨.custom⟩: always snapshotted
+      [{}, true],
+      [{ model: "user/custom" }, true],
+    ];
+    for (const [config, expected] of cases) {
+      assert.equal(shouldSnapshotOpencodeConfig({ config, ...fresh }), expected, JSON.stringify(config));
+    }
+  });
+
+  it("a backup blocks a routed re-snapshot, never an unrouted one", () => {
+    for (const config of [fireworks(undefined), fireworks(nexusHeaders), azure]) {
+      assert.equal(shouldSnapshotOpencodeConfig({ config, hasBackup: true, wasGloballyEnabled: false }), false);
+    }
+    assert.equal(shouldSnapshotOpencodeConfig({ config: { model: "user/custom" }, hasBackup: true, wasGloballyEnabled: true }), true);
+  });
+
+  it("the enabled flag blocks a re-snapshot only of a provider Nexus wrote", () => {
+    for (const config of [fireworks(nexusHeaders), azure]) {
+      assert.equal(shouldSnapshotOpencodeConfig({ config, hasBackup: false, wasGloballyEnabled: true }), false);
+    }
+    // ⟨.fireworks, unattributed⟩ with a stale flag: the user's own provider.
+    assert.equal(shouldSnapshotOpencodeConfig({ config: fireworks(undefined), hasBackup: false, wasGloballyEnabled: true }), true);
   });
 });

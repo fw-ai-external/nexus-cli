@@ -100,6 +100,7 @@ async function run(args, home, env) {
 async function writeCopilotDb(dbPath) {
   await mkdir(path.dirname(dbPath), { recursive: true });
   const sql = [
+    "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, parent_account_id TEXT);",
     `CREATE TABLE IF NOT EXISTS "model_providers" (
       id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'openai',
       settings_json TEXT NOT NULL DEFAULT '{}', account_id TEXT);`,

@@ -1,8 +1,8 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink } from "node:fs/promises";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 import path from "node:path";
-import process from "node:process";
 import {
   AZURE_API_KEY_ENV_REF,
   AZURE_OPENAI_COMPATIBLE_NPM,
@@ -24,6 +24,7 @@ import {
   isFirerouterModelPattern,
   normalizeModelId,
   shortFireworksModelRef,
+  FIREWORKS_OPENAI_BASE_URL,
 } from "../../fireworks/model-id.mjs";
 import { hasModelReasoningLevels } from "../../fireworks/reasoning.mjs";
 import { resolveManagedDisplayName } from "../../fireworks/model-display.mjs";
@@ -48,9 +49,11 @@ import {
 } from "../../keys/key-type.mjs";
 import { isHarnessEnabled } from "../../config/global-config.mjs";
 import { HARNESS } from "../../harness/id.mjs";
-import { mergeFireconnectTelemetryHeaders } from "../../telemetry/request-headers.mjs";
-import { dropOpencodeProvider, mirrorOpencodeV2Providers } from "./providers-v2.mjs";
+import { hasFireconnectAttributionHeader, mergeFireconnectTelemetryHeaders } from "../../telemetry/request-headers.mjs";
+import { dropOpencodeProvider, isMirroredOpencodeV2Provider, mirrorOpencodeV2Providers } from "./providers-v2.mjs";
+import { installOpencodePlugin, removeOpencodePlugin } from "./nexus-plugin.mjs";
 import { DATA_DIRNAME, LEGACY_DATA_DIRNAME } from "../../system/data-dir.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 /**
  * Restore a raw config snapshot from a backup (or delete the config when the
@@ -86,6 +89,9 @@ export const OPENCODE_CONFIG_RELATIVE_PATH = ".config/opencode/opencode.json";
 export const OPENCODE_DATA_RELATIVE_DIR = ".nexus/opencode";
 export const OPENCODE_API_KEY_ENV_REF = "{env:FIREWORKS_API_KEY}";
 export const OPENCODE_FIREWORKS_PROVIDER_ID = "fireworks-ai";
+// The base URL OpenCode's built-in fireworks-ai provider uses. Nexus only
+// writes `options.baseURL` when the account's residency needs another host.
+export const OPENCODE_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 export const OPENCODE_AZURE_PROVIDER_ID = "fireworks-azure";
 export const OPENCODE_MANAGED_PROVIDER_IDS = [OPENCODE_FIREWORKS_PROVIDER_ID, OPENCODE_AZURE_PROVIDER_ID];
 
@@ -268,6 +274,91 @@ export function opencodeProviderStatus(config) {
 }
 
 /**
+ * Whether the routing in this opencode.json was written by Nexus, as opposed
+ * to the user's own native OpenCode Fireworks provider. `fireworks-azure` is a
+ * Nexus-only provider id. On `fireworks-ai` (and the retired `fireworks`),
+ * every Nexus `on` since the CLI started sending attribution stamps its own
+ * `HTTP-Referer` value, which a hand-written provider does not carry.
+ *
+ * The v2 `providers[id]` entry must also still be the mirror Nexus writes
+ * for `provider[id]`. OpenCode v2 prefers `providers[id]`, so a v2 entry the
+ * user edited after Nexus wrote the v1 entry is the provider in effect and
+ * is theirs: the config counts as user-authored and gets snapshotted, so
+ * `off` can put the edit back.
+ * @param {Record<string, any>} config
+ */
+export function isNexusOwnedOpencodeRouting(config) {
+  const status = opencodeProviderStatus(config);
+  if (status === "azure") {
+    return isMirroredOpencodeV2Provider(config, OPENCODE_AZURE_PROVIDER_ID);
+  }
+  if (status !== "fireworks") {
+    return false;
+  }
+  return [OPENCODE_FIREWORKS_PROVIDER_ID, "fireworks"].some(
+    (id) => hasFireconnectAttributionHeader(config.provider?.[id]?.options?.headers)
+      && isMirroredOpencodeV2Provider(config, id),
+  );
+}
+
+/**
+ * Whether opencode.json holds a provider entry Nexus wrote: `fireworks-azure`
+ * (a Nexus-only id), or a `fireworks-ai` / retired `fireworks` entry carrying
+ * this CLI's attribution header. A Fireworks provider the user set up by hand
+ * has neither, so `off` and `uninstall` leave it alone.
+ * @param {Record<string, any>} config
+ */
+export function hasNexusOpencodeProvider(config) {
+  return nexusOpencodeProviderIds(config).length > 0;
+}
+
+/**
+ * The provider ids in opencode.json whose entries Nexus wrote (see
+ * hasNexusOpencodeProvider). With no backup, `off` removes only these, so a
+ * hand-made `fireworks-ai` entry beside a Nexus `fireworks-azure` one stays.
+ * @param {Record<string, any>} config
+ * @returns {string[]}
+ */
+function nexusOpencodeProviderIds(config) {
+  const ids = config.provider?.[OPENCODE_AZURE_PROVIDER_ID] ? [OPENCODE_AZURE_PROVIDER_ID] : [];
+  return ids.concat([OPENCODE_FIREWORKS_PROVIDER_ID, "fireworks"].filter(
+    (id) => hasFireconnectAttributionHeader(config.provider?.[id]?.options?.headers),
+  ));
+}
+
+export function opencodeOffTouches(config, hasBackup, wasEnabled) {
+  return wasEnabled || hasBackup || hasNexusOpencodeProvider(config);
+}
+
+/**
+ * Whether `on` should snapshot the current opencode.json as the config `off`
+ * restores. Unrouted configs are always snapshotted. Routed ones are only
+ * when nothing says Nexus put the routing there: no backup, no enabled flag
+ * over a model on a provider entry Nexus wrote, and the routing is not Nexus-owned (the
+ * user's own native Fireworks provider, or a v2 entry they edited). A
+ * Nexus-routed config whose backup and enabled flag were lost is never
+ * snapshotted, so `off` strips it instead of restoring it.
+ * @param {{ config: Record<string, any>, hasBackup: boolean, wasGloballyEnabled: boolean }} args
+ */
+export function shouldSnapshotOpencodeConfig({ config, hasBackup, wasGloballyEnabled }) {
+  const status = opencodeProviderStatus(config);
+  if (status !== "fireworks" && status !== "azure") {
+    return true;
+  }
+  if (hasBackup) {
+    return false;
+  }
+  // The enabled flag can outlive the routing (e.g. `off` stopped after restoring
+  // the file), so it blocks a snapshot only when the model runs on a provider
+  // entry Nexus wrote, not on the user's own entry beside one.
+  const ours = nexusOpencodeProviderIds(config);
+  if (wasGloballyEnabled && ours.some((id) => config.model?.startsWith?.(`${id}/`))) {
+    return false;
+  }
+  return !isNexusOwnedOpencodeRouting(config);
+}
+
+/**
  * @param {string} storedRef
  * @returns {"literal" | "env-reference" | "missing"}
  */
@@ -405,6 +496,21 @@ function isAuthoredOpencodeReasoningRow(modelId, entry) {
   return entry.id === undefined;
 }
 
+export function opencodeRowSdk(entry, providerNpm) {
+  const rawNpm = entry.provider?.npm ?? providerNpm ?? "@ai-sdk/openai-compatible";
+  return typeof rawNpm === "string"
+    ? rawNpm.replace(/^aisdk:/, "").replace(/@[^@/]+$/, "")
+    : rawNpm;
+}
+
+export function preservedOpencodeEffort(prior) {
+  return {
+    ...(typeof prior?.reasoning === "boolean" ? { reasoning: prior.reasoning } : {}),
+    ...(isReasoningOptions(prior?.reasoning_options) ? { reasoning_options: prior.reasoning_options } : {}),
+    ...(isVariantMap(prior?.variants) ? { variants: prior.variants } : {}),
+  };
+}
+
 function markReasoning(modelId, entry, providerNpm, eligible) {
   if (!isModelObject(entry) || !eligible(modelId, entry)) return entry;
   if (["reasoning", "reasoning_options", "variants"].some((key) => entry[key] !== undefined)) return entry;
@@ -414,10 +520,7 @@ function markReasoning(modelId, entry, providerNpm, eligible) {
   // differently shaped effort variants, so their rows stay as written.
   // Normalize the spellings config can carry (`aisdk:` prefix, `@version`
   // suffix) before comparing, or a compatible row silently never flags.
-  const rawNpm = entry.provider?.npm ?? providerNpm ?? "@ai-sdk/openai-compatible";
-  const npm = typeof rawNpm === "string"
-    ? rawNpm.replace(/^aisdk:/, "").replace(/@[^@/]+$/, "")
-    : rawNpm;
+  const npm = opencodeRowSdk(entry, providerNpm);
   if (npm !== "@ai-sdk/openai-compatible") return entry;
   return { ...entry, reasoning: true };
 }
@@ -498,6 +601,17 @@ function homeFromDataDir(dataDir) {
   return path.dirname(path.dirname(dataDir));
 }
 
+export function withOpencodeResidencyOptions(options, residency) {
+  const next = { ...options };
+  const inferenceBaseUrl = fireworksInferenceUrl(OPENCODE_FIREWORKS_BASE_URL, residency);
+  if (inferenceBaseUrl !== OPENCODE_FIREWORKS_BASE_URL) {
+    next.baseURL = inferenceBaseUrl;
+  } else if (isFireworksInferenceUrl(next.baseURL, OPENCODE_FIREWORKS_BASE_URL)) {
+    delete next.baseURL;
+  }
+  return next;
+}
+
 export async function enableOpencodeFireworks({
   configPath,
   dataDir,
@@ -550,20 +664,13 @@ export async function enableOpencodeFireworks({
 
   const backupPath = opencodeBackupPath(dataDir, configPath);
   const hasBackup = (await readJsonIfExists(backupPath)).snapshot !== undefined;
-  const providerStatus = opencodeProviderStatus(config);
-  const hasFireconnectRouting = providerStatus === "fireworks"
-    || providerStatus === "azure";
   const home = homeFromDataDir(dataDir);
   const wasGloballyEnabled = home ? await isHarnessEnabled(home, HARNESS.OPENCODE) : false;
-  const shouldSnapshot = !hasBackup
-    ? !hasFireconnectRouting || !wasGloballyEnabled
-    : !hasFireconnectRouting;
-  if (shouldSnapshot) {
+  if (shouldSnapshotOpencodeConfig({ config, hasBackup, wasGloballyEnabled })) {
     // The snapshot can contain credentials from the user's other providers —
     // keep the backup (and its directory) private to the owner.
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
-    await writeJson(backupPath, { configPath: path.resolve(configPath), snapshot });
-    await chmod(backupPath, 0o600);
+    ensurePrivateParent(backupPath);
+    await writeJson(backupPath, { configPath: path.resolve(configPath), snapshot }, { mode: 0o600 });
   }
 
   const base = dropOpencodeProvider(withoutRetiredFireworksProvider(config), OPENCODE_AZURE_PROVIDER_ID);
@@ -593,7 +700,9 @@ export async function enableOpencodeFireworks({
     ...(byokHeaders ?? {}),
   };
   const storedApiKey = resolvedEffective;
-  const nextOptions = { ...(existing.options ?? {}), apiKey: storedApiKey };
+  const nextOptions = withOpencodeResidencyOptions(
+    { ...(existing.options ?? {}), apiKey: storedApiKey }, activeAccountResidency("opencode"),
+  );
   if (Object.keys(nextHeaders).length > 0) {
     nextOptions.headers = nextHeaders;
   } else {
@@ -622,9 +731,7 @@ export async function enableOpencodeFireworks({
         // settings or the provider SDK say otherwise.
         out[stored] = withAuthoredOpencodeReasoningEffort(stored, {
           ...buildOpencodeModelEntry(normalized),
-          ...(typeof prior?.reasoning === "boolean" ? { reasoning: prior.reasoning } : {}),
-          ...(isReasoningOptions(prior?.reasoning_options) ? { reasoning_options: prior.reasoning_options } : {}),
-          ...(isVariantMap(prior?.variants) ? { variants: prior.variants } : {}),
+          ...preservedOpencodeEffort(prior),
         }, existing.npm);
       }
     }
@@ -676,6 +783,9 @@ export async function enableOpencodeFireworks({
     },
     model: `${prefix}${opencodeConfigModelRef(resolvedModel)}`,
   }, { mode: hasLiteralSecret ? 0o600 : undefined });
+  // The Fireworks sidebar card (OpenCode 2.x). After the config write, so the
+  // plugin folder only exists while Nexus routes OpenCode.
+  await installOpencodePlugin(configPath);
   return {
     model: next.model,
     modelsAdded: Object.keys(next.provider?.[OPENCODE_FIREWORKS_PROVIDER_ID]?.models ?? {}),
@@ -715,19 +825,16 @@ export async function enableOpencodeAzure({
 
   const backupPath = opencodeBackupPath(dataDir, configPath);
   const hasBackup = (await readJsonIfExists(backupPath)).snapshot !== undefined;
-  const hasFireconnectRouting = opencodeProviderStatus(config) === "fireworks"
-    || opencodeProviderStatus(config) === "azure";
   const home = homeFromDataDir(dataDir);
   const wasGloballyEnabled = home ? await isHarnessEnabled(home, HARNESS.OPENCODE) : false;
-  const shouldSnapshot = !hasBackup
-    ? !hasFireconnectRouting || !wasGloballyEnabled
-    : !hasFireconnectRouting;
-  if (shouldSnapshot) {
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
-    await writeJson(backupPath, { configPath: path.resolve(configPath), snapshot });
-    await chmod(backupPath, 0o600);
+  if (shouldSnapshotOpencodeConfig({ config, hasBackup, wasGloballyEnabled })) {
+    ensurePrivateParent(backupPath);
+    await writeJson(backupPath, { configPath: path.resolve(configPath), snapshot }, { mode: 0o600 });
   }
 
+  // Azure traffic doesn't go to Fireworks: drop the "Hosted on Fireworks"
+  // sidebar card a Fireworks `on` installed.
+  await removeOpencodePlugin(configPath);
   const base = dropOpencodeProvider(withoutRetiredFireworksProvider(config), OPENCODE_FIREWORKS_PROVIDER_ID);
   const existing = base.provider?.[OPENCODE_AZURE_PROVIDER_ID] ?? {};
   const resolvedModel = modelId || opencodeProviderStatus(config) === "azure"
@@ -762,25 +869,23 @@ export async function enableOpencodeAzure({
 }
 
 export async function disableOpencodeFireworks({ configPath, dataDir, wasEnabled = false }) {
+  // The card is Nexus's alone (its own folder), so `off` removes it whatever
+  // the config holds, and first: a disable that stops after restoring the
+  // config would leave OpenCode unrouted, and `off` / `uninstall` would never
+  // come back for it.
+  await removeOpencodePlugin(configPath);
+  return disableOpencodeFireworksConfig({ configPath, dataDir, wasEnabled });
+}
+
+async function disableOpencodeFireworksConfig({ configPath, dataDir, wasEnabled = false }) {
   const backupPath = opencodeBackupPath(dataDir, configPath);
   const backup = await readJsonIfExists(backupPath);
   const config = await readJsonIfExists(configPath);
   const hasBackup = backup.snapshot !== undefined;
-  const prefix = `${OPENCODE_FIREWORKS_PROVIDER_ID}/`;
-  const azurePrefix = `${OPENCODE_AZURE_PROVIDER_ID}/`;
-  const hasOwnedProvider = Boolean(
-    config.provider?.[OPENCODE_FIREWORKS_PROVIDER_ID]
-      || config.provider?.[OPENCODE_AZURE_PROVIDER_ID]
-      || config.provider?.fireworks,
-  );
-  const hasOwnedModel = typeof config.model === "string"
-    && (
-      config.model.startsWith(prefix)
-      || config.model.startsWith(azurePrefix)
-      || config.model.startsWith("fireworks/")
-    );
 
-  if (!wasEnabled && !hasBackup && !hasOwnedProvider && !hasOwnedModel) {
+  // Nothing here is Nexus's (no backup, no provider entry it wrote): the
+  // Fireworks provider and model are the user's own, so leave them.
+  if (!opencodeOffTouches(config, hasBackup, wasEnabled)) {
     return "unchanged";
   }
 
@@ -788,7 +893,8 @@ export async function disableOpencodeFireworks({ configPath, dataDir, wasEnabled
     return "restored";
   }
 
-  // No backup: strip only what we own, and only touch the file if we actually
+  // No backup: strip only the entries Nexus wrote (and the model when it
+  // points at one of them), and only touch the file if we actually
   // removed something — never create a config that didn't exist, and never
   // re-serialize an unrelated config.
   const { existed } = await readRawIfExists(configPath);
@@ -796,16 +902,12 @@ export async function disableOpencodeFireworks({ configPath, dataDir, wasEnabled
     return "unchanged";
   }
   const liveConfig = await readJsonIfExists(configPath);
-  let stripped = OPENCODE_MANAGED_PROVIDER_IDS.reduce(
-    (config, id) => dropOpencodeProvider(config, id),
-    withoutRetiredFireworksProvider(liveConfig),
+  const ours = nexusOpencodeProviderIds(liveConfig);
+  let stripped = ours.reduce(
+    (config, id) => (id === "fireworks" ? withoutRetiredFireworksProvider(config) : dropOpencodeProvider(config, id)),
+    liveConfig,
   );
-  if (typeof stripped.model === "string"
-    && (
-      stripped.model.startsWith(prefix)
-      || stripped.model.startsWith(azurePrefix)
-      || stripped.model.startsWith("fireworks/")
-    )) {
+  if (typeof stripped.model === "string" && ours.some((id) => stripped.model.startsWith(`${id}/`))) {
     const { model: _model, ...rest } = stripped;
     stripped = rest;
   }

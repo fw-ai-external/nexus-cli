@@ -59,7 +59,8 @@ export function formatClaudeUsageSessionChoice(entry, now = Date.now(), opts = {
   const useColor = opts.color === true
     || (opts.color !== false && colorsEnabled(stream));
 
-  const id = path.basename(entry.filePath, ".jsonl");
+  // A harness whose log filename is not the session id passes `sessionId`.
+  const id = entry.sessionId || path.basename(entry.filePath, ".jsonl");
   const shortId = `${id.slice(0, 8)}…`;
   const grandCost = entry.report.grandTotals?.cost;
   const totalCost = entry.report.totals?.cost;
@@ -135,6 +136,9 @@ export async function listRecentClaudeUsageSessions({
  *   input?: NodeJS.ReadStream,
  *   output?: NodeJS.WriteStream,
  *   now?: number,
+ *   listSessions?: typeof listRecentClaudeUsageSessions,
+ *   harnessName?: string,
+ *   logDir?: string,
  * }} opts
  * @returns {Promise<string | null>} absolute session log path, or null if cancelled
  */
@@ -144,11 +148,15 @@ export async function promptClaudeUsageSession({
   input = process.stdin,
   output = process.stdout,
   now = Date.now(),
+  // Another harness supplies its own session list; the menu is shared.
+  listSessions = listRecentClaudeUsageSessions,
+  harnessName = "Claude Code",
+  logDir = path.join(home, ".claude"),
 } = {}) {
-  const sessions = await listRecentClaudeUsageSessions({ home, withinDays, now });
+  const sessions = await listSessions({ home, withinDays, now });
   if (sessions.length === 0) {
     throw new Error(
-      `No Claude Code sessions in the last ${withinDays} day${withinDays === 1 ? "" : "s"} under ${path.join(home, ".claude")}`,
+      `No ${harnessName} sessions in the last ${withinDays} day${withinDays === 1 ? "" : "s"} under ${logDir}`,
     );
   }
   if (sessions.length === 1 || !input?.isTTY) {
@@ -156,11 +164,11 @@ export async function promptClaudeUsageSession({
   }
 
   const chosen = await promptSelect({
-    message: `Claude sessions (last ${withinDays} days) — select one to live-track`,
+    message: `${harnessName === "Claude Code" ? "Claude" : harnessName} sessions (last ${withinDays} days) — select one to live-track`,
     pageSize: 12,
     choices: sessions.map((entry) => ({
       name: formatClaudeUsageSessionChoice(entry, now, { stream: output }),
-      short: path.basename(entry.filePath, ".jsonl").slice(0, 8),
+      short: (entry.sessionId || path.basename(entry.filePath, ".jsonl")).slice(0, 8),
       value: entry.filePath,
     })),
     input,

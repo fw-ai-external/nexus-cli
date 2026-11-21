@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { readdirSync, unlinkSync, existsSync } from "node:fs";
+import { chmodSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -20,11 +20,20 @@ import {
   makeFireconnectSecretId,
   prettyModelName,
   removeFireconnectProvider,
+  readVscodeBackup,
   vscodeDataDir,
+  writeVscodeBackup,
 } from "../../../lib/harnesses/vscode/core.mjs";
-import { FIRECONNECT_REFERER, runCli, runCliJson, withTempHome, itIfSqlite, mockServerlessModel } from "../../helpers.mjs";
+import { detectVscodeInstall } from "../../../lib/harnesses/vscode/install.mjs";
+import vscode from "../../../lib/harnesses/vscode/index.mjs";
+import { FIRECONNECT_REFERER, isolatedProfileEnv, runCli, runCliJson, supportsVscodeSqlite, withIsolatedProfileEnv, withTempHome, itIfSqlite, mockServerlessModel, mockServerlessModelRows } from "../../helpers.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
+import { ensureItemTable, readItemTableValue, writeItemTableValue } from "../../../lib/harnesses/vscode/vscdb-sqlite.mjs";
+import { appUserDataDir } from "../../../lib/io/user-data-dir.mjs";
+import { isHarnessEnabled, setHarnessEnabled } from "../../../lib/config/global-config.mjs";
+
+const hasVscodeSqlite = await supportsVscodeSqlite();
 
 /** A non-fireconnect provider (user-managed) to prove ownership scoping. */
 function userProvider(name = "MyOther") {
@@ -69,6 +78,48 @@ function readStateSecret(vscodePath, secretId) {
   return out === "" ? undefined : out;
 }
 
+describe("VS Code Windows install detection", () => {
+  it("finds a user-scope Insiders-only install with a versioned product.json", async () => {
+    await withTempHome("vscode-win-insiders-", async (home) => {
+      const env = {
+        ProgramFiles: path.join(home, "Program Files"),
+        "ProgramFiles(x86)": path.join(home, "Program Files (x86)"),
+        LOCALAPPDATA: path.join(home, "Local"),
+      };
+      const programs = path.join(env.LOCALAPPDATA, "Programs");
+      const resources = path.join(programs, "Microsoft VS Code Insiders", "22d53a1ff6", "resources", "app");
+      await mkdir(resources, { recursive: true });
+      const productJson = path.join(resources, "product.json");
+      const nameLong = "Visual Studio Code - Insiders";
+      await writeFile(productJson, JSON.stringify({ nameLong }));
+      const options = { platform: "win32", env, home };
+      assert.deepEqual(detectVscodeInstall(undefined, options), {
+        variant: "insiders", folder: "Code - Insiders", productJson, nameLong,
+      });
+
+      const stableResources = path.join(programs, "Microsoft VS Code", "resources", "app");
+      await mkdir(stableResources, { recursive: true });
+      await writeFile(path.join(stableResources, "product.json"), "{}");
+      assert.equal(detectVscodeInstall(undefined, options)?.variant, "stable");
+    });
+  });
+
+  it("finds a machine-wide Windows install with a versioned product.json", async () => {
+    await withTempHome("vscode-win-system-", async (home) => {
+      const env = {
+        ProgramFiles: path.join(home, "Program Files"),
+        "ProgramFiles(x86)": path.join(home, "Program Files (x86)"),
+        LOCALAPPDATA: path.join(home, "Local"),
+      };
+      const resources = path.join(env.ProgramFiles, "Microsoft VS Code", "8a14f0cc1b", "resources", "app");
+      await mkdir(resources, { recursive: true });
+      const productJson = path.join(resources, "product.json");
+      await writeFile(productJson, "{}");
+      assert.equal(detectVscodeInstall(undefined, { platform: "win32", env, home })?.productJson, productJson);
+    });
+  });
+});
+
 /* -------------------------------------------------------------------------- */
 /* Unit tests — pure transforms (no I/O)                                       */
 /* -------------------------------------------------------------------------- */
@@ -77,7 +128,7 @@ describe("vscode-core pure transforms", () => {
   it("buildModelEntry produces the VS Code schema shape with per-model limits", () => {
     // The alias resolves from the API-reported `aliases` on the GLM 5.2 row.
     setServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([
-      mockServerlessModel({
+      ...mockServerlessModelRows({
         aliases: ["accounts/fireworks/routers/glm-fast-latest"],
         context_length: 1_048_575,
       }),
@@ -210,11 +261,98 @@ describe("vscode-core pure transforms", () => {
 describe("vscode harness integration", () => {
   const secretEnv = () => ({ NEXUS_VSCODE_SECRET_PLAINTEXT: "1" });
 
+  for (const platform of ["win32", "linux", "darwin"]) {
+    const scope = platform === "win32" ? "fails on" : "ignores";
+    it(`${platform}: off ${scope} malformed JSON in the other standard profile`, async () => {
+      await withTempHome("vscode-off-malformed-profile-", async (home) => {
+        const env = isolatedProfileEnv(home);
+        const selected = detectVscodeInstall(undefined, { env, home })?.folder || "Code";
+        const other = selected === "Code" ? "Code - Insiders" : "Code";
+        const modelsPath = (folder) => path.join(appUserDataDir(home, folder, { env }), "User", "chatLanguageModels.json");
+        const selectedPath = modelsPath(selected);
+        const otherPath = modelsPath(other);
+        const malformed = '[{"apiKey":"${input:chat.lm.secret.fw-abcdef}"}';
+        const original = JSON.stringify([userProvider()]);
+        await mkdir(path.dirname(otherPath), { recursive: true });
+        await writeFile(otherPath, malformed);
+        await writeVscodeBackup(vscodeDataDir(home), selectedPath, { fileExisted: true, fileRaw: original, secretIds: [] });
+        await setHarnessEnabled(home, "vscode", true, "fireworks");
+
+        await withIsolatedProfileEnv(home, async () => {
+          const off = vscode.off({ home, platform, force: true, quiet: true });
+          if (platform === "win32") {
+            await assert.rejects(off, { message: `${otherPath} is not valid JSON` });
+          } else {
+            assert.equal(await off, "restored");
+          }
+        });
+        assert.equal(await isHarnessEnabled(home, "vscode"), platform === "win32");
+        assert.equal(await readFile(selectedPath, "utf8"), original);
+        assert.equal(await readFile(otherPath, "utf8"), malformed);
+      });
+    });
+  }
+
+  it("win32: off restores an Insiders profile after Stable becomes the default install", { skip: process.platform !== "win32" || !hasVscodeSqlite }, async () => {
+    await withTempHome("vscode-off-profile-switch-", async (home) => {
+      const env = isolatedProfileEnv(home);
+      const windowsRoots = [
+        path.join(env.ProgramFiles, "Microsoft VS Code Insiders"),
+        path.join(env.LOCALAPPDATA, "Programs", "Microsoft VS Code", "abcdef1234"),
+      ];
+      for (const root of windowsRoots) {
+        const productDir = path.join(root, "resources", "app");
+        await mkdir(productDir, { recursive: true });
+        await writeFile(path.join(productDir, "product.json"), "{}");
+      }
+
+      const modelsPath = (folder) => path.join(appUserDataDir(home, folder, { env }), "User", "chatLanguageModels.json");
+      const insidersPath = modelsPath("Code - Insiders");
+      const stablePath = modelsPath("Code");
+      const original = JSON.stringify([userProvider()], null, "\t") + "\n";
+      const stableRaw = JSON.stringify([userProvider("Stable provider")]);
+      const secretId = "chat.lm.secret.fw-abcdef";
+      const storageKey = `secret://${secretId}`;
+      const dataDir = vscodeDataDir(home);
+      await mkdir(path.dirname(insidersPath), { recursive: true });
+      await mkdir(path.dirname(stablePath), { recursive: true });
+      await writeFile(stablePath, stableRaw);
+      await writeVscodeBackup(dataDir, insidersPath, { fileExisted: true, fileRaw: original, secretIds: [secretId] });
+      const managed = { apiKey: `\${input:${secretId}}` };
+      await writeFile(insidersPath, JSON.stringify([managed]));
+      await ensureItemTable(stateDbFor(insidersPath));
+      await writeItemTableValue(stateDbFor(insidersPath), storageKey, "test-value");
+
+      const explicit = await runCli(["vscode", "off", "--vscode-path", stablePath, "--force"], { home, env });
+      assert.equal(explicit.code, 0, explicit.stderr);
+      assert.equal(await readItemTableValue(stateDbFor(insidersPath), storageKey), "test-value");
+
+      const off = await runCli(["vscode", "off", "--force"], { home, env });
+      assert.equal(off.code, 0, off.stderr);
+      assert.equal(await readFile(insidersPath, "utf8"), original);
+      assert.equal(await readItemTableValue(stateDbFor(insidersPath), storageKey), "");
+      assert.equal((await readVscodeBackup(dataDir, insidersPath)).snapshot, undefined);
+      assert.equal(await readFile(stablePath, "utf8"), stableRaw);
+
+      await writeFile(insidersPath, JSON.stringify([userProvider(), managed]));
+      await writeItemTableValue(stateDbFor(insidersPath), storageKey, "test-value");
+      const strip = await runCli(["vscode", "off", "--force"], { home, env });
+      assert.equal(strip.code, 0, strip.stderr);
+      assert.deepEqual(await readJson(insidersPath), [userProvider()]);
+      assert.equal(await readItemTableValue(stateDbFor(insidersPath), storageKey), "");
+    });
+  });
+
   itIfSqlite("on writes the provider, the ${input:...} reference, and stores the key", async () => {
     await withTempHome("vscode-on-", async (home) => {
       const vscodePath = path.join(home, "chatLanguageModels.json");
+      const dbPath = stateDbFor(vscodePath);
+      await ensureItemTable(dbPath);
+      if (process.platform !== "win32") chmodSync(dbPath, 0o644);
       const r = await (await runCli(["login", "--api-key", "fw_test_key_12345"], { home, env: secretEnv() }), await runCli(["vscode", "on", "--vscode-path", vscodePath, "--force"], { home, env: secretEnv() }));
       assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+
+      if (process.platform !== "win32") assert.equal(statSync(dbPath).mode & 0o777, 0o600);
 
       const arr = await readJson(vscodePath);
       assert.equal(arr.length, 1);

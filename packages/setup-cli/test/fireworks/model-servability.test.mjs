@@ -91,7 +91,7 @@ describe("model-servability assertRequestedModelsServable", () => {
         () => assertRequestedModelServable("not-a-real-model", {
           apiKey: "fw_test_key",
         }),
-        /not available on Fireworks/,
+        /isn't in this account's model list/,
       );
     });
   });
@@ -105,7 +105,7 @@ describe("model-servability assertRequestedModelsServable", () => {
           () => assertRequestedModelServable(id, {
             apiKey: "fw_test_key",
           }),
-          /not available on Fireworks/,
+          /isn't in this account's model list/,
           id,
         );
       }
@@ -128,7 +128,7 @@ describe("model-servability assertRequestedModelsServable", () => {
           () => assertRequestedModelServable(id, {
             apiKey: "fw_test_key",
           }),
-          /not available on Fireworks/,
+          /isn't in this account's model list/,
           id,
         );
       }
@@ -215,7 +215,7 @@ describe("model-servability assertRequestedModelsServable", () => {
           ["glm-5p2", "glm-latest", "firerouter", "auto", "", "not-a-real-model"],
           { apiKey: "fw_test_key" },
         ),
-        /not available on Fireworks/,
+        /isn't in this account's model list/,
       );
       assert.equal(fetchCount, 1, "catalog fetched once for the whole batch");
     } finally {

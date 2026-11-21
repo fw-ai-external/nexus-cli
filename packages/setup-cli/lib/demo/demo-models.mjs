@@ -14,7 +14,6 @@ import {
 } from "../fireworks/model-id.mjs";
 import {
   FIREWORKS_MODEL_SPECS,
-  KNOWN_LATEST_ROUTER_ALIASES,
   catalogCacheCandidates,
   isUsableCachedServerlessPricing,
   resolveFireworksModelLabel,
@@ -86,14 +85,6 @@ function demoPickerSortKey(shortId) {
   return `2:${shortId}`;
 }
 
-/** Offline fallback when the serverless catalog has not been warmed yet. */
-function staticDemoFireworksPickerIds() {
-  const latestAliases = [...KNOWN_LATEST_ROUTER_ALIASES]
-    .filter(isDemoLatestRouterShortId)
-    .sort((left, right) => demoPickerSortKey(left).localeCompare(demoPickerSortKey(right)));
-  return ["auto", ...latestAliases];
-}
-
 /**
  * Derive demo picker ids from a serverless catalog snapshot (same source as
  * `nexus model list`). Keeps the `auto` mix and `*-latest` / `*-fast-latest`
@@ -125,9 +116,18 @@ export function refreshDemoPickerFromServerlessCatalog() {
     : null;
 }
 
-/** @returns {string[]} */
+/**
+ * The Fireworks picker ids: from the refreshed catalog, else the last cached
+ * one, else the always-served `auto` mix alone. Never a static model list:
+ * the catalog only lists what this account may use.
+ * @returns {string[]}
+ */
 export function demoFireworksPickerIds() {
-  return demoPickerFireworksIds ?? staticDemoFireworksPickerIds();
+  if (demoPickerFireworksIds) {
+    return demoPickerFireworksIds;
+  }
+  const entries = getServerlessCatalogSnapshot()?.entries ?? [];
+  return entries.length > 0 ? demoFireworksPickerIdsFromCatalog(entries) : ["auto"];
 }
 
 /** @param {string} id */
@@ -337,8 +337,17 @@ export function defaultLeftModel() {
   return DEFAULT_LEFT_MODEL;
 }
 
+/**
+ * The demo's Fireworks side: the preferred default when the catalog serves
+ * it, else the first served picker model, else `auto`.
+ * @returns {string}
+ */
 export function defaultRightModel() {
-  return DEFAULT_RIGHT_MODEL;
+  const ids = demoFireworksPickerIds();
+  if (ids.includes(DEFAULT_RIGHT_MODEL)) {
+    return DEFAULT_RIGHT_MODEL;
+  }
+  return ids.find((id) => id !== "auto") ?? "auto";
 }
 
 /** Side display label: "Fireworks · GLM 5.2 Fast" or "Anthropic · Claude Opus". */

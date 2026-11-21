@@ -1,6 +1,41 @@
 {
   "releases": [
     {
+      "version": "0.12.0",
+      "highlights": [
+        "Sign-in: `nexus login` asks which account you use and remembers company SSO. Nexus accounts sign in through the Nexus web app. Approve key replacement and revocation in the browser. Browser sign-in keys expire after 7 days by default. `nexus login` and `nexus status` show the expiry date, and `nexus status` and the Claude Code status line warn on the last day. Sign in again during that window to replace the key. Over SSH, use `--paste-code` if you can't forward the sign-in port.",
+        "Better Windows support: `nexus uninstall` works, Codex and Claude Code set up cleanly, and more app installs are detected.",
+        "New: `nexus codex usage` reports your Codex sessions' tokens and cost, with the same live meter as `nexus claude usage`. Calls to Nexus Auto are priced as the model that served them.",
+        "Claude Code auto mode: Fireworks now runs auto mode's safety checks on the server, separately from your model, so Claude Code no longer shows the \"this session isn't eligible\" notice. `/status` shows \"Auto mode server: Enabled\", and the checks bill to your Fireworks account.",
+        "Fireworks symbol in the Claude Code status line, as a Codex pet, and in the OpenCode 2.x sidebar.",
+        "Claude Code status line: shows the latest call's generated tokens per second (TPS).",
+        "US data residency: connecting a harness for a US-residency account uses `us.api.fireworks.ai`. `nexus model list` and Nexus catalog pickers list available US-only routers at US rates.",
+        "New: `nexus hermes` connects Hermes Agent with Nexus Auto as the default. DeepSeek V4.1 Flash 1017 Ultra-fast appears as a separate model option."
+      ],
+      "improvements": [
+        "DeepSeek Harness and Hermes: pickers list your account's Nexus models.",
+        "Copilot CLI: shows each model's reasoning-effort levels.",
+        "Codex: reads the ChatGPT app's model list and shows Nexus Auto with its effort levels. Nexus finds Codex and Claude Code when the desktop app starts the CLI with a minimal PATH.",
+        "Codex: image generation is off by default because Fireworks doesn't serve it. Nexus keeps an explicit setting.",
+        "Pricing: Claude Code usage shows the Fast, Turbo or Ultra-fast router you picked and its rate. Standard models no longer show their Spot rates. The built-in DeepSeek V4.1 Flash 1017 Ultra-fast rates now match the published prices.",
+        "`nexus status` flags models your account can't use, and `on` offers a command to switch. When you switch accounts offline, Nexus no longer shows the previous account's catalog.",
+        "Windows: `nexus uninstall` finishes removing Nexus after the CLI exits, and refuses while Nexus Desktop is open.",
+        "Windows: Codex lists its stock models without admin rights or Developer Mode, and works with the npm `codex` install.",
+        "Windows: Codex uses its native patch tool to edit files.",
+        "Windows: re-running `nexus claude on` refreshes the status line, and `off` removes it.",
+        "Windows: detects VS Code Insiders, Cursor, OpenCode Desktop and the GitHub Copilot app where Windows installs them.",
+        "GitHub Copilot app: `nexus copilot-app on` no longer creates the app's database before its first launch. If an earlier run left that database, Nexus moves it aside.",
+        "OpenCode: `off` and `nexus uninstall` keep the Fireworks provider you set up yourself. The sidebar card skips versions it can't run on. `off` and uninstall also undo a partial Pi or Claude Desktop setup.",
+        "Claude Desktop receives a token for this computer instead of your Fireworks key. `nexus claude-desktop restart` reconnects it without changing its profile. `off` removes the Fireworks profile after a profile switch and keeps deleted profiles deleted. A catalog fetch failure no longer looks like an unknown model.",
+        "A newer model stays visible when its `-latest` alias points at an older one. `nexus claude demo` won't overwrite files through symlinks.",
+        "Keys: Linux desktop and SSH sessions share the encrypted copy once it's in use. On macOS, background commands no longer open Keychain dialogs. Nexus won't fall back to plaintext if it can't decrypt your key file and restricts access to the Cursor and VS Code databases before writing keys. Logout tells you where to revoke a key left active and reports a keychain copy it couldn't remove. Sign-in stops on stalled requests or a second browser opening the sign-in page, and Nexus tries to revoke a newly issued key it can't use.",
+        "Updates: the installer and `nexus update` follow published releases and agree on whether Claude Code is connected. Nexus validates downloads, shows progress, cleans up failed downloads, and reports whether it restored the previous install. After a failed check, it waits an hour before retrying. An interrupted FireConnect migration no longer blocks updates. If two Nexus runs migrate the old folder at once, only the run that did the work reports the move.",
+        "`nexus login --force` also replaces this machine's previous key for Platform and SSO accounts. Nexus deletes the old key only after verifying the new one and confirming that connected harnesses use it. If Nexus can't delete it, the sign-in output tells you where to revoke it. Browser sign-in JSON reports what happened to the old key.",
+        "`nexus status` mentions `FIREWORKS_API_KEY` only when it explains why no key is found."
+      ],
+      "footer": "After upgrading, restart your harnesses to load the updated settings. If Node changed since your macOS install of Nexus CLI 0.11.0, the update may ask for your Keychain password once in the terminal."
+    },
+    {
       "version": "0.11.0",
       "highlights": [
         "`nexus login` opens a new Nexus sign-in page: continue with Google, GitHub, LinkedIn, or email.",

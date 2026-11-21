@@ -12,7 +12,7 @@
  * - mirrors Anthropic's signed model catalog byte-for-byte (the app verifies
  *   it against a built-in key; a local cache keeps it working offline)
  *
- * Robustness rules (AGENTS.md): every upstream call is raced with a timeout,
+ * Robustness rules: every upstream call is raced with a timeout,
  * every failure degrades to a cached/local answer, and nothing throws past
  * the request boundary. Message content is never logged.
  */
@@ -25,8 +25,9 @@ import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 // Only the pure leaf: the shim must not pull the CLI's full module graph.
-import { serverlessLineup, thirdPartyDir } from "./lineup.mjs";
-import { autoCatalogEntry, autoCatalogEntryId } from "../../fireworks/models.mjs";
+import { isCustomModelOffered, serverlessLineup, thirdPartyDir } from "./lineup.mjs";
+import { autoCatalogEntry, autoCatalogEntryId, refreshServerlessCatalogCache } from "../../fireworks/models.mjs";
+import { isModelAccessDenial } from "../../fireworks/model-access.mjs";
 import {
   AUTO_PROVIDER_KEY_HEADERS,
   NEXUS_PROVIDERS_HEADER,
@@ -39,10 +40,15 @@ import { SHIM_HEALTH_PATH, ensureShimSecret, readShimSecret, shimHealthDigest } 
 import { timingSafeEqual } from "node:crypto";
 import { loopbackHostHeaders } from "../../system/loopback.mjs";
 import { buildFireconnectTelemetryHeaders } from "../../telemetry/request-headers.mjs";
+import { CLAUDE_DESKTOP_TOKEN_PREFIX, desktopTokenPath, isDesktopToken, readDesktopToken } from "./desktop-token.mjs";
+import { createStoredGatewayKeyLoader } from "./gateway-key.mjs";
+import { activeAccountResidency, fireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 const UPSTREAM = "https://api.fireworks.ai/inference";
 const UPSTREAM_TIMEOUT_MS = 300_000; // long prefills (800k+ tokens) legitimately take minutes
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_BUFFERED_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_TELEMETRY_LINE_CHARS = 1024 * 1024;
 const EST_CHARS_PER_TOKEN = 4;
 
 function argValue(name) {
@@ -121,13 +127,33 @@ async function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
-    req.on("data", (chunk) => {
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      req.off("data", onData);
+      req.resume();
+      reject(error);
+    };
+    const onData = (chunk) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) { reject(new Error("body too large")); req.destroy(); return; }
+      if (size > MAX_BODY_BYTES) {
+        fail(Object.assign(new Error("Request body too large."), { status: 413 }));
+        return;
+      }
       chunks.push(chunk);
+    };
+    req.on("data", onData);
+    req.once("end", () => {
+      if (settled) return;
+      settled = true;
+      const body = Buffer.concat(chunks);
+      chunks.length = 0;
+      resolve(body);
     });
-    req.once("end", () => resolve(Buffer.concat(chunks)));
-    req.once("error", reject);
+    req.once("error", fail);
+    req.once("aborted", () => fail(new Error("Client disconnected.")));
   });
 }
 
@@ -141,6 +167,10 @@ const HOP_HEADERS = new Set([
   "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
 ]);
 
+function hopHeaders(connection) {
+  return new Set([...HOP_HEADERS, ...String(connection ?? "").split(",").map((token) => token.trim().toLowerCase())]);
+}
+
 /**
  * Live lineup from the caches: the picker discovers models via /v1/models
  * (the profile carries no inferenceModels), and name mapping uses the same
@@ -153,15 +183,23 @@ export function createLineupLoader({ modelsCachePath, catalogDir, fallback }) {
   let memo = null;
   return async function currentLineup() {
     try {
-      const [ms, cs] = await Promise.all([
+      const manualModelsPath = path.join(path.dirname(modelsCachePath), "claude-desktop", "manual-models.json");
+      // Keyed on every file the line-up is built from: a model saved with
+      // `on --model` must show up without waiting for a catalog change.
+      const [ms, cs, mm] = await Promise.all([
         stat(modelsCachePath).then((s) => s.mtimeMs).catch(() => 0),
         stat(path.join(catalogDir, "catalog.json")).then((s) => s.mtimeMs).catch(() => 0),
+        stat(manualModelsPath).then((s) => s.mtimeMs).catch(() => 0),
       ]);
-      if (memo?.key === `${ms}:${cs}`) return memo.value;
+      const key = `${ms}:${cs}:${mm}`;
+      if (memo?.key === key) return memo.value;
       const serverless = await readJson(modelsCachePath);
       const catalog = await readJson(path.join(catalogDir, "catalog.json"));
       const entries = Array.isArray(serverless?.entries) ? serverless.entries
         : Array.isArray(serverless?.snapshot?.entries) ? serverless.snapshot.entries : [];
+      // What the catalog actually lists, before `auto` is added below: saved
+      // customs are compared with this, so no catalog keeps them all listed.
+      const servedEntries = [...entries];
       // The on-disk snapshot omits the auto mixes (loadServerlessCatalog
       // synthesizes them in-process); add them so the shim matches the CLI.
       if (!entries.some((e) => autoCatalogEntryId(e))) entries.push(autoCatalogEntry());
@@ -170,15 +208,17 @@ export function createLineupLoader({ modelsCachePath, catalogDir, fallback }) {
       // into the live map so requests work between poller ticks too. The store
       // is durable (off-safe): manual-models.json.
       if (lineup) {
-        const custom = await readJson(path.join(path.dirname(modelsCachePath), "claude-desktop", "manual-models.json")) ?? [];
+        const custom = await readJson(manualModelsPath) ?? [];
+        // Listed only while the catalog serves them (see isCustomModelOffered).
+        lineup.customs = custom.filter((m) => isCustomModelOffered(m, servedEntries));
         for (const m of custom) {
-          if (!lineup.models.some((e) => e.name === m.name)) {
+          if (lineup.customs.includes(m) && !lineup.models.some((e) => e.name === m.name)) {
             lineup.models.push({ name: m.name, labelOverride: m.label, anthropicFamilyTier: m.tier, isFamilyDefault: false });
           }
           lineup.modelMap.models[m.name] = m.shortId;
         }
       }
-      memo = { key: `${ms}:${cs}`, value: lineup ?? fallback() };
+      memo = { key, value: lineup ?? fallback() };
       return memo.value;
     } catch {
       return fallback();
@@ -243,7 +283,7 @@ export function createAutoKeysLoader({ configPath }) {
  * the profile file's mtime; never throws.
  * @param {{ home: string, dataDir: string }} opts
  */
-export function createGatewayKeyLoader({ home, dataDir }) {
+export function createLegacyGatewayKeyLoader({ home, dataDir }) {
   let memo = null;
   const lib = path.join(thirdPartyDir(home), "configLibrary");
   const validId = (id) => typeof id === "string" && /^[\w-]+$/.test(id);
@@ -258,12 +298,27 @@ export function createGatewayKeyLoader({ home, dataDir }) {
       const key = `${profilePath}:${mtime}`;
       if (memo?.key === key) return memo.value;
       const profile = mtime ? await readJson(profilePath) : null;
-      const value = typeof profile?.inferenceGatewayApiKey === "string" ? profile.inferenceGatewayApiKey : "";
+      const value = typeof profile?.inferenceGatewayApiKey === "string" && !isDesktopToken(profile.inferenceGatewayApiKey)
+        ? profile.inferenceGatewayApiKey : "";
       memo = { key, value };
       return value;
     } catch {
       return "";
     }
+  };
+}
+
+export function createGatewayKeyLoader({ dataDir }) {
+  let memo;
+  return async () => {
+    try {
+      const info = await stat(desktopTokenPath(dataDir)).catch(() => null);
+      const stamp = info ? `${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${info.size}` : "";
+      if (memo?.stamp === stamp) return memo.value;
+      const value = await readDesktopToken(dataDir) ?? "";
+      memo = { stamp, value };
+      return value;
+    } catch { return ""; }
   };
 }
 
@@ -293,8 +348,9 @@ function isJsonContentType(value) {
 /** Copy upstream response headers, dropping the hop-by-hop ones. */
 function copyUpstreamHeaders(headers) {
   const out = {};
+  const hop = hopHeaders(headers.get("connection"));
   for (const [k, v] of headers) {
-    if (!HOP_HEADERS.has(k) && k !== "content-encoding") out[k] = v;
+    if (!hop.has(k) && k !== "content-encoding" && k !== "content-length") out[k] = v;
   }
   return out;
 }
@@ -309,8 +365,12 @@ function reply(res, status, payload, headers = {}) {
   res.end(body);
 }
 
+// How much of a 403 body the shim keeps to recognize a Model Access refusal.
+// The body itself always streams through whole.
+const MAX_DENIAL_SNIFF_BYTES = 64 * 1024;
+
 export function createShimServer({
-  modelMap, catalogDir, upstreamOrigin = UPSTREAM, log = console.log,
+  modelMap, catalogDir, upstreamOrigin = fireworksInferenceUrl(UPSTREAM, activeAccountResidency("claude-desktop")), log = console.log,
   // When provided, requests resolve the model map and discovery list from
   // this live loader (serverless cache + signed catalog) instead of the
   // static modelMap.
@@ -328,12 +388,42 @@ export function createShimServer({
   // `nexus auto` are attached only to requests that carry this key; without
   // a loader they are never attached.
   gatewayKeyLoader = null,
+  legacyGatewayKeyLoader = null,
+  storedGatewayKeyLoader = null,
+  maxBufferedBodyBytes = MAX_BUFFERED_BODY_BYTES,
+  maxTelemetryLineChars = MAX_TELEMETRY_LINE_CHARS,
+  upstreamTimeoutMs = UPSTREAM_TIMEOUT_MS,
+  upstreamIdleTimeoutMs = UPSTREAM_TIMEOUT_MS,
+  // Called (never awaited) with the gateway key when the gateway refuses a
+  // turn under the account's Model Access policy, so the model catalog the
+  // line-up comes from can be refreshed now rather than when its TTL ends.
+  // Only the user's own client triggers it.
+  onModelAccessDenied = null,
 }) {
+  let bufferedBodyBytes = 0;
   const currentModelMap = async () => (lineupLoader ? (await lineupLoader()).modelMap : modelMap) ?? modelMap;
   // The Nexus attribution every other harness puts on its gateway traffic.
   // Desktop's own `on` is bespoke, so the shim is where these are added.
   const telemetryHeaders = buildFireconnectTelemetryHeaders(HARNESS.CLAUDE_DESKTOP);
   return http.createServer(async (req, res) => {
+    const controller = new AbortController();
+    let timer;
+    let nodeStream;
+    let reservedBytes = 0;
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.off("aborted", disconnect);
+      res.off("close", disconnect);
+      res.off("finish", cleanup);
+    };
+    const disconnect = () => {
+      controller.abort();
+      nodeStream?.destroy();
+      cleanup();
+    };
+    req.once("aborted", disconnect);
+    res.once("close", disconnect);
+    res.once("finish", cleanup);
     try {
       const url = new URL(req.url, "http://localhost");
       if (req.method === "GET" && url.pathname === "/") return reply(res, 200, "ok");
@@ -350,6 +440,17 @@ export function createShimServer({
         return reply(res, 200, shimHealthDigest(secret, nonce));
       }
 
+      const bodyBytes = Number(req.headers["content-length"] ?? MAX_BODY_BYTES);
+      if (bodyBytes > MAX_BODY_BYTES) {
+        req.resume();
+        return reply(res, 413, { error: { message: "Request body too large." } }, { connection: "close" });
+      }
+      if (bufferedBodyBytes + bodyBytes > maxBufferedBodyBytes) {
+        req.resume();
+        return reply(res, 503, { error: { message: "Too many buffered requests. Try again shortly." } }, { connection: "close" });
+      }
+      reservedBytes = bodyBytes;
+      bufferedBodyBytes += reservedBytes;
       const body = await readBody(req);
 
       // Health probe: count_tokens — estimate locally (~4 chars/token).
@@ -392,16 +493,38 @@ export function createShimServer({
       // that rebinds its own hostname to 127.0.0.1 still sends that name).
       // Anything else is still forwarded, just without the saved keys.
       const callerKey = inboundKey(req.headers);
-      const ownClient = Boolean(gatewayKeyLoader) && hostAllowed(req.headers.host, req.socket.localPort)
+      const bearer = typeof req.headers.authorization === "string" && /^bearer /i.test(req.headers.authorization)
+        ? req.headers.authorization.slice(7).trim() : "";
+      const credentials = [req.headers["x-api-key"], bearer].filter((value) => typeof value === "string");
+      const tokens = credentials.filter((value) => value.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX));
+      const token = gatewayKeyLoader ? await gatewayKeyLoader().catch(() => "") : "";
+      const tokenClient = isDesktopToken(token) && tokens.some((value) => sameSecret(value, token));
+      let storedKey = "";
+      if (tokens.length) {
+        if (!tokenClient || tokens.some((value) => !sameSecret(value, token))) {
+          return reply(res, 401, { error: { message: "Claude Desktop sent an outdated or invalid Nexus token. Quit and reopen Claude Desktop; if that doesn't help, run nexus claude-desktop on." } });
+        }
+        storedKey = storedGatewayKeyLoader ? await storedGatewayKeyLoader().catch(() => "") : "";
+        if (!storedKey || storedKey.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX)) {
+          return reply(res, 401, { error: { message: "No stored Fireworks key is available to the Desktop shim. Sign in again." } });
+        }
+      }
+      const legacyKey = legacyGatewayKeyLoader ? await legacyGatewayKeyLoader().catch(() => "") : "";
+      const ownClient = hostAllowed(req.headers.host, req.socket.localPort)
         && isJsonContentType(req.headers["content-type"])
-        && sameSecret(callerKey, await gatewayKeyLoader().catch(() => ""));
+        && (tokenClient || sameSecret(callerKey, legacyKey));
 
       const headers = {};
+      const hop = hopHeaders(req.headers.connection);
       for (const [name, value] of Object.entries(req.headers)) {
-        if (HOP_HEADERS.has(name) || name === "host" || name === "content-length") continue;
+        if (hop.has(name) || name === "host" || name === "content-length") continue;
         headers[name] = value;
       }
       headers["content-length"] = Buffer.byteLength(outBody);
+      if (tokenClient) {
+        delete headers["x-api-key"];
+        headers.authorization = `Bearer ${storedKey}`;
+      }
       // Desktop's 3p provider sends the key Anthropic-style; Fireworks wants Bearer.
       if (headers["x-api-key"] && !headers.authorization) {
         headers.authorization = `Bearer ${headers["x-api-key"]}`;
@@ -426,7 +549,7 @@ export function createShimServer({
       }
       if (autoKeysLoader && autoTurn && !ownClient) {
         // Names the failed condition only; never a key or header value.
-        const why = !gatewayKeyLoader ? "no gateway key loader"
+        const why = !gatewayKeyLoader && !legacyGatewayKeyLoader ? "no gateway key loader"
           : !hostAllowed(req.headers.host, req.socket.localPort) ? "Host is not a loopback name"
             : !isJsonContentType(req.headers["content-type"]) ? "content-type is not application/json"
               : "request key does not match the applied profile's key (restart Claude Desktop after a key change)";
@@ -440,19 +563,37 @@ export function createShimServer({
         const sent = [anthropicKey && "anthropic", openaiKey && "openai"].filter(Boolean);
         log(`[nexus-shim] auto turn: client verified; saved provider keys ${sent.length ? `sent (${sent.join(", ")})` : "none saved"}`);
       }
+      for (const name of Object.keys(headers)) {
+        if (hop.has(name.toLowerCase())) delete headers[name];
+      }
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+      if (controller.signal.aborted || res.destroyed) return;
+      timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+      timer.unref();
       let upstream;
       try {
-        upstream = await fetch(upstreamOrigin + url.pathname + url.search, {
+        const forward = () => fetch(upstreamOrigin + url.pathname + url.search, {
           method: req.method,
           headers,
           body: ["GET", "HEAD"].includes(req.method) ? undefined : outBody,
           signal: controller.signal,
         });
+        upstream = await forward();
+        if (upstream.status === 401 && tokenClient) {
+          storedGatewayKeyLoader.invalidate?.(storedKey);
+          const refreshedKey = await storedGatewayKeyLoader().catch(() => "");
+          if (!refreshedKey || refreshedKey.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX)) {
+            await upstream.body?.cancel().catch(() => {});
+            return reply(res, 401, { error: { message: "No stored Fireworks key is available to the Desktop shim. Sign in again." } });
+          }
+          if (refreshedKey !== storedKey) {
+            await upstream.body?.cancel().catch(() => {});
+            if (!hop.has("authorization")) headers.authorization = `Bearer ${refreshedKey}`;
+            upstream = await forward();
+          }
+        }
       } catch (error) {
-        clearTimeout(timer);
+        if (res.destroyed) return;
         if (error.name === "AbortError") {
           log(`[nexus-shim] upstream timeout for ${req.method} ${url.pathname}`);
           return reply(res, 504, { error: { type: "timeout_error", message: "Upstream timed out." } });
@@ -472,42 +613,117 @@ export function createShimServer({
 
       res.writeHead(upstream.status, copyUpstreamHeaders(upstream.headers));
       if (upstream.body) {
+        timer = setTimeout(() => controller.abort(), upstreamIdleTimeoutMs);
+        timer.unref();
         // Status-only usage telemetry: a second data listener watches the SSE
         // stream for usage deltas and logs the true token count. Never logs
         // message content. (pipe keeps backpressure; both listeners see data.)
-        const nodeStream = Readable.fromWeb(upstream.body);
+        nodeStream = Readable.fromWeb(upstream.body);
+        nodeStream.once("end", () => clearTimeout(timer));
         {
           let pending = "";
+          let parsing = true;
           nodeStream.on("data", (chunk) => {
-            // Carry over only the last (possibly incomplete) line; complete
-            // lines are scanned exactly once.
-            const text = pending + chunk.toString("utf8");
-            const lines = text.split("\n");
-            pending = lines.pop();
-            for (const line of lines) {
-              const m = /"type":"message_delta".*"usage":(\{[^}]*\})/.exec(line);
-              if (m) {
-                try {
-                  const u = JSON.parse(m[1]);
-                  const total = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
-                  if (total > 0) log(`[nexus-shim] usage ${total} in (${u.cache_read_input_tokens ?? 0} cached)`);
-                } catch {}
+            timer.refresh();
+            if (!parsing) return;
+            try {
+              // Carry over only the last (possibly incomplete) line; complete
+              // lines are scanned exactly once.
+              const text = pending + chunk.toString("utf8");
+              const lines = text.split("\n");
+              pending = lines.pop();
+              if (pending.length > maxTelemetryLineChars || lines.some((line) => line.length > maxTelemetryLineChars)) {
+                pending = "";
+                parsing = false;
+                return;
               }
+              for (const line of lines) {
+                const m = /"type":"message_delta".*"usage":(\{[^}]*\})/.exec(line);
+                if (m) {
+                  try {
+                    const u = JSON.parse(m[1]);
+                    const total = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+                    if (total > 0) log(`[nexus-shim] usage ${total} in (${u.cache_read_input_tokens ?? 0} cached)`);
+                  } catch {}
+                }
+              }
+            } catch {
+              pending = "";
+              parsing = false;
             }
           });
           // A dropped upstream body must end the client response; a client
           // stop (user aborted) must end the upstream request — otherwise
           // generation keeps running (and billing) with no one attached.
           nodeStream.on("error", () => res.destroy());
-          res.once("close", () => nodeStream.destroy());
+        }
+        if (upstream.status === 403) {
+          // A Model Access refusal streams to Desktop untouched like any other
+          // response; a capped copy is checked once it ends.
+          const kept = [];
+          let keptBytes = 0;
+          nodeStream.on("data", (chunk) => {
+            if (keptBytes >= MAX_DENIAL_SNIFF_BYTES) return;
+            const slice = chunk.subarray(0, MAX_DENIAL_SNIFF_BYTES - keptBytes);
+            kept.push(slice);
+            keptBytes += slice.length;
+          });
+          nodeStream.once("end", () => {
+            try {
+              if (!isModelAccessDenial(403, Buffer.concat(kept).toString("utf8"))) return;
+              log(`[nexus-shim] model-access policy refused ${routedModel ?? "the model"}`);
+              if (onModelAccessDenied && ownClient) {
+                const key = typeof headers.authorization === "string" ? headers.authorization.replace(/^bearer\s+/i, "") : "";
+                onModelAccessDenied({ apiKey: key });
+              }
+            } catch { /* observer only */ }
+          });
         }
         nodeStream.pipe(res);
       } else res.end();
     } catch (error) {
-      if (!res.headersSent) reply(res, 502, { error: { message: String(error?.message ?? error) } });
+      if (res.destroyed) return;
+      if (!res.headersSent) reply(res, error?.status === 413 ? 413 : 502, { error: { message: String(error?.message ?? error) } });
       else res.destroy();
+    } finally {
+      bufferedBodyBytes -= reservedBytes;
     }
   });
+}
+
+/**
+ * Refresh the serverless catalog cache after a Model Access refusal, at most
+ * once per `minIntervalMs` and one at a time: a burst of refused turns costs
+ * one listing. Does nothing under `NEXUS_TEST=1` or with
+ * `NEXUS_CATALOG_REFRESH_ON_DENIAL=0`. The refresh is bounded and never throws; its result lands in
+ * the cache file the line-up loader watches.
+ * @param {{ refresh?: (apiKey: string) => Promise<unknown>, minIntervalMs?: number, now?: () => number, log?: (line: string) => void, env?: Record<string, string | undefined> }} [options]
+ * @returns {(args: { apiKey: string }) => void}
+ */
+export function createModelAccessRefresher({
+  refresh = refreshServerlessCatalogCache,
+  minIntervalMs = 60_000,
+  now = Date.now,
+  log = console.log,
+  env = process.env,
+} = {}) {
+  let lastStartedAt = -Infinity;
+  let inFlight = false;
+  return function onModelAccessDenied({ apiKey } = {}) {
+    // Side effect gates: never under the test runner, and off with
+    // NEXUS_CATALOG_REFRESH_ON_DENIAL=0.
+    if (env.NEXUS_TEST === "1" || env.NEXUS_CATALOG_REFRESH_ON_DENIAL === "0") return;
+    if (!apiKey || inFlight || now() - lastStartedAt < minIntervalMs) return;
+    lastStartedAt = now();
+    inFlight = true;
+    Promise.resolve()
+      .then(() => refresh(apiKey))
+      .then((refreshed) => {
+        if (refreshed !== false) log("[nexus-shim] model catalog refreshed after a model-access refusal");
+      })
+      .catch(() => {})
+      .finally(() => { inFlight = false; });
+  };
 }
 
 async function main() {
@@ -536,6 +752,9 @@ async function main() {
     }),
     secretLoader: () => readShimSecret(dataDir),
     gatewayKeyLoader: createGatewayKeyLoader({ home, dataDir }),
+    legacyGatewayKeyLoader: createLegacyGatewayKeyLoader({ home, dataDir }),
+    storedGatewayKeyLoader: createStoredGatewayKeyLoader({ home }),
+    onModelAccessDenied: createModelAccessRefresher(),
     // The harness matrix's CI loopback; never honored outside tests, so a
     // stray variable can't send a real key elsewhere.
     ...(process.env.NEXUS_TEST === "1" && process.env.NEXUS_SHIM_UPSTREAM
@@ -567,7 +786,8 @@ async function main() {
       if (!lineup?.models?.length) return;
       // Custom models (on --model …) aren't in the lineup: keep them, and
       // route their ids in the live map. The store is durable (off-safe).
-      const custom = await readJson(path.join(dataDir, "manual-models.json")) ?? [];
+      // The loader already listed the ones the catalog serves.
+      const custom = lineup.customs ?? await readJson(path.join(dataDir, "manual-models.json")) ?? [];
       for (const m of custom) {
         if (!lineup.models.some((e) => e.name === m.name)) {
           lineup.models.push({ name: m.name, labelOverride: m.label, anthropicFamilyTier: m.tier, isFamilyDefault: false });

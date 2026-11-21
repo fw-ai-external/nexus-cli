@@ -1,4 +1,5 @@
-import { accent, bold, dim, muted, ok } from "../ui.mjs";
+import { accent, bold, colorsEnabled, dim, muted, ok } from "../ui.mjs";
+import { besideLogo } from "../ui/brand-logo.mjs";
 import { AZURE_PROVIDER_LABEL } from "../fireworks/azure-core.mjs";
 import { isFirerouterModelPattern, isFirerouterModel } from "../fireworks/model-id.mjs";
 
@@ -23,7 +24,7 @@ export function printCommandHint(label, command) {
 }
 
 /** Indented detail (secondary). */
-export function printDetail(label, value) {
+function printDetail(label, value) {
   console.log(`  ${muted(`${label}: ${value}`)}`);
 }
 
@@ -55,7 +56,14 @@ export const LOCAL_ONLY_NOTE =
 /** Harness turned on (direct Fireworks). */
 export function printHarnessConnected(name, { model } = {}) {
   const display = displayModel(model);
-  printSuccess(display ? `${name} → Fireworks · ${display}` : `${name} → Fireworks`);
+  const message = display ? `${name} → Fireworks · ${display}` : `${name} → Fireworks`;
+  // The Fireworks symbol beside the success line, on a color TTY only: in a
+  // pipe or CI log the bare Braille dots would just be noise.
+  if (colorsEnabled(process.stdout)) {
+    console.log(besideLogo([ok(message), muted(LOCAL_ONLY_NOTE)]).join("\n"));
+    return;
+  }
+  printSuccess(message);
   printNote(LOCAL_ONLY_NOTE);
 }
 
@@ -240,17 +248,24 @@ export function printDeepseekRestartHint() {
   printSessionRestartHint("DeepSeek Harness");
 }
 
-export function printOpenCodeRestartHint() {
-  printSessionRestartHint("OpenCode");
+/**
+ * @param {{ gatewayRunning?: boolean }} [opts] A live Hermes gateway (the Hermes
+ *   app's, a service's, or a terminal's) read config.yaml at startup and keeps
+ *   the old setup until restarted, so the hint names it.
+ */
+export function printHermesRestartHint({ gatewayRunning = false } = {}) {
+  if (!gatewayRunning) {
+    printSessionRestartHint("Hermes Agent");
+    return;
+  }
+  // Not `hermes gateway restart`: with no service installed it runs the new
+  // gateway in the calling terminal, and closing that terminal stops it.
+  printRestartHint(
+    "A Hermes gateway is running with the old setup. Restart it: quit and reopen the Hermes app, "
+    + "or run `hermes gateway stop` then `hermes gateway ensure`.",
+  );
 }
 
-export function printModelUpdate(message, hints = []) {
-  console.log(ok(message));
-  for (const hint of hints) {
-    if (typeof hint === "string") {
-      console.log(hint);
-    } else {
-      printCommandHint(hint.label, hint.command);
-    }
-  }
+export function printOpenCodeRestartHint() {
+  printSessionRestartHint("OpenCode");
 }

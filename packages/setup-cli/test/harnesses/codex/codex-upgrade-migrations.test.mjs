@@ -38,7 +38,7 @@ describe("migrateCodexCatalogConstantsOnUpgrade", () => {
       const bySlug = new Map((await readCatalog(home)).models.map((row) => [row.slug, row]));
       assert.equal(bySlug.get("kimi-latest")?.supports_search_tool, true);
       assert.equal(bySlug.get("firerouter/test-model")?.supports_search_tool, true);
-      assert.equal(bySlug.get("auto")?.supports_search_tool, true);
+      assert.equal(bySlug.get("nexus/auto")?.supports_search_tool, true);
       assert.equal(bySlug.get("firerouter/opus")?.supports_search_tool, true);
       const gptRows = [...bySlug.values()].filter((row) => row.slug.startsWith("gpt-"));
       assert.ok(gptRows.length > 0, "codex on writes the GPT sign-in rows");

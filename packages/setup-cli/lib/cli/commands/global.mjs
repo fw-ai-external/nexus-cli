@@ -3,7 +3,10 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 import { npmCommand, safeCommand } from "../../system/win-command.mjs";
+import { removeUninstallPaths } from "../../system/windows-uninstall.mjs";
+import { assertWindowsUninstallSafe } from "../../system/windows-uninstall-processes.mjs";
 import {
   DEFAULT_DATA_DIR,
 } from "../../harnesses/claude/core.mjs";
@@ -19,6 +22,7 @@ import {
 import {
   DEEPSEEK_DATA_RELATIVE_DIR,
 } from "../../harnesses/deepseek/constants.mjs";
+import { HERMES_DATA_RELATIVE_DIR } from "../../harnesses/hermes/constants.mjs";
 import {
   PI_DATA_RELATIVE_DIR,
 } from "../../harnesses/pi/core.mjs";
@@ -36,7 +40,7 @@ import {
 import { COPILOT_DATA_RELATIVE_DIR as COPILOT_APP_DATA_RELATIVE_DIR } from "../../harnesses/copilot-app/core.mjs";
 import { COPILOT_CLI_DATA_RELATIVE_DIR } from "../../harnesses/copilot-cli/config.mjs";
 import { globalConfigPath } from "../../config/global-config.mjs";
-import { getHarness, listRoutedHarnessIds } from "../../harness/registry.mjs";
+import { getHarness, listHarnessIdsToRestore } from "../../harness/registry.mjs";
 import { HARNESS, HARNESS_COMMANDS } from "../../harness/id.mjs";
 import { runConfigureCommand } from "./configure.mjs";
 import { runAutoCommand } from "./auto.mjs";
@@ -48,7 +52,7 @@ import { removeShellEnvHook } from "../../io/shell-env-hook.mjs";
 import { runClaudeUpgradePreflight } from "../../system/upgrade.mjs";
 import { finalizeInstallOrUpgrade } from "../../system/finalize-install.mjs";
 import { runUpgradeFinalize } from "../../system/upgrade-finalize.mjs";
-import { downloadCliTarball, fetchLatestVersion } from "../../system/tarball-update.mjs";
+import { downloadCliTarball, fetchLatestVersion, fetchPinnedRelease, isReleaseVersion } from "../../system/tarball-update.mjs";
 import { runtimeDepsInstalled } from "../../system/ensure-cli-deps.mjs";
 import { COMMAND, ownedLaunchers } from "../../system/launchers.mjs";
 import {
@@ -77,6 +81,7 @@ const HARNESS_DATA_DIR = {
   [HARNESS.CODEX]: CODEX_DATA_RELATIVE_DIR,
   [HARNESS.PI]: PI_DATA_RELATIVE_DIR,
   [HARNESS.DEEPSEEK]: DEEPSEEK_DATA_RELATIVE_DIR,
+  [HARNESS.HERMES]: HERMES_DATA_RELATIVE_DIR,
   [HARNESS.CURSOR]: CURSOR_DATA_RELATIVE_DIR,
   [HARNESS.VSCODE]: VSCODE_DATA_RELATIVE_DIR,
   [HARNESS.COPILOT_APP]: COPILOT_APP_DATA_RELATIVE_DIR,
@@ -86,7 +91,7 @@ const HARNESS_DATA_DIR = {
 const CLI_NAME = COMMAND;
 
 function helpLines(...lines) {
-  return lines.join("\n");
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
 function cmdBlock(title, entries) {
@@ -175,10 +180,10 @@ function claudeHelp() {
   );
 }
 
-function configHarnessHelp(id, label, { configPath, configPathNote = "", codexNote = "", displayId = id, force = false } = {}) {
+function configHarnessHelp(id, label, { configPath, configPathNote = "", codexNote = "", displayId = id, force = false, usage = false } = {}) {
   const onOpts = standardOnOpts({
     azure: Boolean(getHarness(id).azure),
-    modelNote: id === "deepseek" ? "default: auto" : id === "codex" ? "default: auto; a re-on keeps the current model" : "",
+    modelNote: id === "deepseek" ? "default: auto" : id === "hermes" ? "default: Nexus Auto" : id === "codex" ? "default: auto; a re-on keeps the current model" : "",
   });
   if (force) {
     onOpts.push(["--force", "Write while the ChatGPT app is running (not recommended)."]);
@@ -193,18 +198,27 @@ function configHarnessHelp(id, label, { configPath, configPathNote = "", codexNo
     `Usage: ${CLI_NAME} ${displayId} [command] [options]`,
     "",
     `Route ${label} through Fireworks. Bare \`${CLI_NAME} ${displayId}\` runs on.`,
-    codexNote ? `\n${codexNote}` : "",
+    "",
+    codexNote,
     "",
     cmdBlock("Commands", [
       ["on", "Enable Fireworks routing (default)."],
       ["off", "Restore your previous config."],
       ["status", "Show provider, auth, and model."],
+      ...(usage ? [["usage", "Pick session → live meter (Tab for the agents pane); snapshot with --json / --last-n."]] : []),
       ["help", "Show this help."],
     ]),
     "",
     optBlock("Options for on", onOpts),
     "",
-    optBlock("Options for status", [
+    ...(usage ? [optBlock("Options for usage", [
+      ["--session <id|path>", "One session: thread id prefix or rollout path."],
+      ["--days <N>", "Lookback for the session list, 1-365 (default 3)."],
+      ["--last-n <N>", "Snapshot of the latest N parent sessions."],
+      ["--plain", "Plain text summary (no interactive TUI styling)."],
+      ["-v, --verbose", "Request-level usage rows and rate details."],
+    ]), ""] : []),
+    optBlock(usage ? "Options for status, usage" : "Options for status", [
       ["--json", "Machine-readable JSON output."],
     ]),
     "",
@@ -285,6 +299,7 @@ export function printHelp(topic = "") {
       + "GPT turns are paid by Codex's own sign-in (your ChatGPT plan, or an OpenAI key from "
       + "`codex login --with-api-key`), else by an OpenAI Provider Key on your Fireworks account.",
     force: true,
+    usage: true,
   };
   const harnessHelp = {
     claude: claudeHelp(),
@@ -336,8 +351,18 @@ export function printHelp(topic = "") {
       configPath: "--config-path <path>",
       configPathNote: "Explicit ~/.dsh/settings.yaml path.",
     }),
+    hermes: helpLines(
+      configHarnessHelp("hermes", "Hermes Agent", {
+        configPath: "--config-path <path>",
+        configPathNote: "Explicit Hermes config.yaml path (default: $HERMES_HOME/config.yaml or ~/.hermes/config.yaml).",
+      }),
+      "",
+      "Selects Hermes's Fireworks provider with Nexus Auto as the default model, writes the plugin",
+      "that lists it, and saves your key as FIREWORKS_API_KEY in the .env next to config.yaml.",
+      "Switch models in Hermes with `/model`.",
+    ),
     "claude-desktop": helpLines(
-      `Usage: ${CLI_NAME} claude-desktop <on|off|status> | mcp <list|add|remove|sync>`,
+      `Usage: ${CLI_NAME} claude-desktop <on|off|status|restart> | mcp <list|add|remove|sync>`,
       "",
       CLAUDE_DESKTOP_LIMITED_NOTE,
       "",
@@ -351,6 +376,7 @@ export function printHelp(topic = "") {
       "  on                 enable (idempotent; pre-existing profiles backed up).",
       "  off                restore the previous configuration.",
       "  status             lane health: shim, applied profile, connectors.",
+      "  restart            restart the shim when status says it's down.",
       "",
       "  mcp list|add|remove|sync",
       "                     Manage connectors in the 3p profile. sync re-detects",
@@ -372,15 +398,20 @@ export function printHelp(topic = "") {
     login: helpLines(
       `Usage: ${CLI_NAME} login [options]`,
       "",
-      "Sign in to Fireworks and store an API key in the OS keychain.",
+      "Sign in to Fireworks through your browser and store this machine's API key in the OS keychain. Without a terminal (CI, scripts), sign in with an API key instead.",
       "",
       optBlock("Options", [
         ["--account <id>", "Enterprise SSO account id."],
-        ["--with-token", "Read API key from stdin (CI/non-interactive)."],
+        ["--with-token", "Without a terminal only (CI, scripts): read an API key from stdin. Refresh and revoke of that key happen on the API keys page."],
         ["--account-type <kind>", "With --with-token: nexus, platform, or unknown (default)."],
-        ["--paste", "Skip chooser and paste a key."],
-        ["--api-key <key>", "Sign in with this key directly."],
+        ["--api-key <key>", "Without a terminal only: sign in with this key."],
+        ["--browser", "Skip chooser and sign in through the browser; keeps this machine's key if it still works (--force replaces it)."],
         ["--force", "Skip the replace-key confirmation when already signed in (key rotation)."],
+        ["--json", "With --browser: print NDJSON events and one result on stdout (never the key). With no browser and no terminal, fails at once (no_browser); over SSH it prints the URL and waits for the forwarded sign-in port."],
+        ["--no-open", "With --browser: don't open a browser; print the sign-in URL."],
+        ["--signup", "With --browser: ask the sign-in page to start on sign-up (the page may show log-in, with a create-account link)."],
+        ["--select-account <id>", "With --browser: preselect this account on the sign-in page (you can still pick another)."],
+        ["--paste-code", "Fallback when you can't forward the sign-in port: the browser shows a code to paste here. Only paste a code from a browser you are using right now."],
         OPT_HOME,
       ]),
     ),
@@ -390,7 +421,10 @@ export function printHelp(topic = "") {
       "Clear stored Fireworks credentials (does not unset FIREWORKS_API_KEY in your shell).",
       "",
       optBlock("Options", [
-        ["--revoke", "Revoke this machine's key without prompting."],
+        ["--revoke", "Revoke this machine's key without prompting; you approve it in the browser."],
+        ["--paste-code", "With a revoke, when you can't forward the sign-in port: the browser shows a code to paste here. Only paste a code from a browser you are using right now."],
+        ["--json", "Print NDJSON on stdout, ending in one result line; never prompts here, and revokes the key browser sign-in created (approve it in the browser that opens; the URL comes as an authorize_url line; if no browser can open, logs out without waiting and warns; over SSH it prints the URL and waits for the forwarded sign-in port)."],
+        ["--no-open", "With --json: don't open a browser for the revoke; print its URL (authorize_url) and wait."],
       ]),
     ),
     status: helpLines(
@@ -484,7 +518,7 @@ export function printHelp(topic = "") {
       ["on", "Route the harness through Fireworks (default when omitted)."],
       ["off", "Restore previous provider settings."],
       ["status", "Show provider, auth, and models."],
-      ["usage", "Claude-only: session usage report."],
+      ["usage", "Claude Code and Codex: session usage report."],
       ["demo", "Claude-only: race two models on a prompt."],
       ["help", "Show harness-specific options."],
     ]),
@@ -564,6 +598,31 @@ export async function runFinalizeInstallCommand(ctx = {}) {
 }
 
 /**
+ * `npm install` for the runtime dependencies of the install at `setupDir`,
+ * matching install.sh: no lifecycle scripts (Nexus's own postinstall is
+ * skipped anyway, and a dependency's install script would run code the
+ * update did not vet), and npm's own output stays out of the update's `→`
+ * steps — its "added N packages" summary is discarded and only errors
+ * reach stderr — unless NEXUS_INSTALL_VERBOSE=1.
+ *
+ * @param {typeof execFileSync} execFile
+ * @param {string} setupDir
+ */
+function installRuntimeDepsWithNpm(execFile, setupDir) {
+  const verbose = process.env.NEXUS_INSTALL_VERBOSE === "1";
+  const [npmBin, npmArgs, npmOptions] = npmCommand([
+    "install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts",
+    `--loglevel=${verbose ? "notice" : "error"}`,
+  ]);
+  execFile(npmBin, npmArgs, {
+    cwd: setupDir,
+    env: { ...process.env, NEXUS_SKIP_POSTINSTALL_FINALIZE: "1" },
+    stdio: verbose ? "inherit" : ["ignore", "ignore", "inherit"],
+    ...npmOptions,
+  });
+}
+
+/**
  * Update path for tarball installs (no .git): check the published version over
  * HTTPS, and when it differs, download the tarball into a staging directory
  * and swap it in — the same staging/swap pattern install.sh uses, so a failed
@@ -590,6 +649,7 @@ async function runTarballUpdate({
   readRemoteVersion,
   downloadTarball,
   renameDir,
+  fetchImpl,
 }) {
   const before = await readVersion(installDir);
   if (before) {
@@ -597,8 +657,11 @@ async function runTarballUpdate({
   }
 
   infoFn("Checking for updates...");
-  const latest = await readRemoteVersion();
-  if (!latest) {
+  const bypassPinning = process.env.NEXUS_TARBALL_URL !== undefined
+    || readRemoteVersion !== fetchLatestVersion || downloadTarball !== downloadCliTarball;
+  const release = bypassPinning ? null : await fetchPinnedRelease({ fetchImpl });
+  const latest = bypassPinning ? await readRemoteVersion({ fetchImpl }) : release?.version;
+  if (!isReleaseVersion(latest)) {
     throw new Error(
       "Update failed: could not check the latest Nexus CLI version. "
       + "Check your network, then run the update again.",
@@ -614,27 +677,22 @@ async function runTarballUpdate({
     if ((!lockfileChanged && !missing) || !exists(setupDir)) {
       return;
     }
-    // No lifecycle scripts: Nexus's own postinstall is skipped anyway, and a
-    // dependency's install script would run code the update did not vet.
+    infoFn("Installing dependencies...");
     try {
-      const [npmBin, npmArgs, npmOptions] = npmCommand(["install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts"]);
-      execFile(npmBin, npmArgs, {
-        cwd: setupDir,
-        env: { ...process.env, NEXUS_SKIP_POSTINSTALL_FINALIZE: "1" },
-        stdio: "inherit",
-        ...npmOptions,
-      });
+      installRuntimeDepsWithNpm(execFile, setupDir);
     } catch (error) {
-      throw new Error(
-        `Update failed: could not install dependencies (${error.message}). `
-        + "Your previous install was put back; run the update again.",
-      );
+      throw new Error(`could not install dependencies (${error.message})`);
     }
   };
+  const DEPS_FAILED_HINT = "Your previous install was put back; run the update again.";
 
   if (before && before === latest) {
     infoFn(`Already up to date (v${before}).`);
-    installRuntimeDeps(false);
+    try {
+      installRuntimeDeps(false);
+    } catch (error) {
+      throw new Error(`Update failed: ${error.message}. ${DEPS_FAILED_HINT}`);
+    }
     await finalize(home, installDir);
     await printNotes({
       home,
@@ -657,7 +715,7 @@ async function runTarballUpdate({
     return;
   }
 
-  const staging = `${installDir}.download`;
+  const staging = `${installDir}.download-${randomUUID()}`;
   const lockfileRel = "packages/setup-cli/package-lock.json";
   const readLockfile = async (dir) => {
     try {
@@ -668,13 +726,18 @@ async function runTarballUpdate({
   };
   const oldLockfile = await readLockfile(installDir);
 
+  infoFn(`Downloading v${latest}...`);
   try {
-    await downloadTarball(staging);
+    await downloadTarball(staging, {
+      fetchImpl,
+      ...(release ? { url: release.tarballUrl, expectedSha: release.sha }
+        : process.env.NEXUS_TARBALL_URL !== undefined ? { url: process.env.NEXUS_TARBALL_URL } : {}),
+    });
     if (!exists(path.join(staging, "packages/setup-cli/bin/nexus.mjs"))) {
       throw new Error("download incomplete");
     }
   } catch (error) {
-    await rm(staging, { recursive: true, force: true });
+    if (error?.code !== "EEXIST") await rm(staging, { recursive: true, force: true });
     throw new Error(
       `Update failed: could not download the Nexus CLI tarball (${error.message}). `
       + "Your existing install was left in place.",
@@ -684,7 +747,7 @@ async function runTarballUpdate({
   let stagedVersion = "";
   try {
     const pkg = JSON.parse(await readFile(path.join(staging, "packages/setup-cli/package.json"), "utf8"));
-    if (typeof pkg?.version !== "string" || !pkg.version) {
+    if (!isReleaseVersion(pkg?.version)) {
       throw new Error("missing version");
     }
     stagedVersion = pkg.version;
@@ -694,6 +757,10 @@ async function runTarballUpdate({
       "Update stopped: could not read the version of the downloaded release. "
       + "Your existing install was left in place.",
     );
+  }
+  if (release && stagedVersion !== latest) {
+    await rm(staging, { recursive: true, force: true });
+    throw new Error("Update stopped: downloaded version does not match the checked metadata. Your existing install was left in place.");
   }
   try {
     assertNotDowngrade(before, stagedVersion);
@@ -710,20 +777,37 @@ async function runTarballUpdate({
   // take its place, or its dependencies won't install, the previous one
   // moves back. It is removed only once the new install is usable.
   const previous = `${installDir}.previous`;
-  const restorePrevious = async () => {
-    await rm(installDir, { recursive: true, force: true });
-    await renameDir(previous, installDir);
+  // Puts cli.previous back and returns the error to throw. When that fails
+  // too, nothing usable is left at ~/.nexus/cli, so say so and how to recover.
+  const restorePrevious = async (reason, hint) => {
+    try {
+      await rm(installDir, { recursive: true, force: true });
+      await renameDir(previous, installDir);
+    } catch (error) {
+      return new Error(
+        `Update failed: ${reason}, and the previous install could not be put back (${error.message}). `
+        + "Reinstall Nexus CLI to repair it:\n  curl -fsSL https://nexus.fireworks.ai/install.sh | bash",
+      );
+    }
+    return new Error(`Update failed: ${reason}. ${hint}`);
   };
-  await rm(previous, { recursive: true, force: true });
-  await renameDir(installDir, previous);
+  try {
+    await rm(previous, { recursive: true, force: true });
+    await renameDir(installDir, previous);
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true });
+    throw new Error(
+      `Update failed: could not move the current install aside (${error.message}). `
+      + "Your existing install was left in place.",
+    );
+  }
   try {
     await renameDir(staging, installDir);
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
-    await restorePrevious().catch(() => {});
-    throw new Error(
-      `Update failed: could not move the downloaded release into place (${error.message}). `
-      + "Your existing install was left in place.",
+    throw await restorePrevious(
+      `could not move the downloaded release into place (${error.message})`,
+      "Your existing install was left in place.",
     );
   }
 
@@ -731,8 +815,7 @@ async function runTarballUpdate({
   try {
     installRuntimeDeps(depsChanged);
   } catch (error) {
-    await restorePrevious().catch(() => {});
-    throw error;
+    throw await restorePrevious(error.message, DEPS_FAILED_HINT);
   }
   await rm(previous, { recursive: true, force: true });
 
@@ -785,6 +868,7 @@ async function runTarballUpdate({
  *   readRemoteVersion?: typeof fetchLatestVersion,
  *   downloadTarball?: typeof downloadCliTarball,
  *   renameDir?: typeof rename,
+ *   fetchImpl?: typeof fetch,
  * }} [dependencies]
  */
 export async function runUpgradeCommand({
@@ -806,6 +890,7 @@ export async function runUpgradeCommand({
   readRemoteVersion = fetchLatestVersion,
   downloadTarball = downloadCliTarball,
   renameDir = rename,
+  fetchImpl = fetch,
 } = {}) {
   if (!home) {
     throw new Error("HOME is not set; update requires HOME to be set.");
@@ -857,6 +942,7 @@ export async function runUpgradeCommand({
       readRemoteVersion,
       downloadTarball,
       renameDir,
+      fetchImpl,
     });
   }
 
@@ -900,7 +986,7 @@ export async function runUpgradeCommand({
         encoding: "utf8",
       });
       const version = JSON.parse(pkg).version;
-      if (typeof version !== "string" || !version) {
+      if (!isReleaseVersion(version)) {
         throw new Error("missing version");
       }
       fetchedVersion = version;
@@ -919,16 +1005,9 @@ export async function runUpgradeCommand({
     if ((!lockfileChanged && !missing) || !exists(setupDir)) {
       return;
     }
-    // No lifecycle scripts: Nexus's own postinstall is skipped anyway, and a
-    // dependency's install script would run code the update did not vet.
+    infoFn("Installing dependencies...");
     try {
-      const [npmBin, npmArgs, npmOptions] = npmCommand(["install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts"]);
-      execFile(npmBin, npmArgs, {
-        cwd: setupDir,
-        env: { ...process.env, NEXUS_SKIP_POSTINSTALL_FINALIZE: "1" },
-        stdio: "inherit",
-        ...npmOptions,
-      });
+      installRuntimeDepsWithNpm(execFile, setupDir);
     } catch (error) {
       throw new Error(`Update failed: could not install dependencies (${error.message}). Re-run the installer.`);
     }
@@ -1057,6 +1136,7 @@ async function restoreHarness(ctx, home, harnessId, force, { quiet = false } = {
     dataDir: "",
     force,
     quiet,
+    restoreAllVscodeProfiles: harnessId === HARNESS.VSCODE,
   };
   try {
     const outcome = await adapter.off(offCtx);
@@ -1090,7 +1170,7 @@ function assertNotDowngrade(installed, candidate) {
  * behind. The whole data directory comes last so
  * nothing is left behind (update-check.json, key-storage.json, plaintext
  * .api-key fallback), and after the launchers so a failure removing it doesn't
- * skip them. (gh fw-ai/nexus-cli#12)
+ * skip them.
  * @param {string} home
  */
 async function installFootprint(home) {
@@ -1159,7 +1239,7 @@ function unrecordedLegacyAside(home, recordedAsideDirs = setAsideDirs(home)) {
  *   cleanup step so the interactive path can tick a checklist.
  * @returns {Promise<{ path: string, message: string }[]>} removal failures
  */
-async function removeFireConnectFiles(home, removeCatalog, { skipPerHarnessDirs, reportStep } = {}) {
+async function removeFireConnectFiles(home, removeCatalog, { skipPerHarnessDirs, reportStep, cleanupPaths = removeUninstallPaths } = {}) {
   const aside = unrecordedLegacyAside(home);
   await removeShellEnvHook(home).catch(() => {});
   await reportStep?.("Shell environment hook");
@@ -1177,13 +1257,7 @@ async function removeFireConnectFiles(home, removeCatalog, { skipPerHarnessDirs,
     ...await installFootprint(home),
   ];
 
-  const removalFailures = [];
-  for (const pathToRemove of pathsToRemove) {
-    const failure = await removePath(pathToRemove);
-    if (failure) {
-      removalFailures.push(failure);
-    }
-  }
+  const { failures: removalFailures, deferred } = await cleanupPaths(home, pathsToRemove);
   if (aside.looksNexus) {
     if (aside.keyFiles.length > 0) {
       const keyFileNames = aside.keyFiles.map((keyFile) => path.basename(keyFile)).join(", ");
@@ -1192,7 +1266,10 @@ async function removeFireConnectFiles(home, removeCatalog, { skipPerHarnessDirs,
       console.log("Left ~/.nexus-pre: it looks like a backup from an older Nexus version. Delete it yourself if you don't need it.");
     }
   }
-  await reportStep?.("Nexus CLI files");
+  if (deferred.length > 0) {
+    console.log("Nexus CLI files and the Windows launcher are scheduled for removal after this process exits.");
+  }
+  await reportStep?.("Nexus CLI files", deferred.length > 0 ? "after exit" : "removed");
   return removalFailures;
 }
 
@@ -1261,7 +1338,7 @@ function printFarewell(restoredLabels) {
   }
   console.log("");
   console.log("  Sad to see you go! If something pushed you away, we'd like to know:");
-  console.log(`    ${accent("https://github.com/fw-ai/nexus-cli/issues")}`);
+  console.log(`    ${accent("https://github.com/fw-ai-external/nexus-cli/issues")}`);
   console.log("");
   console.log("  Reinstall anytime:");
   console.log(`    ${accent("curl -fsSL https://nexus.fireworks.ai/install.sh | bash")}`);
@@ -1275,7 +1352,7 @@ function printFarewell(restoredLabels) {
 function printUninstallSummary({ offErrors, removalFailures }) {
   const hasErrors = offErrors.length > 0 || removalFailures.length > 0;
   if (!hasErrors) {
-    console.log("Nexus CLI has been uninstalled. Restart any running harnesses (Claude Code, OpenCode, Codex, Pi, Cursor, VS Code, Copilot, DeepSeek Harness) to fully apply.");
+    console.log("Nexus CLI has been uninstalled. Restart any running harnesses (Claude Code, OpenCode, Codex, Pi, Cursor, VS Code, Copilot, DeepSeek Harness, Hermes Agent) to fully apply.");
     return;
   }
   for (const { harnessId, label, message } of offErrors) {
@@ -1308,7 +1385,7 @@ function printUninstallSummary({ offErrors, removalFailures }) {
  *
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
  */
-export async function runUninstallCommand(ctx) {
+export async function runUninstallCommand(ctx, { cleanupPaths = removeUninstallPaths, checkProcesses = assertWindowsUninstallSafe } = {}) {
   const home = process.env.HOME ?? "";
   if (!home) {
     throw new Error("HOME is not set; uninstall requires HOME to be set.");
@@ -1320,8 +1397,9 @@ export async function runUninstallCommand(ctx) {
     throw new Error("uninstall does not support path overrides");
   }
 
-  // Only harnesses that are actually on: one never routed has nothing to restore.
-  const harnessIds = await listRoutedHarnessIds(ctx, home);
+  await checkProcesses(home);
+
+  const harnessIds = await listHarnessIdsToRestore(ctx, home);
   // Interactive only when stdin is a TTY and the user didn't pass --force.
   // This mirrors `ensureIdeStopped`'s own TTY gate, so the two stay consistent:
   // a non-TTY (CI/pipe) keeps the historical force-restore-all behavior.
@@ -1434,11 +1512,13 @@ export async function runUninstallCommand(ctx) {
   }
 
   const cleanupWidth = "Shell environment hook".length;
+  await checkProcesses(home);
   const removalFailures = await removeFireConnectFiles(home, removeCatalog, {
+    cleanupPaths,
     skipPerHarnessDirs: interactive ? removedHarnessDirs : undefined,
     reportStep: interactive
-      ? async (label) => {
-        console.log(`    ${checkGlyph()} ${label.padEnd(cleanupWidth)}  removed`);
+      ? async (label, state = "removed") => {
+        console.log(`    ${checkGlyph()} ${label.padEnd(cleanupWidth)}  ${state}`);
         await pace(interactive, 160);
       }
       : undefined,

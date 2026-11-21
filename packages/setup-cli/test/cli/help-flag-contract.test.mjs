@@ -45,6 +45,19 @@ describe("harness help flag contract", () => {
     }
   });
 
+  it("renders one blank line between sections, never two", () => {
+    for (const harnessId of [...HARNESSES, "chatgpt"]) {
+      const help = helpTextFor(harnessId);
+      assert.doesNotMatch(help, /\n\n\n/, `${harnessId}: help has a doubled blank line`);
+      if (/runs on\./.test(help)) {
+        assert.match(help, /runs on\.\n\n\S/, `${harnessId}: no single blank line after the route line`);
+      }
+    }
+    for (const harnessId of ["codex", "chatgpt"]) {
+      assert.match(helpTextFor(harnessId), /runs on\.\n\nThe Codex CLI/, `${harnessId}: note not separated from the route line`);
+    }
+  });
+
   it("advertises no provider-key flags on Codex, which uses its own sign-in", () => {
     const help = helpTextFor("codex");
     assert.equal(getHarness("codex").firerouter.byok, "none");

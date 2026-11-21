@@ -10,13 +10,18 @@ import {
   buildCodexFirerouterCatalogEntry,
   buildCodexOpenaiCatalogEntry,
   CODEX_AUTO_COMPACT_FRACTION,
+  CODEX_AUTO_MODEL_SLUG,
   CODEX_CONSTANT_FIELDS,
   CODEX_MINIMAX_UNSUPPORTED_NOTE,
+  CODEX_WINDOWS_FIELDS,
   codexAutoCompactTokenLimit,
+  codexConstantFields,
   codexCatalogContainsModel,
   codexModelExclusionReason,
-  codexRowHasUsableContext,
+  codexModelRef,
+  codexModelSlug,
   filterPickerCatalogForCodex,
+  isLegacyCodexAutoSlug,
   MODEL_OVERRIDES,
   refreshCodexCatalogRows,
   isStaleCodexAutoLabel,
@@ -35,7 +40,20 @@ import {
   prettyModelName,
 } from "../../../lib/fireworks/models.mjs";
 import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
+import { NEXUS_AUTO_MODEL_ID } from "../../../lib/fireworks/model-id.mjs";
+import { CURSOR_AUTO_MODEL_ID } from "../../../lib/harnesses/cursor/core.mjs";
 import { mockServerlessModel } from "../../helpers.mjs";
+
+/** Run fn with process.platform reporting platform, restoring it afterwards. */
+function withPlatform(platform, fn) {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...original, value: platform });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
+}
 
 function mockModel(overrides = {}) {
   return mockServerlessModel({
@@ -84,7 +102,7 @@ describe("codex-catalog buildCodexCatalogEntry", () => {
     );
     assert.equal(router.slug, "glm-latest");
     assert.equal(router.auto_review_model_override, "glm-latest");
-    assert.equal(buildCodexAutoCatalogEntry("auto").auto_review_model_override, "auto");
+    assert.equal(buildCodexAutoCatalogEntry("auto").auto_review_model_override, "nexus/auto");
     assert.equal(
       buildCodexAutoCatalogEntry("auto-instant").auto_review_model_override,
       "auto-instant",
@@ -109,6 +127,115 @@ describe("codex-catalog buildCodexCatalogEntry", () => {
       buildCodexOpenaiCatalogEntry("gpt-9-sol", {}, null),
     ];
     assert.ok(rows.every((row) => row.supports_search_tool === true), rows.map((row) => row.slug).join(","));
+  });
+
+  function generatedPatchRows() {
+    const base = mockModel({ name: "accounts/fireworks/models/example-model" });
+    return [
+      buildCodexCatalogEntry(base),
+      buildCodexCatalogEntryForRouter("accounts/fireworks/routers/example-router", base, "Example Router"),
+      buildCodexFirerouterCatalogEntry(),
+      buildCodexFirerouterCatalogEntry("firerouter/example"),
+      buildCodexAutoCatalogEntry("auto"),
+      buildCodexOpenaiCatalogEntry("gpt-example", {}, null),
+    ];
+  }
+
+  const earlierPatchRows = () => [
+    { slug: "auto", base_instructions: "" },
+    { slug: "example-model", apply_patch_tool_type: null },
+    { slug: "firerouter/example", apply_patch_tool_type: "function" },
+    { slug: "gpt-example", base_instructions: "Stock instructions", apply_patch_tool_type: null },
+    { slug: "gpt-other", base_instructions: "Stock instructions", apply_patch_tool_type: "freeform" },
+  ];
+
+  it("enables native patches for generated model rows on Windows only", () => {
+    withPlatform("win32", () => {
+      for (const row of generatedPatchRows()) {
+        assert.equal(row.apply_patch_tool_type, "freeform", row.slug);
+      }
+    });
+    for (const platform of ["darwin", "linux"]) {
+      withPlatform(platform, () => {
+        for (const row of generatedPatchRows()) {
+          assert.equal(Object.hasOwn(row, "apply_patch_tool_type"), false, `${platform} ${row.slug}`);
+        }
+      });
+    }
+  });
+
+  it("codexConstantFields adds the Windows fields only on win32", () => {
+    assert.deepEqual(codexConstantFields("win32"), { ...CODEX_CONSTANT_FIELDS, ...CODEX_WINDOWS_FIELDS });
+    assert.equal(codexConstantFields("darwin"), CODEX_CONSTANT_FIELDS);
+    assert.equal(codexConstantFields("linux"), CODEX_CONSTANT_FIELDS);
+  });
+
+  it("on Windows, upgrades missing or stale patch capabilities without changing stock rows", () => {
+    withPlatform("win32", () => {
+      const rows = earlierPatchRows();
+      const restamped = withCodexConstantFields(rows, null);
+      assert.deepEqual(restamped.map((row) => row.apply_patch_tool_type), ["freeform", "freeform", "freeform", null, "freeform"]);
+      assert.deepEqual(withCodexConstantFields(restamped, null), restamped);
+      assert.equal(rows[0].apply_patch_tool_type, undefined);
+      assert.equal(rows[1].apply_patch_tool_type, null);
+      assert.deepEqual(withCodexConstantFields([], null), []);
+      assert.deepEqual(withCodexConstantFields([null, "invalid"], null), [null, "invalid"]);
+    });
+  });
+
+  it("off Windows, leaves every row's patch capability as it was", () => {
+    for (const platform of ["darwin", "linux"]) {
+      withPlatform(platform, () => {
+        const rows = earlierPatchRows();
+        const restamped = withCodexConstantFields(rows, null);
+        assert.deepEqual(
+          restamped.map((row) => row.apply_patch_tool_type),
+          rows.map((row) => row.apply_patch_tool_type),
+          platform,
+        );
+        assert.equal(Object.hasOwn(restamped[0], "apply_patch_tool_type"), false, platform);
+      });
+    }
+  });
+
+  it("keeps stock Codex patch capabilities when importing native rows", () => {
+    for (const capability of [null, "freeform"]) {
+      const native = { slug: "gpt-example", base_instructions: "Stock instructions", apply_patch_tool_type: capability };
+      assert.equal(buildCodexOpenaiCatalogEntry("gpt-example", {}, [native]).apply_patch_tool_type, capability);
+    }
+  });
+
+  it("names the auto mix nexus/auto, which the ChatGPT app doesn't take for its own Auto", () => {
+    assert.equal(CODEX_AUTO_MODEL_SLUG, "nexus/auto");
+    assert.equal(CODEX_AUTO_MODEL_SLUG, NEXUS_AUTO_MODEL_ID, "Codex sends the shared id");
+    assert.equal(CURSOR_AUTO_MODEL_ID, NEXUS_AUTO_MODEL_ID, "Cursor sends the same id");
+    const row = buildCodexAutoCatalogEntry("auto");
+    assert.equal(row.slug, "nexus/auto");
+    assert.equal(row.display_name, "Nexus Auto");
+    assert.equal(row.default_reasoning_level, undefined, "Nexus sets no default effort");
+    assert.equal(codexModelSlug("auto"), "nexus/auto");
+    assert.equal(codexModelSlug("glm-latest"), "glm-latest");
+    assert.equal(codexModelRef("nexus/auto"), "auto");
+    assert.equal(codexModelRef("auto"), "auto");
+    assert.equal(codexModelRef("glm-latest"), "glm-latest");
+    assert.equal(isLegacyCodexAutoSlug("auto"), true);
+    assert.equal(isLegacyCodexAutoSlug("nexus/auto"), false);
+    assert.equal(isLegacyCodexAutoSlug(undefined), false);
+    // Either spelling counts as the auto mix being in the picker.
+    assert.equal(codexCatalogContainsModel({ models: [row] }, "auto"), true);
+    assert.equal(codexCatalogContainsModel({ models: [{ slug: "auto" }] }, "auto"), true);
+  });
+
+  it("renames an earlier release's bare auto row in place and drops a duplicate", () => {
+    const legacy = { slug: "auto", display_name: "Nexus Auto", auto_review_model_override: "auto", priority: 99 };
+    const [renamed] = withCodexAutoRows([legacy]);
+    assert.equal(renamed.slug, "nexus/auto");
+    assert.equal(renamed.auto_review_model_override, "nexus/auto");
+    assert.deepEqual(Object.keys(renamed).slice(0, 4), Object.keys(legacy), "key order is kept");
+
+    const glm = { slug: "glm-latest" };
+    const both = withCodexAutoRows([legacy, glm, buildCodexAutoCatalogEntry("auto")]);
+    assert.deepEqual(both.map((row) => row.slug), ["nexus/auto", "glm-latest"]);
   });
 
   it("offers auto low through max, and keeps the standard ladder elsewhere", () => {
@@ -379,7 +506,7 @@ describe("codex-catalog buildCodexCatalog", () => {
   it("dynamically adds an auto entry so Codex can resolve its context", () => {
     const base = buildCodexCatalogFromSnapshot(buildServerlessCatalogSnapshot([]), []);
     const models = addCodexSelectedModel(base.models, base, "auto");
-    const entry = models.find((model) => model.slug === "auto");
+    const entry = models.find((model) => model.slug === "nexus/auto");
     assert.ok(entry);
     assert.equal(entry.display_name, "Nexus Auto");
     assert.equal(entry.context_window, 1_048_575);
@@ -413,7 +540,7 @@ describe("codex-catalog buildCodexCatalog", () => {
     const snapshot = buildServerlessCatalogSnapshot([mockModel()]);
     const entries = [...snapshot.entries, autoCatalogEntry()];
     const catalog = buildCodexCatalogFromSnapshot({ ...snapshot, entries }, [mockModel()]);
-    const entry = catalog.models.find((model) => model.slug === "auto");
+    const entry = catalog.models.find((model) => model.slug === "nexus/auto");
     assert.ok(entry, "auto is missing from the Codex catalog");
     assert.equal(entry.display_name, "Nexus Auto");
     assert.equal(entry.context_window, 1_048_575);
@@ -562,8 +689,6 @@ describe("codex-catalog buildCodexCatalog", () => {
       mockServerlessModel({
         id: "accounts/fireworks/models/kimi-k2p7-code",
         display_name: "Kimi K2.7 Code",
-        serverless_mode: "fast",
-        usage_identifier: "accounts/fireworks/routers/kimi-k2p7-code-fast",
         aliases: ["accounts/fireworks/routers/kimi-latest"],
         supports_tools: true,
         input_modalities: ["text", "image"],
@@ -664,7 +789,13 @@ describe("codex-catalog buildCodexCatalog", () => {
   });
 
   it("registers the kimi latest aliases the API reports on kimi-k2p7-code", () => {
+    // A plain `-latest` alias needs the standard row, `-fast-latest` the fast one.
     const catalog = buildCodexCatalog([
+      mockModel({
+        name: "accounts/fireworks/models/kimi-k2p7-code",
+        displayName: "Kimi K2.7 Code",
+        aliases: ["accounts/fireworks/routers/kimi-latest"],
+      }),
       mockModel({
         name: "accounts/fireworks/models/kimi-k2p7-code",
         displayName: "Kimi K2.7 Code",

@@ -90,7 +90,7 @@ describe("getOAuthArgumentsForAccount", () => {
     const result = await getOAuthArgumentsForAccount("nope", { baseUrl: url });
     assert.equal(result.ok, false);
     assert.match(result.failure, /Check the account ID/);
-    assert.match(result.failure, /--paste/);
+    assert.doesNotMatch(result.failure, /--paste\b/);
     server.close();
   });
 
@@ -147,7 +147,7 @@ describe("createUserJit", () => {
     server.close();
   });
 
-  it("fails softly when the control plane is unreachable", async () => {
+  it("fails softly when the Fireworks API is unreachable", async () => {
     const result = await createUserJit(ID_TOKEN, "example-account", { baseUrl: "http://127.0.0.1:1" });
     assert.equal(result.ok, false);
     assert.match(result.failure, /Couldn't reach/);

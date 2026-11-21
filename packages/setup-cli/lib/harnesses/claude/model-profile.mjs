@@ -7,7 +7,6 @@ import {
   isClaudeNativeModel,
   isClaudeNativeSlotAlias,
   isFirerouterModel,
-  isFirerouterModelPattern,
   isRetiredModelId,
   normalizeModelId,
   validateModelId,
@@ -53,10 +52,14 @@ const LEGACY_CLAUDE_MODEL_MIGRATIONS = Object.freeze({
  * (saved profile / live settings) mapping during activation so an existing
  * `claude on` install is migrated to the current routing; explicit per-run CLI
  * overrides are merged afterward and are not migrated.
+ *
+ * A legacy pin moves to its alias only when `isServed` says the account's
+ * catalog lists that alias: an alias the account can't use is never written.
  * @param {Record<string, string>} mapping
+ * @param {{ isServed?: (modelId: string) => boolean }} [options]
  * @returns {{ mapping: Record<string, string>, changed: boolean }}
  */
-export function migrateLegacyClaudeModelMapping(mapping = {}) {
+export function migrateLegacyClaudeModelMapping(mapping = {}, { isServed = () => true } = {}) {
   const next = {};
   let changed = false;
   for (const [slot, modelId] of Object.entries(mapping)) {
@@ -67,9 +70,10 @@ export function migrateLegacyClaudeModelMapping(mapping = {}) {
     // Retired pins carried over from an earlier `on` (FireRouter routes,
     // `auto-instant`) drop to the `auto` mix; explicit slot flags are
     // merged after this and win.
+    const legacyAlias = LEGACY_CLAUDE_MODEL_MIGRATIONS[fireworksModelSlug(modelId)];
     const target = isRetiredModelId(modelId)
       ? AUTO_MODEL_ID
-      : LEGACY_CLAUDE_MODEL_MIGRATIONS[fireworksModelSlug(modelId)];
+      : legacyAlias && isServed(legacyAlias) ? legacyAlias : undefined;
     if (target) {
       next[slot] = target;
       changed = true;
@@ -163,8 +167,9 @@ export function mappingUsesBareFirerouter(mapping) {
  * Whether a configured OpenAI key should ride along as `x-openai-api-key`:
  * bare `firerouter` anywhere (its mix can serve GPT primaries), or a GPT
  * compound like `firerouter/gpt-...` as the /model default or pinned to any
- * tier slot (saved or flagged). Pinned non-GPT compounds stay clean. Mirrors
- * `needsOpenaiKey` in `SlotMapping.lean`.
+ * tier slot (saved or flagged). Pinned non-GPT compounds stay clean.
+ * Mirrored in the CLI's internal formal models, which check it on a finite
+ * set of cases: change both together.
  * @param {Record<string, string>} mapping resolved Claude slot mapping
  * @param {string|null} defaultModel the top-level /model default `on` writes
  *   (`--model`, a kept saved pick, or the implicit firerouter default)

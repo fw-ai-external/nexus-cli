@@ -16,8 +16,12 @@ while IFS= read -r legacy_var; do
   [[ -n "${!current_var+x}" ]] || export "${current_var}=${!legacy_var}"
 done < <(compgen -e | grep '^FIRECONNECT_' || true)
 
-DEFAULT_SOURCE="https://github.com/fw-ai/nexus-cli.git"
+DEFAULT_SOURCE="https://github.com/fw-ai-external/nexus-cli.git"
 SOURCE="${NEXUS_SOURCE:-${DEFAULT_SOURCE}}"
+# The repo's name before it moved still means the default source.
+case "${SOURCE}" in
+  https://github.com/fw-ai/nexus-cli | https://github.com/fw-ai/nexus-cli/ | https://github.com/fw-ai/nexus-cli.git) SOURCE="${DEFAULT_SOURCE}" ;;
+esac
 # HTTPS tarball for the public repo, via the documented archive endpoint
 # (https://docs.github.com/en/rest/repos/contents — it redirects to GitHub's
 # archive host). `git clone` of a public HTTPS URL still consults the user's
@@ -25,7 +29,7 @@ SOURCE="${NEXUS_SOURCE:-${DEFAULT_SOURCE}}"
 # missing/revoked SSH key makes the public repo unclonable ("Permission
 # denied (publickey)"). The tarball goes straight over HTTPS and never
 # touches git configuration. (NEXUS_TARBALL_URL exists mainly for tests.)
-TARBALL_URL="${NEXUS_TARBALL_URL:-https://api.github.com/repos/fw-ai/nexus-cli/tarball/main}"
+TARBALL_URL="${NEXUS_TARBALL_URL:-https://api.github.com/repos/fw-ai-external/nexus-cli/tarball/main}"
 MIN_NODE_MAJOR=22
 CLAUDE_SETTINGS_RESTORED=0
 STAGED_DEPS_INSTALLED=0
@@ -76,7 +80,7 @@ ensure_node_runtime() {
   # Windows (Git Bash / MSYS / Cygwin): Node is frequently installed but not on
   # the PATH the shell inherits (e.g. C:\Program Files\nodejs). Probe the common
   # install location and add it to PATH for this session before giving up, so
-  # the installer doesn't dead-end when Node is present. (gh fw-ai/nexus-cli#11)
+  # the installer doesn't dead-end when Node is present.
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
       if ! command -v node >/dev/null 2>&1; then
@@ -115,7 +119,7 @@ ensure_node_runtime() {
   if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     # Prompt from the controlling terminal so this works under `curl … | bash`,
     # where stdin is the script stream (a plain `read -p` prompt never shows and
-    # would consume the next line of the script). (gh fw-ai/nexus-cli#11)
+    # would consume the next line of the script).
     if [[ -r /dev/tty ]]; then
       read -r -p "Install Node.js with Homebrew now? [y/N] " install_node </dev/tty
     else
@@ -276,12 +280,25 @@ const headers = typeof env.ANTHROPIC_CUSTOM_HEADERS === "string"
   })
   : [];
 const header = (name) => headers.find((entry) => entry.name === name)?.value ?? "";
+// Mirrors claudeFireconnectIntent in packages/setup-cli/lib/harnesses/claude/core.mjs.
 const hasTelemetry = headers.some(({ name, value }) => [
   "x-firerouter-harness",
   "x-title",
   "fireworks-use-case",
   "http-referer",
-].includes(name) || (name === "user-agent" && /^(fireconnect|nexus)\//i.test(value)));
+].includes(name) || (
+  name === "user-agent" && /^(?:fireconnect|nexus)\/(?:unknown|\d+\.\d+\.\d+)$/i.test(value)
+));
+const withoutContextSuffix = (value) => (
+  typeof value === "string" ? value.replace(/\[1m\]$/i, "") : value
+);
+// Main lives in the top-level `model` field; a bare picker alias pins nothing.
+const topLevelModel = typeof settings.model === "string"
+  ? withoutContextSuffix(settings.model.trim())
+  : "";
+const isPickerAlias = ["opus", "sonnet", "haiku", "fable"].includes(
+  withoutContextSuffix(topLevelModel.trim()).toLowerCase(),
+);
 const mappingKeys = [
   "ANTHROPIC_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -290,25 +307,18 @@ const mappingKeys = [
   "ANTHROPIC_DEFAULT_FABLE_MODEL",
   "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
-const isFireworksModelMapping = (value) => {
-  if (typeof value !== "string") {
-    return false;
-  }
-  const model = value.trim();
-  return model.startsWith("accounts/fireworks/")
-    || /^[a-z0-9][a-z0-9._-]*(?:\[1m\])?$/i.test(model);
-};
-const hasFireworksMapping = mappingKeys.some(
-  (key) => isFireworksModelMapping(env[key]),
-);
+// On Nexus's exact base URL every unset slot reads as Claude's native model.
+const hasFireworksMapping = env.ANTHROPIC_BASE_URL === "https://api.fireworks.ai/inference"
+  || Boolean(topLevelModel && !isPickerAlias)
+  || mappingKeys.some((key) => Boolean(withoutContextSuffix(env[key])));
 const fireworksHeader = header("x-fireworks-api-key");
 const currentHelper = typeof settings.apiKeyHelper === "string" ? settings.apiKeyHelper : "";
-const hasManagedHelper = (
-  typeof state.managedApiKeyHelper === "string"
-  && currentHelper === state.managedApiKeyHelper
-) || (
-  /(?:^|[/\\])fireconnect(?:\.mjs)?['"]?(?:\s|$)/.test(currentHelper)
-  && /(?:^|\s)key\s+export(?:\s|$)/.test(currentHelper)
+const hasManagedHelper = Boolean(currentHelper) && (
+  (Boolean(state.managedApiKeyHelper) && currentHelper === state.managedApiKeyHelper)
+  || (
+    /(?:^|[/\\])(?:fireconnect|nexus)(?:\.mjs|\.cmd)?['"]?(?:\s|$)/.test(currentHelper)
+    && /(?:^|\s)key\s+export(?:\s|$)/.test(currentHelper)
+  )
 );
 const hasManagedEvidence = Object.hasOwn(backup, "snapshot")
   || Object.hasOwn(backup, "values")
@@ -418,19 +428,60 @@ print_claude_restore_summary() {
   echo "Reconnect Claude Code through Nexus CLI: nexus claude"
 }
 
-# Fetch the public release tarball over plain HTTPS into $1. Fails (returning
-# non-zero) when curl/wget/tar is unavailable or the download is incomplete.
-# Timeouts keep the wait bounded.
+LATEST_RELEASE_URL="https://github.com/fw-ai-external/nexus-cli/releases/latest"
+
+# Prints the newest public Release's tag (v<MAJOR.MINOR.PATCH>), read from
+# where $LATEST_RELEASE_URL redirects (a github.com redirect, not the
+# rate-limited REST API). Fails when there is no Release or the redirect is
+# anything else.
+latest_release_tag() {
+  local location="" line tag
+  if [[ "$1" == curl ]]; then
+    location="$(curl -fsS -I -o /dev/null --connect-timeout 15 --max-time 60 \
+      -w '%{redirect_url}' "${LATEST_RELEASE_URL}")" || return 1
+  else
+    # wget exits non-zero when it stops at the redirect; the header is what counts.
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      [[ "${line}" =~ ^[[:space:]]*[Ll]ocation:[[:space:]]*(.*)$ ]] && location="${BASH_REMATCH[1]}"
+    done < <(wget -q -S --max-redirect=0 -T 30 -O /dev/null "${LATEST_RELEASE_URL}" 2>&1 || true)
+  fi
+  tag="${location#https://github.com/fw-ai-external/nexus-cli/releases/tag/}"
+  [[ "${tag}" != "${location}" && "${tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s' "${tag}"
+}
+
+# Fetch the newest public Release's tarball over plain HTTPS into $1. Fails
+# (returning non-zero) when curl/wget/tar is unavailable, there is no Release
+# or the download is incomplete. Timeouts keep the wait bounded.
 download_cli_tarball() {
   local staging="$1"
+  local url="${TARBALL_URL}"
+  local sha tag
   command -v tar >/dev/null 2>&1 || return 1
   if command -v curl >/dev/null 2>&1; then
+    if [[ -z "${NEXUS_TARBALL_URL+x}" ]]; then
+      tag="$(latest_release_tag curl)" || return 1
+      sha="$(curl -fsSL --connect-timeout 15 --max-time 300 -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/fw-ai-external/nexus-cli/commits/${tag}" && printf '.')" || return 1
+      sha="${sha%.}"
+      [[ ${#sha} -eq 40 && "${sha}" != *[!0-9a-f]* ]] || return 1
+      url="https://api.github.com/repos/fw-ai-external/nexus-cli/tarball/${sha}"
+    fi
     # -L: the documented api.github.com archive endpoint redirects to the
     # archive host.
-    curl -fsSL --connect-timeout 15 --max-time 300 "${TARBALL_URL}" \
+    curl -fsSL --connect-timeout 15 --max-time 300 "${url}" \
       | tar -xzf - -C "${staging}" --strip-components=1
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 30 -O - "${TARBALL_URL}" \
+    if [[ -z "${NEXUS_TARBALL_URL+x}" ]]; then
+      tag="$(latest_release_tag wget)" || return 1
+      sha="$(wget -q -T 30 --header='Accept: application/vnd.github.sha' -O - \
+        "https://api.github.com/repos/fw-ai-external/nexus-cli/commits/${tag}" && printf '.')" || return 1
+      sha="${sha%.}"
+      [[ ${#sha} -eq 40 && "${sha}" != *[!0-9a-f]* ]] || return 1
+      url="https://api.github.com/repos/fw-ai-external/nexus-cli/tarball/${sha}"
+    fi
+    wget -q -T 30 -O - "${url}" \
       | tar -xzf - -C "${staging}" --strip-components=1
   else
     return 1
@@ -484,7 +535,7 @@ ensure_durable_source() {
   if (( ! downloaded )); then
     echo "Couldn't download Nexus CLI from ${SOURCE}; your existing install was left in place." >&2
     if [[ "${SOURCE}" == "${DEFAULT_SOURCE}" ]]; then
-      echo "Check your network (the installer downloads ${TARBALL_URL} over HTTPS)." >&2
+      echo "Check your network (the installer downloads the latest release from github.com/fw-ai-external/nexus-cli over HTTPS)." >&2
     else
       echo "Your git configuration may be blocking the clone; see 'git config --get-regexp url\\..*\\.insteadof'." >&2
     fi
@@ -650,11 +701,11 @@ const OWNED = [
   "catalog-cache.json", "list-price-cache.json", "codex-stock-models.json",
   "update-check.json", "update-check.lock", "release-notes.json", "minted-key.json",
   "demo.json", ".api-key", ".secret-memory",
-  "cli", "claude-desktop", "statusline-refresh", "set-aside.json",
+  "cli", "claude-desktop", "statusline-refresh", "set-aside.json", "rename-merging",
 ];
 const STRONG = [
   "key-storage.json", "secret-backend.json", "rename-complete", "rename-announced",
-  "minted-key.json", ".secret-memory",
+  "minted-key.json", ".secret-memory", "rename-merging",
 ];
 let entries = [];
 try { entries = fs.readdirSync(dir); } catch { process.exit(0); }
@@ -767,6 +818,14 @@ else fs.symlinkSync(path.basename(target), legacy, "dir");
   fi
 }
 
+finalize_install() {
+  if { : </dev/tty; } 2>/dev/null; then
+    node "${CLI}" finalize-install </dev/tty
+  else
+    node "${CLI}" finalize-install
+  fi
+}
+
 main() {
   ensure_node_runtime
   check_names_are_ours
@@ -782,7 +841,7 @@ main() {
   # enabled harness keys, retire the Claude WebSearch MCP, reconcile shell hook.
   # Best-effort — never abort after the launcher is already on disk.
   install_progress "Finalizing install..."
-  if ! node "${CLI}" finalize-install; then
+  if ! finalize_install; then
     install_note "Post-install finalize skipped (non-fatal). Run: nexus update"
   fi
 

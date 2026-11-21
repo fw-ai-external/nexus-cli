@@ -236,6 +236,15 @@ describe("Claude model profiles", () => {
     assert.deepEqual(clean.mapping, defaultClaudeModelMapping());
   });
 
+  it("keeps a legacy pin when the account's catalog doesn't serve its alias", () => {
+    const migrated = migrateLegacyClaudeModelMapping(
+      { haiku: "deepseek-v4-flash", opus: "firerouter" },
+      { isServed: (modelId) => modelId !== "deepseek-flash-latest" },
+    );
+    // The alias is never written; retired FireRouter pins still go to auto.
+    assert.deepEqual(migrated.mapping, { haiku: "deepseek-v4-flash", opus: "auto" });
+  });
+
   it("migrates FireRouter slots carried over from an earlier on to auto", () => {
     const migrated = migrateLegacyClaudeModelMapping({
       main: "firerouter",

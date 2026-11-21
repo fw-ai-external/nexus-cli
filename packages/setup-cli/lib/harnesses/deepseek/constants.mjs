@@ -1,10 +1,11 @@
+import { FIREWORKS_OPENAI_BASE_URL } from "../../fireworks/model-id.mjs";
 export const DEEPSEEK_HOME_RELATIVE_DIR = ".dsh";
 export const DEEPSEEK_DATA_RELATIVE_DIR = ".nexus/deepseek";
 
 /** Provider route id under `llm-pi-ai.providers`. */
 export const DEEPSEEK_FIREWORKS_PROVIDER_ID = "fireworks";
 /** OpenAI-compatible Fireworks inference base (includes `/v1`). */
-export const DEEPSEEK_FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+export const DEEPSEEK_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 export const DEEPSEEK_API_KEY_ENV = "FIREWORKS_API_KEY";
 
 export const DEEPSEEK_LLM_PI_AI_NS = "llm-pi-ai";

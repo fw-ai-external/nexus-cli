@@ -10,6 +10,7 @@ import {
 import { usageCostDigits } from "./format.mjs";
 
 const ANTHROPIC_PRICING_DOCS_URL = "https://platform.claude.com/docs/en/about-claude/pricing";
+const OPENAI_PRICING_DOCS_URL = "https://openai.com/api/pricing";
 
 const RESET = ANSI.reset;
 const DIM = ANSI.muted;
@@ -36,7 +37,7 @@ export function formatCostEstimateNote() {
   return [
     "Cost estimate:",
     "  Fireworks-served model estimate per request: (input * input rate + cache writes * cache-write rates + cache reads * cache-read rate + output * output rate) / 1,000,000.",
-    `  Anthropic model usage is fetched from session logs; estimated cost is calculated from local rates and may be affected by tool usage, inference service tier and location, and other factors. Reference: ${ANTHROPIC_PRICING_DOCS_URL}`,
+    `  Anthropic and OpenAI model usage is fetched from session logs; estimated cost is calculated from local rates and may be affected by tool usage, inference service tier and location, and other factors. Reference: ${ANTHROPIC_PRICING_DOCS_URL}, ${OPENAI_PRICING_DOCS_URL}`,
     "  ***All pricing shown below are estimates based on token usage, please refer to service-specific billing pages for actual cost information***",
   ];
 }
@@ -144,8 +145,9 @@ function displayModelName(model) {
   return model;
 }
 
-function sessionId(report) {
-  return path.basename(report.path, ".jsonl");
+/** A report's session id: its own, else the log's filename (Codex rollouts name a timestamp first). */
+export function sessionId(report) {
+  return report.sessionId || path.basename(report.path, ".jsonl");
 }
 
 function shortSessionId(id) {

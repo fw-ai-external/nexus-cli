@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -49,6 +50,11 @@ function markerFile(home, sessionId) {
   return path.join(home, ".nexus", "statusline-refresh", `${sessionId}.refreshed`);
 }
 
+function claimFiles(home, sessionId) {
+  return readdirSync(path.join(home, ".nexus", "statusline-refresh"))
+    .filter((name) => name.startsWith(`${sessionId}.`) && name.endsWith(".claim"));
+}
+
 function pricedUsage() {
   return { models: [{ label: "Ember-1", cost: 0.03 }] };
 }
@@ -88,7 +94,7 @@ describe("claimSessionPriceHealing", () => {
       delete process.env.NEXUS_TEST;
       try {
         assert.equal(claimSessionPriceHealing(opts), true);
-        assert.ok(existsSync(markerFile(home, "sess-1")));
+        assert.equal(claimFiles(home, "sess-1").length, 1);
         assert.equal(claimSessionPriceHealing(opts), false);
         assert.equal(
           claimSessionPriceHealing({ ...opts, transcriptPath: "/t/sess-2.jsonl" }),
@@ -139,7 +145,7 @@ describe("claimSessionPriceHealing", () => {
           true,
         );
         assert.equal(existsSync(stale), false);
-        assert.ok(existsSync(markerFile(home, "new")));
+        assert.equal(claimFiles(home, "new").length, 1);
       } finally {
         if (prev === undefined) {
           delete process.env.NEXUS_TEST;
@@ -189,6 +195,97 @@ describe("claimSessionPriceHealing", () => {
         assert.equal(claimSessionPriceHealing(opts), true);
         assert.equal(claimSessionPriceHealing(opts), false);
       } finally {
+        if (prev === undefined) {
+          delete process.env.NEXUS_TEST;
+        } else {
+          process.env.NEXUS_TEST = prev;
+        }
+      }
+    });
+  });
+
+  it("hands a model back when its refresh fails to spawn", () => {
+    withTempHome((home) => {
+      const prev = process.env.NEXUS_TEST;
+      delete process.env.NEXUS_TEST;
+      try {
+        const opts = { home, transcriptPath: "/t/retry.jsonl", usage: unpricedUsage() };
+        assert.equal(claimSessionPriceHealing(opts), true);
+        assert.equal(spawnPriceRefresh({ home, sessionId: "retry", spawnFn: () => { throw new Error("EAGAIN"); } }), null);
+        assert.equal(claimFiles(home, "retry").length, 0);
+        assert.equal(claimSessionPriceHealing(opts), true);
+      } finally {
+        if (prev === undefined) {
+          delete process.env.NEXUS_TEST;
+        } else {
+          process.env.NEXUS_TEST = prev;
+        }
+      }
+    });
+  });
+
+  it("a failed refresh releases only the models it was spawned for", () => {
+    withTempHome((home) => {
+      const prev = process.env.NEXUS_TEST;
+      delete process.env.NEXUS_TEST;
+      try {
+        const listeners = [];
+        const spawnFn = () => ({ unref() {}, on(event, fn) { listeners.push(fn); return this; } });
+        const first = { home, transcriptPath: "/t/two.jsonl", usage: unpricedUsage() };
+        assert.equal(claimSessionPriceHealing(first), true);
+        spawnPriceRefresh({ home, sessionId: "two", spawnFn });
+        const second = { ...first, usage: { models: [...unpricedUsage().models, { label: "Other", cost: null }] } };
+        assert.equal(claimSessionPriceHealing(second), true);
+        spawnPriceRefresh({ home, sessionId: "two", spawnFn });
+        assert.equal(claimFiles(home, "two").length, 2);
+        listeners[0](new Error("ENOENT"));
+        assert.equal(claimFiles(home, "two").length, 1);
+        assert.equal(claimSessionPriceHealing(first), true, "the failed refresh's model is claimable again");
+        const otherOnly = { ...first, usage: { models: [{ label: "Other", cost: null }] } };
+        assert.equal(claimSessionPriceHealing(otherOnly), false, "the live refresh keeps its claim");
+      } finally {
+        if (prev === undefined) {
+          delete process.env.NEXUS_TEST;
+        } else {
+          process.env.NEXUS_TEST = prev;
+        }
+      }
+    });
+  });
+
+  it("lets only one of two concurrent turns claim the same model", () => {
+    withTempHome((home) => {
+      const prev = process.env.NEXUS_TEST;
+      delete process.env.NEXUS_TEST;
+      const realRead = fs.readFileSync;
+      try {
+        const opts = { home, transcriptPath: "/t/race.jsonl", usage: unpricedUsage() };
+        const dir = path.join(home, ".nexus", "statusline-refresh");
+        let raced = false;
+        let other = null;
+        // The other turn runs in full between this turn's marker read and its claim.
+        fs.readFileSync = function readThenRace(file, ...rest) {
+          let result;
+          let error;
+          try {
+            result = realRead.call(this, file, ...rest);
+          } catch (caught) {
+            error = caught;
+          }
+          if (!raced && String(file).startsWith(dir)) {
+            raced = true;
+            other = claimSessionPriceHealing(opts);
+          }
+          if (error) throw error;
+          return result;
+        };
+        syncBuiltinESMExports();
+        const mine = claimSessionPriceHealing(opts);
+        assert.equal(other, true);
+        assert.equal(mine, false, "both turns claimed the same model");
+      } finally {
+        fs.readFileSync = realRead;
+        syncBuiltinESMExports();
         if (prev === undefined) {
           delete process.env.NEXUS_TEST;
         } else {

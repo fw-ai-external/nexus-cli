@@ -61,8 +61,12 @@ describe("ui tokens", () => {
       assert.doesNotMatch(page, /—|·/, "no em dash or middle dot");
       assert.doesNotMatch(page, /<(script|link|img|iframe)\b|url\(/i, "no scripts or network assets");
     }
-    assert.match(callbackPage(false), /Use an API key instead/);
+    assert.match(callbackPage(false), /href="https:\/\/nexus\.fireworks\.ai\/settings\/api-keys">Use an API key instead/);
     assert.doesNotMatch(callbackPage(true), /Use an API key instead/);
+    assert.match(
+      callbackPage(false, { keysUrl: "https://app.fireworks.ai/settings/users/api-keys" }),
+      /href="https:\/\/app\.fireworks\.ai\/settings\/users\/api-keys">Use an API key instead/,
+    );
     assert.match(callbackPage(true), /Return to your terminal\./);
     assert.match(callbackPage(false, { returnTo: "app" }), /Return to the Nexus app to try again\./);
     assert.match(callbackPage(true, { returnTo: "app" }), /Return to the Nexus app\./);

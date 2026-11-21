@@ -25,6 +25,8 @@ const SET_ASIDE_NAME = /^\.nexus-pre(?:-\d+)?$/;
 
 const RENAME_COMPLETE_MARKER = "rename-complete";
 const RENAME_ANNOUNCED_MARKER = "rename-announced";
+/** Written into `~/.nexus` before a merge so a run that dies part way leaves it ours. */
+const MERGE_CLAIM_MARKER = "rename-merging";
 
 /**
  * @param {string} file
@@ -82,6 +84,7 @@ export const NEXUS_OWNED_FILENAMES = Object.freeze([
   "claude-desktop",
   "statusline-refresh",
   SET_ASIDE_RECORD_FILENAME,
+  MERGE_CLAIM_MARKER,
 ]);
 
 /**
@@ -99,6 +102,7 @@ export const NEXUS_STRONG_FILENAMES = Object.freeze([
   RENAME_ANNOUNCED_MARKER,
   "minted-key.json",
   ".secret-memory",
+  MERGE_CLAIM_MARKER,
 ]);
 
 function readSetAsideRecord(home) {
@@ -127,6 +131,42 @@ function recordSetAside(home, aside) {
   } catch {
     // Best effort: without the record, uninstall leaves the aside directory.
   }
+}
+
+/**
+ * Drop `aside` from the record once it is known not to be set aside.
+ * @param {string} home
+ * @param {string} aside
+ */
+function forgetSetAside(home, aside) {
+  const names = readSetAsideRecord(home);
+  if (!names.includes(path.basename(aside))) {
+    return;
+  }
+  try {
+    writeFileAtomicSync(
+      path.join(home, DATA_DIRNAME, SET_ASIDE_RECORD_FILENAME),
+      `${JSON.stringify(names.filter((name) => name !== path.basename(aside)))}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // A stale name is harmless: readers skip a recorded directory that is missing.
+  }
+}
+
+/**
+ * Where to set `~/.fireconnect` aside: a recorded name whose directory is
+ * missing (a run that died after recording it), else a fresh one.
+ * @param {string} home
+ */
+function setAsidePath(home) {
+  const missing = readSetAsideRecord(home).find((name) => !lstatOrNull(path.join(home, name)));
+  if (missing) {
+    return path.join(home, missing);
+  }
+  return lstatOrNull(path.join(home, LEGACY_ASIDE_DIRNAME))
+    ? path.join(home, `${LEGACY_ASIDE_DIRNAME}-${Date.now()}`)
+    : path.join(home, LEGACY_ASIDE_DIRNAME);
 }
 
 /**
@@ -177,11 +217,29 @@ export function isNexusDataDir(dir) {
 }
 
 /**
+ * Whether the directory `dir` described (an lstat result) still exists under a
+ * recorded set-aside name, meaning a concurrent run renamed it rather than this
+ * run removing it.
+ * @param {string} home
+ * @param {import("node:fs").Stats | null} dir
+ */
+function stillSetAside(home, dir) {
+  if (!dir?.isDirectory()) {
+    return false;
+  }
+  return readSetAsideRecord(home).some((name) => {
+    const aside = lstatOrNull(path.join(home, name));
+    return Boolean(aside) && aside.ino === dir.ino && aside.dev === dir.dev;
+  });
+}
+
+/**
  * Point `~/.fireconnect` at `~/.nexus` so anything still holding the old path
  * (a pre-rename launcher or upgrader, an open harness session, a downgrade)
  * reads and writes the same data.
  * @param {string} legacy
  * @param {NodeJS.Platform} platform
+ * @returns {boolean} true when this call created the link
  */
 function linkLegacyToTarget(legacy, platform) {
   try {
@@ -190,8 +248,10 @@ function linkLegacyToTarget(legacy, platform) {
     } else {
       symlinkSync(DATA_DIRNAME, legacy, "dir");
     }
+    return true;
   } catch {
     // Already linked (a concurrent run) or not permitted; the data move stands.
+    return false;
   }
 }
 
@@ -237,6 +297,11 @@ function moveMissingEntries(legacy, target) {
   } catch {
     return;
   }
+  // Nexus's own files first, so a run that dies part way leaves `~/.nexus`
+  // still recognisably ours and the next run finishes the merge.
+  const ours = (entry) => entry === "config.json" || NEXUS_OWNED_FILENAMES.includes(entry)
+    || entry.startsWith(".secret-memory-");
+  entries.sort((a, b) => Number(ours(b)) - Number(ours(a)));
   for (const entry of entries) {
     if (lstatOrNull(path.join(target, entry))) {
       continue;
@@ -246,6 +311,14 @@ function moveMissingEntries(legacy, target) {
     } catch {
       // Stays in the set-aside copy.
     }
+  }
+}
+
+function dropMergeClaim(target) {
+  try {
+    unlinkSync(path.join(target, MERGE_CLAIM_MARKER));
+  } catch {
+    // Left behind it still marks ~/.nexus as ours; uninstall removes it.
   }
 }
 
@@ -300,21 +373,41 @@ export function migrateLegacyDataDir(home, { platform = process.platform, rename
     // A linked ~/.fireconnect (a dotfiles checkout) is set aside whole, so
     // nothing is moved out of the user's repository.
     if (!lstatOrNull(legacy)?.isSymbolicLink()) {
+      // Claim ~/.nexus first: a run that dies mid-merge may leave only a
+      // harness backup beside generic names, which alone would look foreign.
+      try {
+        writeFileSync(path.join(target, MERGE_CLAIM_MARKER), "", { flag: "wx" });
+      } catch (error) {
+        if (error?.code !== "EEXIST") return "failed";
+      }
+      const legacyDir = lstatOrNull(legacy);
       moveMissingEntries(legacy, target);
       try {
         rmdirSync(legacy);
-        linkLegacyToTarget(legacy, platform);
+        const linked = linkLegacyToTarget(legacy, platform);
+        dropMergeClaim(target);
+        // rmdir can report success while a concurrent run renames the old
+        // directory aside (seen on macOS). Then the directory still exists
+        // under a recorded set-aside name, or that run already made the link;
+        // either way that run did the work, not this one.
+        if (stillSetAside(home, legacyDir) || (!linked && linksTo(legacy, target))) {
+          return "none";
+        }
         return "moved";
       } catch {
         // Something in it clashes with ~/.nexus; set the rest aside.
       }
     }
-    const aside = lstatOrNull(path.join(home, LEGACY_ASIDE_DIRNAME))
-      ? path.join(home, `${LEGACY_ASIDE_DIRNAME}-${Date.now()}`)
-      : path.join(home, LEGACY_ASIDE_DIRNAME);
+    const aside = setAsidePath(home);
+    // Record before renaming: a run that dies in between leaves a name whose
+    // directory is missing, which the next run reuses, never an untracked one.
+    recordSetAside(home, aside);
     try {
       rename(legacy, aside);
     } catch {
+      if (!lstatOrNull(aside)) {
+        forgetSetAside(home, aside);
+      }
       // Gone or already a link: another run is handling it.
       const now = lstatOrNull(legacy);
       return !now || now.isSymbolicLink() ? "none" : "failed";
@@ -326,10 +419,11 @@ export function migrateLegacyDataDir(home, { platform = process.platform, rename
       } catch {
         unlinkSync(aside);
       }
+      forgetSetAside(home, aside);
       return "none";
     }
-    recordSetAside(home, aside);
     linkLegacyToTarget(legacy, platform);
+    dropMergeClaim(target);
     return "set-aside";
   }
   try {

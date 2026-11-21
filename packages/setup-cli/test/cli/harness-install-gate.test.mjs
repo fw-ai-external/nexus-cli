@@ -5,6 +5,8 @@ import path from "node:path";
 import { describe, it } from "node:test";
 
 import { globalConfigPath, setHarnessEnabled } from "../../lib/config/global-config.mjs";
+import { assertHarnessInstalled } from "../../lib/cli/commands/harness.mjs";
+import { checkHarnessInstall } from "../../lib/harness/detect.mjs";
 import { codexConfigPath } from "../../lib/harnesses/codex/core.mjs";
 import { runCli, seedKeychainConfig, withTempHome } from "../helpers.mjs";
 
@@ -33,6 +35,37 @@ async function installFakeCommand(bin, name) {
 }
 
 describe("harness install gate", () => {
+  it("allows first-time Windows Copilot app setup when its install location is unknown", async () => {
+    await withTempHome("install-gate-copilot-custom-", async (home) => {
+      const { bin } = await gateEnv(home);
+      const customDir = path.join(home, "custom-install");
+      await mkdir(customDir);
+      await writeFile(path.join(customDir, "github.exe"), "");
+      const platform = Object.getOwnPropertyDescriptor(process, "platform");
+      const env = process.env;
+      try {
+        Object.defineProperty(process, "platform", { value: "win32" });
+        process.env = {
+          ...env,
+          HOME: home,
+          USERPROFILE: home,
+          PATH: bin,
+          LOCALAPPDATA: path.join(home, "AppData", "Local"),
+          ProgramFiles: path.join(home, "Program Files"),
+          "ProgramFiles(x86)": path.join(home, "Program Files (x86)"),
+          ProgramW6432: path.join(home, "Program Files"),
+        };
+        assert.equal(existsSync(globalConfigPath(home)), false);
+        assert.equal(checkHarnessInstall(home, "copilot-app").state, "unknown");
+        await assert.doesNotReject(assertHarnessInstalled({ id: "copilot-app", label: "GitHub Copilot" }, {}, home));
+        assert.equal(existsSync(globalConfigPath(home)), false);
+      } finally {
+        process.env = env;
+        Object.defineProperty(process, "platform", platform);
+      }
+    });
+  });
+
   it("refuses `on` when the harness's command isn't on PATH, and writes nothing", async () => {
     await withTempHome("install-gate-missing-", async (home) => {
       const { env } = await gateEnv(home);

@@ -1,4 +1,5 @@
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   isFirerouterModelPattern,
   isRetiredModelId,
   normalizeModelId,
+  FIREWORKS_OPENAI_BASE_URL,
 } from "../../fireworks/model-id.mjs";
 import { resolveManagedDisplayName } from "../../fireworks/model-display.mjs";
 import { readJsonIfExists, writeJson } from "../../io/json.mjs";
@@ -39,12 +41,16 @@ import { HARNESS } from "../../harness/id.mjs";
 import { piKnownFireworksModelIds } from "./pi-catalog.mjs";
 import { catalogWithAutomaticAuto, registerableModelIds } from "../../fireworks/models.mjs";
 import { getServerlessCatalogSnapshot } from "../../fireworks/serverless-catalog-cache.mjs";
+import { activeAccountResidency, fireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 export const PI_SETTINGS_RELATIVE_PATH = ".pi/agent/settings.json";
 export const PI_MODELS_RELATIVE_PATH = ".pi/agent/models.json";
 export const PI_DATA_RELATIVE_DIR = ".nexus/pi";
 export const PI_API_KEY_ENV_REF = "$FIREWORKS_API_KEY";
 const PI_PROVIDER = "fireworks";
+// The base URL Pi's built-in fireworks provider uses. Nexus only writes
+// `baseUrl` when the account's residency needs another host.
+const PI_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 const PI_MANAGED_BY = "fireconnect";
 // Pi routes Foundry through a distinct custom provider (openai-completions) so
 // it never collides with the built-in Fireworks provider.
@@ -323,7 +329,7 @@ async function deleteLegacyFiles(dataDir) {
  * Like every harness, `on` snapshots each Pi file it edits and `off` restores
  * it byte-for-byte. A later `on` keeps the first snapshot.
  */
-function backupPath(dataDir, filePath, label) {
+export function backupPath(dataDir, filePath, label) {
   const key = createHash("sha256").update(path.resolve(filePath)).digest("hex").slice(0, 16);
   return path.join(dataDir, `${label}-backup.${key}.json`);
 }
@@ -335,13 +341,14 @@ async function snapshotOnce(dataDir, filePath, label) {
   if ((await readJsonIfExists(dest)).snapshot !== undefined) return;
   const snapshot = await readRawIfExists(filePath);
   const mode = snapshot.existed ? (await stat(filePath)).mode & 0o777 : undefined;
-  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  ensurePrivateParent(dest);
   await writeJsonFile(dest, { filePath: path.resolve(filePath), snapshot, mode }, 0o600);
 }
 
 /** Remember what Nexus last wrote, so `off` can tell whether Pi or the user changed it since. */
 async function markWritten(dataDir, filePath, label) {
   const dest = backupPath(dataDir, filePath, label);
+  ensurePrivateParent(dest);
   const backup = await readJsonIfExists(dest);
   if (backup.snapshot === undefined) return;
   await writeJsonFile(dest, { ...backup, written: sha256((await readRawIfExists(filePath)).raw ?? "") }, 0o600);
@@ -362,13 +369,14 @@ async function readSnapshot(dataDir, filePath, label) {
  * OAuth refresh and /login), so only the keys Nexus owns go back to their
  * pre-`on` values and everything else is kept.
  */
-async function restoreFile(dataDir, filePath, label, revertOwnKeys, mode) {
+export async function restoreFile(dataDir, filePath, label, revertOwnKeys, mode) {
   const backup = await readSnapshot(dataDir, filePath, label);
   const current = await readRawIfExists(filePath);
   // A file that vanished while on can only come back from the snapshot.
   const untouched = backup && (!current.existed
     || backup.written === undefined
-    || backup.written === sha256(current.raw ?? ""));
+    || backup.written === sha256(current.raw ?? "")
+    || backup.snapshot.raw === current.raw);
   if (backup && untouched) {
     if (backup.snapshot.existed) {
       await mkdir(path.dirname(filePath), { recursive: true });
@@ -382,7 +390,6 @@ async function restoreFile(dataDir, filePath, label, revertOwnKeys, mode) {
     const before = backup?.snapshot?.existed ? parseLoose(backup.snapshot.raw) : {};
     await writeJsonFile(filePath, revertOwnKeys(await readJsonFile(filePath), before), mode);
   }
-  await unlink(backupPath(dataDir, filePath, label)).catch(() => {});
 }
 
 function parseLoose(raw) {
@@ -447,6 +454,9 @@ async function connectPi({ settingsPath, authPath, modelsPath, dataDir, home }, 
   const previous = routed && NEXUS_PROVIDERS.includes(settings.defaultProvider)
     ? (profile.previous ?? {})
     : { defaultProvider: settings.defaultProvider, defaultModel: settings.defaultModel };
+  // Recorded first: it is what marks a rewritten `fireworks` default as ours,
+  // so an `on` that dies after the settings write is still found by `off`.
+  await writePiProfile(home, { previous });
   await writeJsonFile(settingsPath, withDefaults(settings, { defaultProvider: provider, defaultModel: model }, scope));
   await markWritten(dataDir, settingsPath, "settings");
   if (authEntry) {
@@ -455,7 +465,6 @@ async function connectPi({ settingsPath, authPath, modelsPath, dataDir, home }, 
   }
   await writeJsonFile(modelsPath, withProvider(await readJsonFile(modelsPath), provider, entry), modelsMode);
   await markWritten(dataDir, modelsPath, "models");
-  await writePiProfile(home, { previous });
   await deleteLegacyFiles(dataDir);
 }
 
@@ -511,7 +520,9 @@ export async function enablePiFireworks({
 function piFireworksProvider(modelIds, headers, piKnownIds) {
   const ids = [...new Set(modelIds.filter(Boolean).map(fullFireworksResourceId))]
     .filter((id) => isPiNexusOnlyModelId(id) || (piKnownIds && !piKnownIds.has(id)));
+  const inferenceBaseUrl = fireworksInferenceUrl(PI_FIREWORKS_BASE_URL, activeAccountResidency("pi"));
   return {
+    ...(inferenceBaseUrl !== PI_FIREWORKS_BASE_URL ? { baseUrl: inferenceBaseUrl } : {}),
     models: ids.map((id) => buildPiCustomFireworksModelEntry(id, resolveManagedDisplayName(id))),
     ...(Object.keys(headers).length ? { headers } : {}),
   };
@@ -577,15 +588,9 @@ export async function disablePiFireworks({ settingsPath, authPath, modelsPath, d
     return { changed: false };
   }
   const previous = profile.previous ?? {};
-  await restoreFile(dataDir, settingsPath, "settings", (current, before) => {
-    if (!NEXUS_PROVIDERS.includes(current.defaultProvider)) return withDefaults(current, current);
-    return withDefaults(current, hasSnapshot ? before : previous);
-  });
-  await restoreFile(dataDir, authPath, "auth", (current, before) => {
-    if (!isNexusAuth(current)) return current;
-    const { [PI_PROVIDER]: _nexus, ...rest } = current;
-    return before[PI_PROVIDER] ? { ...rest, [PI_PROVIDER]: before[PI_PROVIDER] } : rest;
-  }, 0o600);
+  // settings.json and auth.json are what mark Pi as ours, so they go back last,
+  // and every snapshot is kept until all three are back: an `off` that dies part
+  // way still leaves Pi routed, with the user's originals, for a retry or uninstall.
   await restoreFile(dataDir, modelsPath, "models", (current, before) => {
     let next = withProvider(current);
     for (const id of NEXUS_PROVIDERS) {
@@ -593,6 +598,18 @@ export async function disablePiFireworks({ settingsPath, authPath, modelsPath, d
     }
     return next;
   });
+  await restoreFile(dataDir, authPath, "auth", (current, before) => {
+    if (!isNexusAuth(current)) return current;
+    const { [PI_PROVIDER]: _nexus, ...rest } = current;
+    return before[PI_PROVIDER] ? { ...rest, [PI_PROVIDER]: before[PI_PROVIDER] } : rest;
+  }, 0o600);
+  await restoreFile(dataDir, settingsPath, "settings", (current, before) => {
+    if (!NEXUS_PROVIDERS.includes(current.defaultProvider)) return withDefaults(current, current);
+    return withDefaults(current, hasSnapshot ? before : previous);
+  });
+  for (const [filePath, label] of [[modelsPath, "models"], [authPath, "auth"], [settingsPath, "settings"]]) {
+    await unlink(backupPath(dataDir, filePath, label)).catch(() => {});
+  }
   await writePiProfile(home, {});
   await deleteLegacyFiles(dataDir);
   return { changed: true };

@@ -104,14 +104,15 @@ function validateHarnessOptions(route, ctx) {
     throw new Error("--refresh applies only to `nexus model list`.");
   }
   // `claude live --session` is still accepted so old invocations reach the retirement notice.
-  const sessionAllowed = harnessId === HARNESS.CLAUDE && !noun
-    && (verb === "usage" || verb === "live");
+  const usageHarness = harnessId === HARNESS.CLAUDE || harnessId === HARNESS.CODEX;
+  const sessionAllowed = !noun && ((usageHarness && verb === "usage")
+    || (harnessId === HARNESS.CLAUDE && verb === "live"));
   if (ctx.session && !sessionAllowed) {
-    throw new Error("--session applies only to `nexus claude usage`.");
+    throw new Error("--session applies only to `nexus claude usage` and `nexus codex usage`.");
   }
   const hasUsageOption = Boolean(ctx.days || ctx.lastN || ctx.verbose || ctx.plain);
-  if (hasUsageOption && !(harnessId === HARNESS.CLAUDE && verb === "usage" && !noun)) {
-    throw new Error("--days/--last-n/--verbose/--plain apply only to `nexus claude usage`.");
+  if (hasUsageOption && !(usageHarness && verb === "usage" && !noun)) {
+    throw new Error("--days/--last-n/--verbose/--plain apply only to `nexus claude usage` and `nexus codex usage`.");
   }
   if (verb === "live" && harnessId !== HARNESS.CLAUDE) {
     throw new Error("`nexus <harness> live` is supported only for Claude Code.");
@@ -119,14 +120,14 @@ function validateHarnessOptions(route, ctx) {
   const jsonSupported = verb === "status"
     || verb === "usage";
   if (ctx.json && !jsonSupported) {
-    throw new Error("--json is supported by status and Claude usage.");
+    throw new Error("--json is supported by status and usage.");
   }
 
   if (ctx.settingsPath && harnessId !== HARNESS.CLAUDE && harnessId !== HARNESS.PI) {
     throw new Error("--settings-path is supported only by Claude and Pi.");
   }
   if (ctx.configPath && !FILE_CONFIG_HARNESS_SET.has(harnessId)) {
-    throw new Error("--config-path is supported only by OpenCode, Codex, Pi, and DeepSeek Harness.");
+    throw new Error("--config-path is supported only by OpenCode, Codex, Pi, DeepSeek Harness, and Hermes Agent.");
   }
   if (ctx.dbPath && harnessId !== HARNESS.CURSOR && harnessId !== HARNESS.COPILOT_APP) {
     throw new Error("--db-path is supported only by Cursor and the Copilot app.");
@@ -140,7 +141,7 @@ function validateHarnessOptions(route, ctx) {
   if (ctx.unsetAnthropicKey || ctx.unsetOpenaiKey) {
     throw new Error("To clear a saved provider key, run `nexus auto --unset openai-api-key` (or `--unset anthropic-api-key`).");
   }
-  if (ctx.anthropic || ctx.openai || ctx.storedOnly || ctx.withToken || ctx.revoke || ctx.paste || ctx.account) {
+  if (ctx.anthropic || ctx.openai || ctx.storedOnly || ctx.withToken || ctx.revoke || ctx.paste || ctx.browser || ctx.noOpen || ctx.signup || ctx.selectAccount || ctx.account) {
     throw new Error("This option belongs to a global login/logout/key command, not a harness command.");
   }
 

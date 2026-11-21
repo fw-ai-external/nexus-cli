@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -8,16 +8,20 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
-  createAutoKeysLoader, createAutoProvidersLoader, createGatewayKeyLoader, createShimServer, isEntrypoint,
+  createAutoKeysLoader, createAutoProvidersLoader, createLegacyGatewayKeyLoader, createShimServer, isEntrypoint,
 } from "../../../lib/harnesses/claude-desktop/shim.mjs";
 import {
   detectConnectors, migrateSkillsPlugin, DEFAULT_MODEL_MAP, firstPartyDir, thirdPartyDir,
-  disableProfileLane, egressHosts, enableProfileLane, readProfileStatus, shimNotReadyMessage, waitForShim,
+  disableProfileLane, egressHosts, enableProfileLane, readProfileStatus, restartShim, shimNotReadyMessage, waitForShim,
+  detectShimProfileId, readClaudeDesktopProfileKey, readProfileState, readWrittenProfiles,
   syncReportLines,
 } from "../../../lib/harnesses/claude-desktop/profile-lane.mjs";
 import { ensureShimSecret, readShimSecret, shimSecretPath } from "../../../lib/harnesses/claude-desktop/shim-auth.mjs";
 import { migrateClaudeDesktopEgressOnUpgrade } from "../../../lib/harnesses/claude-desktop/upgrade-migrations.mjs";
 import { seedKeychainConfig, withoutEnvFireworksKey } from "../../helpers.mjs";
+import { isHarnessEnabled } from "../../../lib/config/global-config.mjs";
+import { listRoutedHarnessIds } from "../../../lib/harness/registry.mjs";
+import { HARNESS } from "../../../lib/harness/id.mjs";
 
 process.env.NEXUS_TEST = "1";
 
@@ -371,7 +375,6 @@ test("isConnectorUrl: https anywhere, http only on loopback", () => {
   assert.equal(isConnectorUrl("not a url"), false);
 });
 
-import { detectShimProfileId } from "../../../lib/harnesses/claude-desktop/profile-lane.mjs";
 
 const SHIM_PROFILE_BODY = {
   inferenceGatewayBaseUrl: "http://127.0.0.1:8799",
@@ -441,6 +444,7 @@ test("off never leaves a shim-pointing profile applied (stale backup appliedId)"
     await writeFile(path.join(backup, "_meta.json"), JSON.stringify({
       appliedId: "old-fw", entries: [{ id: "old-fw", name: "Fireworks" }],
     }));
+    if (process.platform !== "win32") await chmod(path.join(backup, "_meta.json"), 0o640);
     const statePath = path.join(home, ".nexus", "claude-desktop", "profile-state.json");
     const state = JSON.parse(await readFile(statePath, "utf8"));
     await writeFile(statePath, JSON.stringify({ ...state, backup }));
@@ -451,6 +455,7 @@ test("off never leaves a shim-pointing profile applied (stale backup appliedId)"
     const meta = JSON.parse(await readFile(path.join(lib, "_meta.json"), "utf8"));
     assert.equal(meta.appliedId, null);
     assert.deepEqual(meta.entries.map((e) => e.id), ["old-fw"]); // entry kept, just not applied
+    if (process.platform !== "win32") assert.equal((await stat(path.join(lib, "_meta.json"))).mode & 0o777, 0o640);
   } finally { await cleanup(); }
 });
 
@@ -818,7 +823,7 @@ test("shim sends keys saved with nexus auto on auto-routed turns only, live from
     modelMap: DEFAULT_MODEL_MAP, catalogDir,
     upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`,
     autoKeysLoader: loader,
-    gatewayKeyLoader: async () => "fw_TEST_PROFILE_KEY",
+    legacyGatewayKeyLoader: async () => "fw_TEST_PROFILE_KEY",
     log: (line) => logs.push(line),
   });
   const logs = [];
@@ -889,7 +894,7 @@ test("normalizeThinking maps UI effort spellings onto Fireworks ladders", () => 
 
 import { reliesOnClaudeAiLogin } from "../../../lib/harnesses/claude-desktop/profile-lane.mjs";
 
-test("reliesOnClaudeAiLogin flags control-plane hosts unless own client exists", () => {
+test("reliesOnClaudeAiLogin flags hosted connector hosts unless own client exists", () => {
   assert.equal(reliesOnClaudeAiLogin({ name: "gmail", url: "https://gmailmcp.googleapis.com/mcp/v1" }), true);
   assert.equal(reliesOnClaudeAiLogin({ name: "visualize", url: "https://sandbox.claudemcpcontent.com/imagine_mcp" }), true);
   assert.equal(reliesOnClaudeAiLogin({ name: "bigquery", url: "https://bigquery.googleapis.com/mcp" }), true);
@@ -1102,19 +1107,45 @@ test("secret-bearing profile files are written owner-only (0600)", async () => {
   } finally { await cleanup(); }
 });
 
-test("loadDesktopLineup: cold cache + offline falls back to the curated list", async () => {
+test("loadDesktopLineup: cold cache + offline offers only auto, never the whole curated list", async () => {
   const { home, cleanup } = await tempHome();
   try {
     const { loadDesktopLineup } = await import("../../../lib/harnesses/claude-desktop/profile-lane.mjs");
     // No serverless cache, no signed catalog, and the fetch is offline
-    // (NEXUS_TEST gates real fetches) — the curated fallback answers.
+    // (NEXUS_TEST gates real fetches): nothing says which curated routes this
+    // account may use, so only the always-served auto mix is offered.
     const { full, models, modelMap } = await loadDesktopLineup({
       apiKey: "test", signedCatalogPath: path.join(home, "nowhere", "catalog.json"),
     });
     assert.equal(full, false);
-    assert.ok(models.length >= 3);
+    assert.deepEqual(models.map((m) => m.route), ["auto"]);
+    // Every curated name and family still routes somewhere: to auto.
     assert.ok(Object.keys(modelMap.models).length >= 3);
+    assert.deepEqual([...new Set(Object.values(modelMap.models))], ["auto"]);
+    assert.deepEqual([...new Set(Object.values(modelMap.families))], ["auto"]);
   } finally { await cleanup(); }
+});
+
+test("servedStaticLineup keeps only curated routes the served catalog lists", async () => {
+  const { servedStaticLineup } = await import("../../../lib/harnesses/claude-desktop/lineup.mjs");
+  const lineup = servedStaticLineup([{ shortId: "auto" }, { shortId: "glm-latest" }]);
+  assert.deepEqual(lineup.models.map((m) => m.route), ["auto", "glm-latest"]);
+  assert.equal(lineup.modelMap.families.sonnet, "glm-latest");
+  // glm-flash-latest isn't listed (its mode is blocked, say): haiku goes to auto.
+  assert.equal(lineup.modelMap.families.haiku, "auto");
+  assert.equal(lineup.modelMap.models["claude-haiku-4-5"], "auto");
+});
+
+test("serverlessLineup family fallbacks never route to a model the catalog doesn't list", async () => {
+  const { serverlessLineup } = await import("../../../lib/harnesses/claude-desktop/lineup.mjs");
+  const catalog = { surfaces: { chat: { model_selector_config: [{ models: [
+    { id: "claude-opus-4-8" }, { id: "claude-sonnet-4-8" },
+  ] }] } } };
+  const lineup = serverlessLineup([{ id: "auto", shortId: "auto" }, { id: "accounts/fireworks/routers/kimi-latest", shortId: "kimi-latest" }], catalog);
+  assert.ok(lineup);
+  assert.equal(lineup.modelMap.families.sonnet, "auto");
+  assert.equal(lineup.modelMap.families.haiku, "auto");
+  assert.ok(!Object.values(lineup.modelMap.models).includes("glm-latest"));
 });
 
 test("upgrade scrub removes FireRouter custom models from manual list, shim map, and profile", async () => {
@@ -1157,6 +1188,108 @@ test("egressHosts: the profile's own list, else the saved one, else every host",
   assert.deepEqual(egressHosts({ coworkEgressAllowedHosts: "example.com" }), ["*"]);
   assert.deepEqual(egressHosts(null, ["example.com"]), ["example.com"]);
   assert.deepEqual(egressHosts({ coworkEgressAllowedHosts: ["a.example.com"] }, ["b.example.com"]), ["a.example.com"]);
+});
+
+test("a linked Desktop library survives enable and disable with its original profiles and entry links", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const external = path.join(home, "linked-library");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const original = JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" });
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(path.dirname(lib), { recursive: true });
+    await mkdir(external);
+    await writeFile(path.join(external, "original.json"), original);
+    await writeFile(path.join(external, "_meta.json"), meta);
+    await symlink("original.json", path.join(external, "linked-profile.json"));
+    await symlink(external, lib, "dir");
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const state = await readProfileState(home);
+      assert.equal((await lstat(lib)).isSymbolicLink(), true);
+      assert.equal((await lstat(state.backup)).isDirectory(), true);
+      assert.equal(await readFile(path.join(state.backup, "original.json"), "utf8"), original);
+      await disableProfileLane(home, quiet);
+      assert.equal((await lstat(lib)).isSymbolicLink(), true);
+      assert.equal(await readFile(path.join(external, "original.json"), "utf8"), original);
+      assert.equal(await readFile(path.join(external, "_meta.json"), "utf8"), meta);
+      assert.equal((await lstat(path.join(external, "linked-profile.json"))).isSymbolicLink(), true);
+      assert.equal(await readFile(path.join(external, "linked-profile.json"), "utf8"), original);
+    });
+  } finally { await cleanup(); }
+});
+
+test("off restores original library modes while backups stay private", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const originals = [["", 0o755], ["_meta.json", 0o644], ["original.json", 0o640],
+    ["assets", 0o750], ["assets/script", 0o751], ["assets/empty", 0o644]];
+  try {
+    await mkdir(path.join(lib, "assets"), { recursive: true });
+    await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] }));
+    await writeFile(path.join(lib, "original.json"), JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" }));
+    await writeFile(path.join(lib, "assets", "script"), "example");
+    await writeFile(path.join(lib, "assets", "empty"), "");
+    for (const [name, mode] of originals) await chmod(path.join(lib, name), mode);
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const { backup } = await readProfileState(home);
+      const assertPrivate = async () => {
+        for (const [name] of originals) {
+          const info = await stat(path.join(backup, name));
+          assert.equal(info.mode & 0o777, info.isDirectory() ? 0o700 : 0o600, name);
+        }
+        assert.equal((await stat(`${backup}.modes.json`)).mode & 0o777, 0o600);
+      };
+      await assertPrivate();
+      await writeFile(path.join(lib, "later.json"), "{}");
+      await chmod(path.join(lib, "later.json"), 0o640);
+      await disableProfileLane(home, quiet);
+      for (const [name, mode] of originals) assert.equal((await stat(path.join(lib, name))).mode & 0o777, mode, name);
+      assert.equal((await stat(path.join(lib, "later.json"))).mode & 0o777, 0o640);
+      assert.equal(await readFile(path.join(lib, "assets", "empty"), "utf8"), "");
+      await assertPrivate();
+    });
+  } finally { await cleanup(); }
+});
+
+test("off preserves permission-only edits to byte-identical user profiles", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const profiles = [["restricted", 0o644, 0o600, "{}"], ["shared", 0o600, 0o640, "{}"],
+    ["empty", 0o640, 0o644, ""], ["unchanged", 0o640, 0o640, "{}"]];
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "_meta.json"), JSON.stringify({
+      appliedId: null, entries: profiles.map(([id]) => ({ id })),
+    }));
+    for (const [id, mode, , body] of profiles) {
+      await writeFile(path.join(lib, `${id}.json`), body);
+      await chmod(path.join(lib, `${id}.json`), mode);
+    }
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const { backup } = await readProfileState(home);
+      for (const [id, , mode, body] of profiles) {
+        const file = path.join(lib, `${id}.json`);
+        assert.equal(await readFile(file, "utf8"), body);
+        await chmod(file, mode);
+      }
+      await disableProfileLane(home, quiet);
+      for (const [id, , mode, body] of profiles) {
+        const file = path.join(lib, `${id}.json`);
+        assert.equal((await stat(file)).mode & 0o777, mode, id);
+        assert.equal(await readFile(file, "utf8"), body);
+        assert.equal((await stat(path.join(backup, `${id}.json`))).mode & 0o777, 0o600);
+      }
+    });
+  } finally { await cleanup(); }
 });
 
 test("on allows every host and keeps a user-set egress list across on and off/on", async () => {
@@ -1389,7 +1522,7 @@ test("shim still serves any Host, but saved keys go only to loopback names", asy
     modelMap: DEFAULT_MODEL_MAP, catalogDir, log: () => {},
     upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`,
     autoKeysLoader: async () => ({ anthropicKey: "sk-ant-example-0000", openaiKey: "" }),
-    gatewayKeyLoader: async () => "fw_TEST_PROFILE_KEY",
+    legacyGatewayKeyLoader: async () => "fw_TEST_PROFILE_KEY",
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const port = server.address().port;
@@ -1414,11 +1547,11 @@ test("shim still serves any Host, but saved keys go only to loopback names", asy
   }
 });
 
-test("createGatewayKeyLoader reads the applied profile's key, or nothing", async () => {
+test("createLegacyGatewayKeyLoader reads the applied profile's literal key, or nothing", async () => {
   const { home, cleanup } = await tempHome();
   const dataDir = path.join(home, ".nexus", "claude-desktop");
   try {
-    const loader = createGatewayKeyLoader({ home, dataDir });
+    const loader = createLegacyGatewayKeyLoader({ home, dataDir });
     assert.equal(await loader(), "");
     await mkdir(dataDir, { recursive: true });
     await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: true, profileId: "p1" }));
@@ -1428,10 +1561,43 @@ test("createGatewayKeyLoader reads the applied profile's key, or nothing", async
     assert.equal(await loader(), "fw_TEST_PROFILE_KEY");
     await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: true, profileId: "../p1" }));
     assert.equal(await loader(), "");
+    // The provisional state a partial on leaves behind is never served.
+    await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: false, profileId: "p1" }));
+    assert.equal(await loader(), "");
     // Older installs without profile-state.json: the applied profile decides.
     await rm(path.join(dataDir, "profile-state.json"));
     await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: "p1", entries: [{ id: "p1" }] }));
     assert.equal(await loader(), "fw_TEST_PROFILE_KEY");
+  } finally { await cleanup(); }
+});
+
+test("profile observers ignore invalid persisted IDs before resolving paths", async () => {
+  const { home, cleanup } = await tempHome();
+  const dataDir = path.join(home, ".nexus", "claude-desktop");
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const shimUrl = "http://127.0.0.1:8799";
+  try {
+    await mkdir(dataDir, { recursive: true });
+    await mkdir(lib, { recursive: true });
+    const profile = { inferenceGatewayBaseUrl: shimUrl, inferenceGatewayApiKey: "fw_TEST_PROFILE_KEY", inferenceProvider: "gateway", inferenceCredentialKind: "static" };
+    await writeFile(path.join(path.dirname(lib), "escape.json"), JSON.stringify(profile));
+    const invalid = ["../escape", "a/../../escape", "a\\escape", ".", "_meta", "a.b", "a".repeat(129), "", 7, null];
+    for (const id of invalid) {
+      await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: true, profileId: id }));
+      await writeFile(path.join(dataDir, "written-profiles.json"), JSON.stringify([id]));
+      await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: id, entries: [{ id }] }));
+      assert.equal(await readProfileState(home), null);
+      assert.equal(await readClaudeDesktopProfileKey(home), null);
+      assert.deepEqual([...await readWrittenProfiles(home)], []);
+      assert.equal(await detectShimProfileId(lib, shimUrl, home), null);
+    }
+    const id = "profile_1-valid";
+    await writeFile(path.join(lib, `${id}.json`), JSON.stringify(profile));
+    await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: true, profileId: id }));
+    await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: id, entries: [{ id }] }));
+    assert.equal((await readProfileState(home)).profileId, id);
+    assert.equal(await detectShimProfileId(lib, shimUrl, home), id);
+    assert.equal(await readClaudeDesktopProfileKey(home), "fw_TEST_PROFILE_KEY");
   } finally { await cleanup(); }
 });
 
@@ -1553,5 +1719,281 @@ test("a purged relay profile entry is not reported skipped when the name migrate
     const synced = await syncProfileConnectors(home, { listOrgConnectors: async () => [] });
     assert.deepEqual(synced.migrated.map((e) => e.name), ["linear"]);
     assert.deepEqual(synced.skipped, []);
+  } finally { await cleanup(); }
+});
+
+test("an on that fails partway leaves a state off can undo, and a re-on keeps the original backup", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const deviceConfig = path.join(thirdPartyDir(home), "claude_desktop_config.json");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const original = JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" });
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), original);
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    // A directory where the device config file belongs makes the device step fail
+    // after the Fireworks profile is already applied.
+    await mkdir(deviceConfig);
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await assert.rejects(enableProfileLane(home, quiet));
+      const partial = await readProfileState(home);
+      assert.ok(partial, "a partial on records what off needs");
+      assert.equal(partial.enabled, false);
+      assert.equal(await readFile(path.join(partial.backup, "_meta.json"), "utf8"), meta);
+
+      await rm(deviceConfig, { recursive: true });
+      await enableProfileLane(home, quiet);
+      const state = await readProfileState(home);
+      assert.equal(state.enabled, true);
+      assert.equal(state.backup, partial.backup, "re-on keeps the pre-Nexus backup");
+
+      await disableProfileLane(home, quiet);
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta);
+      assert.equal(await readFile(path.join(lib, "original.json"), "utf8"), original);
+      assert.equal(await readProfileState(home), null);
+    });
+  } finally { await cleanup(); }
+});
+
+async function assertFireworksUnlisted(lib, profileId) {
+  const meta = JSON.parse(await readFile(path.join(lib, "_meta.json"), "utf8"));
+  assert.ok(!meta.entries.some((entry) => entry.id === profileId), "the Fireworks entry is gone");
+  assert.notEqual(meta.appliedId, profileId);
+  await assert.rejects(stat(path.join(lib, `${profileId}.json`)), { code: "ENOENT" });
+  return meta;
+}
+
+test("off removes the Fireworks profile after the user picks Default, with no earlier library", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  try {
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const { profileId } = await readProfileState(home);
+      const current = JSON.parse(await readFile(path.join(lib, "_meta.json"), "utf8"));
+      await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ ...current, appliedId: null }));
+
+      await disableProfileLane(home, quiet);
+
+      const meta = await assertFireworksUnlisted(lib, profileId);
+      assert.equal(meta.appliedId, null);
+      assert.equal(await readProfileState(home), null);
+    });
+  } finally { await cleanup(); }
+});
+
+test("off removes the Fireworks profile when a repeat on ran after the user switched profiles", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const original = JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), original);
+    await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] }));
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const { profileId } = await readProfileState(home);
+      const current = JSON.parse(await readFile(path.join(lib, "_meta.json"), "utf8"));
+      await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ ...current, appliedId: "original" }));
+      await enableProfileLane(home, quiet);
+
+      await disableProfileLane(home, quiet);
+
+      const meta = await assertFireworksUnlisted(lib, profileId);
+      assert.equal(meta.appliedId, "original");
+      assert.deepEqual(meta.entries.map((entry) => entry.id), ["original"]);
+      assert.equal(await readFile(path.join(lib, "original.json"), "utf8"), original);
+    });
+  } finally { await cleanup(); }
+});
+
+test("off removes the Fireworks profile when a repeat on ran after the user picked Default, with no earlier library", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  try {
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await enableProfileLane(home, quiet);
+      const { profileId } = await readProfileState(home);
+      const current = JSON.parse(await readFile(path.join(lib, "_meta.json"), "utf8"));
+      await writeFile(path.join(lib, "_meta.json"), JSON.stringify({ ...current, appliedId: null }));
+      await enableProfileLane(home, quiet);
+
+      await disableProfileLane(home, quiet);
+
+      const meta = await assertFireworksUnlisted(lib, profileId);
+      assert.equal(meta.appliedId, null);
+      assert.deepEqual(meta.entries, []);
+    });
+  } finally { await cleanup(); }
+});
+
+test("off undoes an on that failed after applying the profile", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const deviceConfig = path.join(thirdPartyDir(home), "claude_desktop_config.json");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" }));
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    await mkdir(deviceConfig);
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await assert.rejects(enableProfileLane(home, quiet));
+      await disableProfileLane(home, quiet);
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta);
+      assert.equal(await readProfileState(home), null);
+    });
+  } finally { await cleanup(); }
+});
+
+
+test("an on that fails after applying the profile leaves the enabled flag set, so uninstall finds Desktop", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const deviceConfig = path.join(thirdPartyDir(home), "claude_desktop_config.json");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" }));
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    await mkdir(deviceConfig);
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await assert.rejects(enableProfileLane(home, quiet));
+      assert.notEqual(await readFile(path.join(lib, "_meta.json"), "utf8"), meta, "Desktop points at the Fireworks profile");
+      assert.equal(await isHarnessEnabled(home, HARNESS.CLAUDE_DESKTOP), true, "the flag is set while there is something to undo");
+      const routed = await listRoutedHarnessIds({}, home);
+      assert.ok(routed.includes(HARNESS.CLAUDE_DESKTOP), `uninstall lists Desktop among routed harnesses, got ${JSON.stringify(routed)}`);
+
+      await disableProfileLane(home, quiet);
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta);
+      assert.equal(await isHarnessEnabled(home, HARNESS.CLAUDE_DESKTOP), false);
+    });
+  } finally { await cleanup(); }
+});
+
+test("an on that fails before touching Desktop leaves the flag set and off clears it without changing Desktop", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const shimState = path.join(home, ".nexus", "claude-desktop", "shim-state.json");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const original = JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" });
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), original);
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    await mkdir(shimState, { recursive: true });
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await assert.rejects(enableProfileLane(home, quiet));
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta, "nothing in Desktop changed yet");
+      assert.equal((await readProfileState(home))?.enabled, false);
+      assert.equal(await isHarnessEnabled(home, HARNESS.CLAUDE_DESKTOP), true, "the flag is set before the first Desktop write");
+
+      await rm(shimState, { recursive: true });
+      await disableProfileLane(home, quiet);
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta);
+      assert.equal(await readFile(path.join(lib, "original.json"), "utf8"), original);
+      assert.equal(await readProfileState(home), null);
+      assert.equal(await isHarnessEnabled(home, HARNESS.CLAUDE_DESKTOP), false);
+    });
+  } finally { await cleanup(); }
+});
+
+async function seedConnectedLane(home, port = 8811) {
+  const dataDir = path.join(home, ".nexus", "claude-desktop");
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ enabled: true, lane: "profile", port, profileId: "prof-1" }));
+  await writeFile(path.join(dataDir, "shim-state.json"), JSON.stringify({ port, modelMap: {} }));
+  return dataDir;
+}
+
+test("restartShim rewrites the service file and restarts the shim, leaving the profile alone", async () => {
+  const { home, cleanup } = await tempHome();
+  try {
+    const dataDir = await seedConnectedLane(home);
+    const stateBefore = await readFile(path.join(dataDir, "profile-state.json"), "utf8");
+    const started = [];
+    const waited = [];
+    await restartShim(home, {
+      allowSystemChanges: true,
+      start: async (servicePath, options) => { started.push({ servicePath, options }); },
+      wait: async (port, options) => { waited.push({ port, options }); },
+    });
+    assert.equal(started.length, 1);
+    assert.match(await readFile(started[0].servicePath, "utf8"), /shim\.mjs/);
+    assert.deepEqual(waited.map((w) => w.port), [8811]);
+    assert.equal(waited[0].options.secret, await readShimSecret(dataDir));
+    assert.equal(await readFile(path.join(dataDir, "profile-state.json"), "utf8"), stateBefore);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("restartShim refuses when Claude Desktop isn't connected, without starting anything", async () => {
+  const { home, cleanup } = await tempHome();
+  try {
+    let started = false;
+    await assert.rejects(
+      restartShim(home, { allowSystemChanges: true, start: async () => { started = true; }, wait: async () => {} }),
+      /isn't connected.*nexus claude-desktop on/,
+    );
+    assert.equal(started, false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("restartShim reports a shim that still doesn't come up", async () => {
+  const { home, cleanup } = await tempHome();
+  try {
+    await seedConnectedLane(home);
+    await assert.rejects(
+      restartShim(home, {
+        allowSystemChanges: true,
+        start: async () => {},
+        wait: async (port) => { throw new Error(shimNotReadyMessage({ port, newErrors: "" })); },
+      }),
+      /did not start on 127\.0\.0\.1:8811/,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("off undoes an on that failed before the shim service was set up", { skip: process.platform === "win32" }, async () => {
+  const { home, cleanup } = await tempHome();
+  const lib = path.join(thirdPartyDir(home), "configLibrary");
+  const shimState = path.join(home, ".nexus", "claude-desktop", "shim-state.json");
+  const quiet = { allowSystemChanges: false, log: () => {} };
+  const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original" }] });
+  try {
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" }));
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    // A directory where the shim state belongs makes the shim step fail.
+    await mkdir(shimState, { recursive: true });
+    await seedKeychainConfig(home, "fw_example_key");
+    await withoutEnvFireworksKey(async () => {
+      await assert.rejects(enableProfileLane(home, quiet));
+      assert.equal((await readProfileState(home))?.enabled, false, "a failure before the shim starts still leaves a state off can undo");
+      await rm(shimState, { recursive: true });
+      await disableProfileLane(home, quiet);
+      assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta);
+      assert.equal(await readProfileState(home), null);
+    });
   } finally { await cleanup(); }
 });

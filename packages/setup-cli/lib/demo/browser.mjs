@@ -18,8 +18,6 @@ import {
   costPerGenerations,
 } from "./measurement.mjs";
 
-const FIREWORKS_DISPLAY = "Fireworks · GLM 5.2 Fast";
-
 /**
  * Build the self-contained compare.html.
  *

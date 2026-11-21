@@ -1,4 +1,4 @@
-/** @typedef {"" | "claude" | "claude-desktop" | "opencode" | "codex" | "pi" | "cursor" | "vscode" | "copilot-app" | "copilot-cli" | "deepseek"} HarnessArg */
+/** @typedef {"" | "claude" | "claude-desktop" | "opencode" | "codex" | "pi" | "cursor" | "vscode" | "copilot-app" | "copilot-cli" | "deepseek" | "hermes"} HarnessArg */
 
 export const HARNESS = Object.freeze({
   CLAUDE: "claude",
@@ -18,6 +18,7 @@ export const HARNESS = Object.freeze({
   COPILOT_APP: "copilot-app",
   COPILOT_CLI: "copilot-cli",
   DEEPSEEK: "deepseek",
+  HERMES: "hermes",
 });
 
 export const HARNESSES = Object.freeze(Object.values(HARNESS));
@@ -50,6 +51,7 @@ export const HARNESS_COMMANDS = Object.freeze([
   { command: "copilot-app", name: "GitHub Copilot desktop app" },
   { command: "copilot-cli", name: "GitHub Copilot CLI" },
   { command: "deepseek", name: "DeepSeek Harness (dsh)" },
+  { command: "hermes", name: "Hermes Agent" },
 ].map(Object.freeze));
 
 /**
@@ -62,12 +64,13 @@ export function resolveHarnessAlias(token) {
   return HARNESS_ALIASES[token] ?? token;
 }
 
-/** Codex, OpenCode, Pi, and DeepSeek Harness — file-based configs (literal or legacy env ref). */
+/** Codex, OpenCode, Pi, DeepSeek Harness, and Hermes Agent — file-based configs (literal or legacy env ref). */
 export const FILE_CONFIG_HARNESS_IDS = Object.freeze([
   HARNESS.CODEX,
   HARNESS.OPENCODE,
   HARNESS.PI,
   HARNESS.DEEPSEEK,
+  HARNESS.HERMES,
 ]);
 
 export const FILE_CONFIG_HARNESS_SET = new Set(FILE_CONFIG_HARNESS_IDS);
@@ -89,10 +92,6 @@ export const AZURE_ON_HARNESS_IDS = Object.freeze([
 export const AZURE_ON_HARNESS_SET = new Set(AZURE_ON_HARNESS_IDS);
 
 /**
- * @param {string} value
- * @returns {HarnessId}
- */
-/**
  * `copilot` names two different products, so it is never guessed at — the
  * error says which is which instead of silently picking one.
  */
@@ -100,25 +99,3 @@ export const AMBIGUOUS_COPILOT_MESSAGE =
   "`copilot` is ambiguous — GitHub ships two products:\n"
   + "  nexus copilot-app    GitHub Copilot desktop app\n"
   + "  nexus copilot-cli    GitHub Copilot CLI (the `copilot` command)";
-
-export function parseHarnessId(value) {
-  if (value === "copilot") {
-    throw new Error(AMBIGUOUS_COPILOT_MESSAGE);
-  }
-  if (!HARNESSES.includes(value)) {
-    throw new Error(`Unknown harness: ${value}. Choose one of: ${HARNESSES.join(", ")}`);
-  }
-  return value;
-}
-
-/**
- * @param {string} value
- * @returns {HarnessId[]}
- */
-export function parseHarnessIdList(value) {
-  const ids = value.split(",").map((part) => part.trim()).filter(Boolean);
-  if (ids.length === 0) {
-    throw new Error("At least one harness id is required");
-  }
-  return ids.map(parseHarnessId);
-}

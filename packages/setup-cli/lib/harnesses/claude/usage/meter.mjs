@@ -64,6 +64,7 @@ import {
   V,
   vislen,
 } from "./meter-style.mjs";
+import { createBackgroundRefresh, createRecordReader } from "./meter-hooks.mjs";
 import { isSyntheticModel } from "./report.mjs";
 
 /** Default footer keys; callers that offer more nav pass their own. */
@@ -77,6 +78,8 @@ class Dashboard {
     stream = process.stdout,
     agentLabel = "",
     keyHint = DEFAULT_KEY_HINT,
+    sessionLabel = "",
+    harnessName = "",
   } = {}) {
     this.path = filePath;
     this.index = index;
@@ -89,7 +92,8 @@ class Dashboard {
     this.seen = new Map();
     this.totals = new Map();     // bucket key -> Tally, insertion-ordered
     this.colors = new Map();
-    this.session = filePath ? path.basename(filePath, ".jsonl").slice(0, 8) : "········";
+    this.title = harnessName ? `  ✦  ${harnessName} · Live Cost Meter  ` : Dashboard.TITLE;
+    this.session = sessionLabel || (filePath ? path.basename(filePath, ".jsonl").slice(0, 8) : "········");
     this.agentLabel = agentLabel;
     this.keyHint = keyHint;
     this.locked = false;
@@ -131,6 +135,15 @@ class Dashboard {
     // session's models are assigned from the top of the palette.
     this.index = new ModelIndex();
     this.colors = new Map();
+  }
+
+  /** Re-tally the same session (a call's served model became known), keeping the pane and peers. */
+  replay() {
+    const { agents: pane, peers } = this;
+    const saved = pane && { list: pane.list, index: pane.index, focused: pane.focused };
+    this.reset();
+    this.peers = peers;
+    if (saved) Object.assign(pane, saved);
   }
 
   color(key) {
@@ -292,7 +305,7 @@ class Dashboard {
     const rows = Math.max(14, this.stream.rows || 24);
     const inner = w - 2;
     const out = [`${ANSI.homeCursor}${ANSI.clearScreen}`];
-    const title = clip(Dashboard.TITLE, inner);
+    const title = clip(this.title, inner);
     const n = this.turns.length;
     const agentPart = this.agentLabel
       ? `   ·   ${sanitize(this.agentLabel).replace(/\s+/g, " ").trim()}`
@@ -301,7 +314,7 @@ class Dashboard {
     // whether anything WAS. Say what the session is doing: spin only while a
     // turn is genuinely unsettled, and name the idle case outright so a finished
     // session doesn't look like it hung mid-request.
-    const state = this.working
+    const state = this.failure ? "⚠ couldn't read this session's log" : this.working
       ? `${SPIN[this.tick % SPIN.length]} working`
       : (n === 0 ? "idle · no turns yet" : "idle · waiting for your next prompt");
     const meta = clip(
@@ -354,7 +367,7 @@ class Dashboard {
     const w = Dashboard.plainWidth(this.stream) - 2;
     const write = (line) => this.stream.write(`${line}\n`);
     write(`${ACCENT}${TL}${H.repeat(w)}${TR}${R}`);
-    const t = Dashboard.TITLE;
+    const t = this.title;
     write(`${ACCENT}${V}${R}${B}${t}${R}${" ".repeat(Math.max(0, w - vislen(t)))}${ACCENT}${V}${R}`);
     write(`${ACCENT}${BL}${H.repeat(w)}${BR}${R}`);
     write(`${D}${clip(Dashboard.HDR, Dashboard.plainWidth(this.stream))}${R}`);
@@ -446,6 +459,11 @@ export function syncAgentPane(pane, agents) {
  *   agentPane?: { list: any[], index: number, focused: boolean, trackingId: string } | null,
  *   readAgents?: () => Promise<any[]>,
  *   onReady?: (db: Dashboard) => void,
+ *   translate?: (filePath: string) => (record: any) => any[],
+ *   sessionLabel?: string,
+ *   refreshServed?: () => Promise<boolean>,
+ *   servedMs?: number,
+ *   harnessName?: string,
  * }} opts
  */
 export async function runUsageMeter({
@@ -464,6 +482,11 @@ export async function runUsageMeter({
   agentPane = null,
   readAgents,
   onReady,
+  translate,
+  sessionLabel = "",
+  refreshServed,
+  servedMs = 10_000,
+  harnessName = "",
 } = {}) {
   if (!filePath) {
     throw new Error("filePath is required");
@@ -479,8 +502,11 @@ export async function runUsageMeter({
     fullscreen: !usePlain,
     stream,
     agentLabel,
+    sessionLabel,
+    harnessName,
     ...(keyHint ? { keyHint } : {}),
   });
+  const reader = createRecordReader(translate && (() => translate(filePath)), { onFailure: (error) => { db.failure = error; } });
   db.locked = true;
   // Caller-owned so the keys that move the pane cursor (read outside the meter)
   // and the rows the meter draws are the same object — no state to sync.
@@ -528,12 +554,17 @@ export async function runUsageMeter({
   // slow cadence instead of every poll, and never let it block the tail loop.
   let peersAt = 0;
   let peersBusy = false;
+  let peersAgain = false; // a forced refresh asked for mid-flight runs right after it
   const wantAgents = Boolean(agentPane && !usePlain && typeof readAgents === "function");
   // Both the footer split and the agents pane come from the same listing, so
   // they share one cadence and one in-flight guard rather than each re-reading
   // every subagent log on its own timer.
-  const refreshPeers = () => {
-    if (peersBusy) return;
+  const refreshPeers = ({ force = false } = {}) => {
+    if (peersBusy) {
+      if (force) peersAgain = true;
+      return;
+    }
+    if (force) peersAt = 0;
     if (typeof readPeers !== "function" && !wantAgents) return;
     const now = Date.now();
     if (peersAt && now - peersAt < peersMs) return;
@@ -554,8 +585,23 @@ export async function runUsageMeter({
         if (Array.isArray(agents)) syncAgentPane(agentPane, agents);
       })
       .catch(() => { /* keep the previous figures */ })
-      .finally(() => { peersBusy = false; });
+      .finally(() => {
+        peersBusy = false;
+        if (peersAgain) {
+          peersAgain = false;
+          refreshPeers({ force: true });
+        }
+      });
   };
+
+  // Served models come from the network on their own slow cadence, never awaited
+  // here; something new replays the log so those calls price as what ran.
+  let replayWanted = false;
+  const refreshServedModels = createBackgroundRefresh({
+    run: refreshServed,
+    everyMs: servedMs,
+    onChange: () => { replayWanted = true; },
+  });
 
   let fd;
   try {
@@ -582,9 +628,17 @@ export async function runUsageMeter({
     for (;;) {
       if (signal?.aborted) break;
       refreshPeers();
+      refreshServedModels();
+      if (replayWanted) {
+        replayWanted = false;
+        db.replay(); reader.reset(); pos = 0; // re-tally the same log with the newly known models
+        if (usePlain) { shown = 0; stream.write("\n(prices updated)\n"); } // plain output can't redraw: reprint
+        refreshPeers({ force: true }); // agents and peers price from the same models
+      }
       const [lines, next, truncated] = await readLines(fd, pos);
       pos = next;
       if (truncated) {
+        reader.reset();
         // The log was rewritten under us. Everything tallied so far describes
         // content that no longer exists, so start the session over rather than
         // mixing old turns with new ones.
@@ -593,7 +647,7 @@ export async function runUsageMeter({
       }
       for (const line of lines) {
         try {
-          db.feed(JSON.parse(line));
+          for (const rec of reader.records(JSON.parse(line))) db.feed(rec);
         } catch {
           /* torn write */
         }
@@ -621,6 +675,7 @@ export async function runUsageMeter({
     }
     process.off("SIGINT", onSigInt);
     restore();
+    if (reader.failure) process.stderr.write(`warning: couldn't read this session's log: ${sanitize(reader.failure.message)}\n`);
     if (usePlain) {
       stream.write("\n");
       for (const ln of db.footer(Dashboard.plainWidth(stream))) {

@@ -176,6 +176,45 @@ describe("firerouter model recognition", () => {
 });
 
 describe("model catalog", () => {
+  const fixtureModel = (shortId, target) => ({
+    shortId,
+    id: `accounts/fireworks/${shortId.endsWith("-latest") ? "routers" : "models"}/${shortId}`,
+    ...(target === undefined ? {} : { baseModelId: target }),
+  });
+
+  it("keeps only the newest concrete version above all alias targets", () => {
+    const catalog = [
+      fixtureModel("modelfamily-latest", "accounts/fireworks/models/modelfamily-a1b2"),
+      fixtureModel("modelfamily-fast-latest", "accounts/fireworks/models/modelfamily-a1b3"),
+      ...["a1b2", "a1b3", "a1b4", "a1b5-pro", "a1b5-fast"].map((suffix) => fixtureModel(`modelfamily-${suffix}`)),
+    ];
+    const expected = ["modelfamily-latest", "modelfamily-fast-latest", "modelfamily-a1b5-pro", "modelfamily-a1b5-fast"];
+    assert.deepEqual(preferLatestAliases(catalog).map((entry) => entry.shortId), expected);
+    assert.deepEqual(registerableModelIds(catalog), catalog.filter((entry) => expected.includes(entry.shortId)).map((entry) => entry.id));
+    assert.deepEqual(preferLatestAliases([...catalog].reverse()).map((entry) => entry.shortId), [...expected].reverse());
+  });
+
+  it("drops concrete versions at or below the newest fast alias target", () => {
+    const catalog = [
+      fixtureModel("modelfamily-latest", "modelfamily-a1b2"),
+      fixtureModel("modelfamily-fast-latest", "modelfamily-a1b4-fast"),
+      fixtureModel("modelfamily-a1b3"),
+      fixtureModel("modelfamily-a1b4-pro"),
+    ];
+    assert.deepEqual(preferLatestAliases(catalog), catalog.slice(0, 2));
+  });
+
+  it("conservatively drops concretes when any alias target is unknown", () => {
+    for (const target of [undefined, null, {}, "", "modelfamily", "otherfamily-a1b2", "modelfamily-latest"]) {
+      const known = fixtureModel("modelfamily-latest", "modelfamily-a1b2");
+      const unknown = fixtureModel("modelfamily-fast-latest", target);
+      const concrete = fixtureModel("modelfamily-a1b5-pro");
+      assert.deepEqual(preferLatestAliases([known, unknown, concrete]), [known, unknown]);
+      assert.deepEqual(preferLatestAliases([unknown, known, concrete]), [unknown, known]);
+    }
+    assert.deepEqual(preferLatestAliases([]), []);
+  });
+
   it("preferLatestAliases keeps aliases or only the newest concrete family version", () => {
     const catalog = [
       { shortId: "deepseek-v3", id: "accounts/fireworks/models/deepseek-v3" },
@@ -227,6 +266,18 @@ describe("model catalog", () => {
     ];
     const kept = preferLatestAliases(catalog).map((e) => e.shortId);
     assert.deepEqual(kept, ["kimi-fast-latest", "glm-fast-latest"]);
+  });
+
+  it("preferLatestAliases keeps an ultra-fast router out of its family's alias", () => {
+    // No `*-ultrafast-latest` alias exists to collapse into, so folding the
+    // router into the standard alias would hide it from every picker.
+    const catalog = [
+      { shortId: "example-flash-latest", id: "accounts/fireworks/routers/example-flash-latest", baseModelId: "accounts/fireworks/models/example-v2-flash" },
+      { shortId: "example-v2-flash", id: "accounts/fireworks/models/example-v2-flash" },
+      { shortId: "example-v2-flash-ultrafast", id: "accounts/fireworks/routers/example-v2-flash-ultrafast" },
+    ];
+    const kept = preferLatestAliases(catalog).map((e) => e.shortId);
+    assert.deepEqual(kept, ["example-flash-latest", "example-v2-flash-ultrafast"]);
   });
 
   it("preferLatestAliases collapses the kimi-k3 base model into the kimi aliases", () => {
@@ -338,4 +389,3 @@ describe("model catalog", () => {
     assert.deepEqual(registerableModelIds(catalog), ["auto", "accounts/fireworks/routers/glm-latest"]);
   });
 });
-

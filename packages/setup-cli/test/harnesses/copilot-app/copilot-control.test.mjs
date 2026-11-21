@@ -60,6 +60,11 @@ describe("copilot quit guard targets the desktop app, not the CLI", () => {
   });
 
   it("matches the desktop images on Windows, but never the CLI", () => {
+    assert.ok(matchesImage(windowsImage, "github.exe                         1234 Console"));
+    assert.ok(matchesImage(windowsImage, "GitHub.exe                         1234 Console"));
+    assert.ok(!matchesImage(windowsImage, "GitHubDesktop.exe                  4321 Console"));
+    assert.ok(!matchesImage(windowsImage, "mygithub.exe                       4321 Console"));
+    assert.ok(!matchesImage(windowsImage, ""));
     // tasklist gives image names only, so every plausible desktop executable
     // is enumerated: the app itself and copilotd.exe (the daemon named in the
     // app's own PowerShell strings).

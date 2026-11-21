@@ -9,6 +9,7 @@ import {
 import {
   assertResolvedKeyNotRejected,
   fireworksKeyPresent,
+  keyStoreUnreadableError,
   persistApiKeyFromFlag,
   resolveFireworksApiKeyValue,
   tryReadKeychainSecret,
@@ -84,6 +85,14 @@ export async function resolveHarnessOnApiKey({
     }
   }
 
+  if (!effectiveKey) {
+    // A stored key that can't be decrypted is not a missing key: explain the
+    // master-key mismatch instead of prompting for (or asking to log in with)
+    // a key that could not be stored either.
+    const unreadable = keyStoreUnreadableError();
+    if (unreadable) throw unreadable;
+  }
+
   if (!effectiveKey && home) {
     effectiveKey = await promptForKey(home);
     if (effectiveKey) {
@@ -92,7 +101,7 @@ export async function resolveHarnessOnApiKey({
   }
 
   if (!effectiveKey) {
-    throw new Error(MISSING_FIREWORKS_API_KEY_MESSAGE);
+    throw missingHarnessKeyError();
   }
 
   const existingHarnessKey = getExistingHarnessKey
@@ -130,6 +139,17 @@ export async function resolveHarnessOnApiKey({
     source,
     effectiveKey,
   };
+}
+
+/**
+ * The error for a `<harness> on` that resolved no Fireworks key. A stored key
+ * the current master key can't decrypt is not a missing key: that case gets
+ * the recovery steps (see `keyStoreUnreadableError`) instead of the sign-in
+ * guidance, which would only mint a key that can't be stored either.
+ * @returns {Error}
+ */
+export function missingHarnessKeyError() {
+  return keyStoreUnreadableError() ?? new Error(MISSING_FIREWORKS_API_KEY_MESSAGE);
 }
 
 export async function resolveFireworksApiKey({

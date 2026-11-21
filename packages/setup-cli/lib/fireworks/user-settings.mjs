@@ -4,10 +4,7 @@ import { fireworksGatewayFetchSignal } from "./gateway-fetch.mjs";
 import { verifyFireworksApiKey } from "../keys/verify-api-key.mjs";
 
 /**
- * The signed-in user's account-level preferences (`UserSettings`, one per
- * user at accounts/{a}/users/{u}/settings), read with their own API key.
- * Only `shareNexusAnalytics` is used here: the "share anonymous usage data"
- * answer, which is set on the web and read by the Nexus desktop app.
+ * The signed-in user's settings, read with their own API key.
  *
  * Every function returns a result object and never throws. Failure messages
  * are fixed strings: server error text can carry the account or user ID, so
@@ -16,7 +13,7 @@ import { verifyFireworksApiKey } from "../keys/verify-api-key.mjs";
 
 /**
  * @typedef {"network"|"unsupported"|"forbidden"|"other"} SettingsFailureCode
- * @typedef {{ ok: true, shareNexusAnalytics: boolean|null } | { ok: false, code: SettingsFailureCode, message: string }} ShareNexusAnalyticsResult
+ * @typedef {{ ok: true, shareNexusAnalytics: boolean|null, nexusAnalyticsId: string|null, nexusAccountAnalyticsId: string|null } | { ok: false, code: SettingsFailureCode, message: string }} ShareNexusAnalyticsResult
  * @typedef {{ ok: true, userName: string } | { ok: false, code: SettingsFailureCode, message: string }} UserNameResult
  */
 
@@ -128,6 +125,16 @@ function shareNexusAnalyticsFrom(body) {
 }
 
 /**
+ * An opaque ID of at most 128 characters: letters, digits, `_` and `-` only
+ * (no `@`, `/` or spaces), so an email or resource path is never passed on.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function analyticsIdFrom(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
+}
+
+/**
  * Read the preference; null when the user has never answered.
  * @param {string} apiKey
  * @param {string} userName  accounts/{a}/users/{u}
@@ -140,5 +147,10 @@ export async function getShareNexusAnalytics(apiKey, userName, { gatewayUrl = ""
   if (!response.ok) return httpFailure(response);
   const body = await readJson(response);
   if (!body || typeof body !== "object") return fail("other");
-  return { ok: true, shareNexusAnalytics: shareNexusAnalyticsFrom(body) };
+  return {
+    ok: true,
+    shareNexusAnalytics: shareNexusAnalyticsFrom(body),
+    nexusAnalyticsId: analyticsIdFrom(body.nexusAnalyticsId),
+    nexusAccountAnalyticsId: analyticsIdFrom(body.nexusAccountAnalyticsId),
+  };
 }

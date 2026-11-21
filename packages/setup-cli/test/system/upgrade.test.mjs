@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -451,7 +451,9 @@ describe("upgrade fetch, compare, and reset ordering", () => {
 
   it("runs npm install when already current but runtime packages are missing", async () => {
     const events = [];
+    const output = [];
     await runUpgradeCommand(upgradeDependencies({
+      infoFn: (message) => output.push(message),
       execFile: (file, args) => {
         if (file === "git") {
           const command = args.slice(2);
@@ -474,6 +476,7 @@ describe("upgrade fetch, compare, and reset ordering", () => {
       events.some((event) => /npm(\.cmd)? install --omit=dev/.test(event)),
       `expected npm install, got: ${events.join(" | ")}`,
     );
+    assert.ok(output.includes("Installing dependencies..."), `expected the install step, got: ${output.join(" | ")}`);
   });
 
   it("stops when installed and fetched release versions are unreadable", async () => {
@@ -580,6 +583,7 @@ describe("tarball update (no .git install)", () => {
     await withTarballInstall(async ({ home, installDir }) => {
       const events = [];
       const output = [];
+      const npmCalls = [];
       await runUpgradeCommand(tarballDeps({
         home,
         readRemoteVersion: async () => "1.0.0",
@@ -588,11 +592,13 @@ describe("tarball update (no .git install)", () => {
           "packages/setup-cli/package.json": JSON.stringify({ version: "1.0.0" }),
           "packages/setup-cli/package-lock.json": "new-lock\n",
         }),
-        execFile: (file, args) => {
+        execFile: (file, args, options) => {
           events.push([file, ...args].join(" "));
+          if (/npm/.test(file) || args.some((arg) => /npm/.test(arg))) npmCalls.push({ args, options });
           return "";
         },
         finalize: async () => events.push("finalize"),
+        infoFn: (message) => output.push(message),
         successFn: (message) => output.push(message),
       }));
 
@@ -604,7 +610,20 @@ describe("tarball update (no .git install)", () => {
         `expected npm install, got: ${events.join(" | ")}`,
       );
       assert.equal(events.at(-1), "finalize");
-      assert.deepEqual(output, ["Updated v0.9.0 → v1.0.0."]);
+      assert.deepEqual(output, [
+        "Current version: v0.9.0",
+        "Checking for updates...",
+        "Downloading v1.0.0...",
+        "Installing dependencies...",
+        "Updated v0.9.0 → v1.0.0.",
+      ]);
+      // npm's own output stays out of the `→` steps: no lifecycle-script
+      // banner, no "added N packages" summary; only npm errors reach stderr.
+      assert.equal(npmCalls.length, 1);
+      assert.ok(npmCalls[0].args.includes("--ignore-scripts"));
+      assert.ok(npmCalls[0].args.includes("--loglevel=error"));
+      assert.deepEqual(npmCalls[0].options.stdio, ["ignore", "ignore", "inherit"]);
+      assert.equal(npmCalls[0].options.env.NEXUS_SKIP_POSTINSTALL_FINALIZE, "1");
     });
   });
 
@@ -636,7 +655,7 @@ describe("tarball update (no .git install)", () => {
 
   it("puts the previous install back when the downloaded release cannot be moved into place", async () => {
     await withTarballInstall(async ({ home, installDir }) => {
-      const staging = `${installDir}.download`;
+      let staging;
       await assert.rejects(
         runUpgradeCommand(tarballDeps({
           home,
@@ -646,7 +665,10 @@ describe("tarball update (no .git install)", () => {
             "packages/setup-cli/package.json": JSON.stringify({ version: "1.0.0" }),
           }),
           renameDir: async (from, to) => {
-            if (from === staging) throw new Error("EXDEV: cross-device link not permitted");
+            if (from.startsWith(`${installDir}.download-`)) {
+              staging = from;
+              throw new Error("EXDEV: cross-device link not permitted");
+            }
             return rename(from, to);
           },
           execFile: () => "",
@@ -657,6 +679,88 @@ describe("tarball update (no .git install)", () => {
       assert.equal(await readFile(path.join(installDir, "packages/setup-cli/bin/nexus.mjs"), "utf8"), "// old\n");
       assert.equal(existsSync(`${installDir}.previous`), false);
       assert.equal(existsSync(staging), false);
+    });
+  });
+
+  it("says the install is gone and how to reinstall when the swap and the restore both fail", async () => {
+    await withTarballInstall(async ({ home, installDir }) => {
+      const error = await runUpgradeCommand(tarballDeps({
+        home,
+        readRemoteVersion: async () => "1.0.0",
+        downloadTarball: fakeDownload({
+          "packages/setup-cli/bin/nexus.mjs": "// new\n",
+          "packages/setup-cli/package.json": JSON.stringify({ version: "1.0.0" }),
+        }),
+        renameDir: async (from, to) => {
+          if (from.startsWith(`${installDir}.download-`)) throw new Error("EXDEV: cross-device link not permitted");
+          if (from === `${installDir}.previous`) throw new Error("EBUSY: resource busy or locked");
+          return rename(from, to);
+        },
+        execFile: () => "",
+        finalize: async () => assert.fail("finalize must not run after a failed swap"),
+      })).then(() => assert.fail("update must fail"), (caught) => caught);
+      assert.equal(existsSync(installDir), false);
+      assert.doesNotMatch(error.message, /left in place|put back;/);
+      assert.match(
+        error.message,
+        /could not move the downloaded release into place \(EXDEV.*\), and the previous install could not be put back \(EBUSY.*\)\..*\n  curl -fsSL https:\/\/nexus\.fireworks\.ai\/install\.sh \| bash$/s,
+      );
+      assert.deepEqual((await readdir(path.dirname(installDir))).filter((name) => name.startsWith("cli.download-")), []);
+    });
+  });
+
+  it("says the install is gone and how to reinstall when dependencies and the restore both fail", async () => {
+    await withTarballInstall(async ({ home, installDir }) => {
+      const error = await runUpgradeCommand(tarballDeps({
+        home,
+        readRemoteVersion: async () => "1.0.0",
+        downloadTarball: fakeDownload({
+          "packages/setup-cli/bin/nexus.mjs": "// new\n",
+          "packages/setup-cli/package.json": JSON.stringify({ version: "1.0.0" }),
+          "packages/setup-cli/package-lock.json": "new-lock\n",
+        }),
+        renameDir: async (from, to) => {
+          if (from === `${installDir}.previous`) throw new Error("EBUSY: resource busy or locked");
+          return rename(from, to);
+        },
+        execFile: () => { throw new Error("npm exited with code 1"); },
+        finalize: async () => assert.fail("finalize must not run after a failed dependency install"),
+      })).then(() => assert.fail("update must fail"), (caught) => caught);
+      assert.equal(existsSync(installDir), false);
+      assert.doesNotMatch(error.message, /left in place|put back;/);
+      assert.match(
+        error.message,
+        /could not install dependencies \(npm exited with code 1\), and the previous install could not be put back \(EBUSY.*\)\..*\n  curl -fsSL https:\/\/nexus\.fireworks\.ai\/install\.sh \| bash$/s,
+      );
+    });
+  });
+
+  it("removes the download and keeps the install when the current install cannot be moved aside", async () => {
+    await withTarballInstall(async ({ home, installDir }) => {
+      await assert.rejects(
+        runUpgradeCommand(tarballDeps({
+          home,
+          readRemoteVersion: async () => "1.0.0",
+          downloadTarball: fakeDownload({
+            "packages/setup-cli/bin/nexus.mjs": "// new\n",
+            "packages/setup-cli/package.json": JSON.stringify({ version: "1.0.0" }),
+          }),
+          renameDir: async (from, to) => {
+            if (from === installDir) {
+              throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+            }
+            return rename(from, to);
+          },
+          execFile: () => "",
+          finalize: async () => assert.fail("finalize must not run when the install was not moved aside"),
+        })),
+        /^Error: Update failed: could not move the current install aside \(EPERM.*\)\. Your existing install was left in place\.$/,
+      );
+      assert.equal(await readFile(path.join(installDir, "packages/setup-cli/bin/nexus.mjs"), "utf8"), "// old\n");
+      assert.deepEqual(
+        (await readdir(path.dirname(installDir))).filter((name) => name !== "cli" && name.startsWith("cli")),
+        [],
+      );
     });
   });
 
@@ -770,6 +874,31 @@ describe("tarball update (no .git install)", () => {
       );
       assert.equal(await readFile(path.join(installDir, "packages/setup-cli/bin/nexus.mjs"), "utf8"), "// old\n");
       assert.equal(existsSync(`${installDir}.download`), false);
+    });
+  });
+
+  for (const version of ["1", "1.0.0\n", { version: "1.0.0" }]) {
+    it(`keeps the install intact for malformed downloaded version ${JSON.stringify(version)}`, async () => {
+      await withTarballInstall(async ({ home, installDir }) => {
+        await assert.rejects(runUpgradeCommand(tarballDeps({
+          home, readRemoteVersion: async () => "1.0.0",
+          downloadTarball: fakeDownload({
+            "packages/setup-cli/bin/nexus.mjs": "// new\n",
+            "packages/setup-cli/package.json": JSON.stringify({ version }),
+          }),
+        })), /could not read the version of the downloaded release/);
+        assert.equal(await readFile(path.join(installDir, "packages/setup-cli/bin/nexus.mjs"), "utf8"), "// old\n");
+      });
+    });
+  }
+
+  it("refuses malformed remote versions before downloading", async () => {
+    await withTarballInstall(async ({ home, installDir }) => {
+      await assert.rejects(runUpgradeCommand(tarballDeps({
+        home, readRemoteVersion: async () => "1.0.0\n",
+        downloadTarball: async () => assert.fail("must not download malformed metadata"),
+      })), /could not check the latest/);
+      assert.equal(await readFile(path.join(installDir, "packages/setup-cli/bin/nexus.mjs"), "utf8"), "// old\n");
     });
   });
 

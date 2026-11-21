@@ -1,6 +1,7 @@
 import { accent, warn as uiWarn } from "../ui.mjs";
 import {
   builtinFileStoreAvailable,
+  isKeyStoreUndecryptableError,
   secretsFilePath,
   storeBuiltinFileSecretVerified,
 } from "./builtin-file-secret-store.mjs";
@@ -12,6 +13,10 @@ import {
   writePlaintextSecret,
 } from "./plaintext-secret-store.mjs";
 import { isKeyStorageForcedNull } from "./storage-env.mjs";
+
+export function warnStaleSecretCopy() {
+  try { console.warn(uiWarn("A stale credential copy could not be removed. Check file ownership, permissions, and symlinks.")); } catch { /* best effort */ }
+}
 
 /**
  * @typedef {object} SecretFallbackDeps
@@ -49,7 +54,9 @@ export function createSecretFallbackHandlers(deps) {
       await deps.withHomeScopedEnv(resolvedHome, async () => {
         await storeBuiltinFileSecretVerified(deps.secretService, account, trimmed);
       });
-    } catch {
+    } catch (error) {
+      // The store exists under another master key: stop rather than try plaintext.
+      if (isKeyStoreUndecryptableError(error)) throw error;
       return false;
     }
 
@@ -74,7 +81,7 @@ export function createSecretFallbackHandlers(deps) {
     try {
       await deletePlaintextSecret(resolvedHome);
     } catch {
-      // Secure file storage + cache are authoritative.
+      warnStaleSecretCopy();
     }
     return true;
   }
@@ -126,6 +133,10 @@ export function createSecretFallbackHandlers(deps) {
 
   /**
    * secure → encrypted file → plaintext ladder shared by setSecret and reprobe.
+   * An encrypted store the current master key cannot decrypt stops the ladder
+   * (KeyStoreUndecryptableError): plaintext is only for hosts where no
+   * encrypted store can be used, not for a store that still holds secrets
+   * under a previous key.
    *
    * @param {string} value
    * @param {string} [home]
@@ -141,7 +152,7 @@ export function createSecretFallbackHandlers(deps) {
       await storeSecure(trimmed, home);
       return "secure";
     } catch (error) {
-      if (isKeyStorageForcedNull()) {
+      if (isKeyStorageForcedNull() || isKeyStoreUndecryptableError(error)) {
         throw error;
       }
       if (await storeSecretInFileFallback(trimmed, resolvedHome, error, deps.secretAccount, { quiet })) {

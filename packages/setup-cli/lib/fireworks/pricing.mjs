@@ -1,23 +1,14 @@
 import {
-  FIREWORKS_MODEL_SPECS,
   FIREWORKS_PRICING_DOCS_URL,
   catalogCacheCandidates,
   lookupModelSpec,
   isUsableCachedServerlessPricing,
+  lookupSpecPricing,
   resolveSpecSlug,
 } from "./model-specs.mjs";
 import { lookupCachedServerlessPricing } from "./serverless-catalog-cache.mjs";
 
 export { FIREWORKS_PRICING_DOCS_URL };
-
-/**
- * Standard serverless rates (USD per 1M tokens) from Fireworks docs.
- */
-export const FIREWORKS_STANDARD_PRICING = Object.fromEntries(
-  Object.entries(FIREWORKS_MODEL_SPECS)
-    .filter(([, spec]) => spec.pricing)
-    .map(([slug, spec]) => [slug, { label: spec.label, ...spec.pricing }]),
-);
 
 function pricingCandidates(modelRef) {
   return catalogCacheCandidates(modelRef);
@@ -36,15 +27,16 @@ export function lookupFireworksPricing(modelRef) {
   }
 
   const spec = lookupModelSpec(modelRef);
-  if (!spec?.pricing) {
+  const pricing = lookupSpecPricing(modelRef);
+  if (!pricing) {
     return null;
   }
 
   return {
     slug: resolveSpecSlug(modelRef),
     label: spec.label,
-    ...spec.pricing,
-    tier: spec.pricing.tier ?? "standard",
+    ...pricing,
+    tier: pricing.tier ?? "standard",
     source: FIREWORKS_PRICING_DOCS_URL,
   };
 }
@@ -73,24 +65,6 @@ export function formatAnthropicStylePerMtok(pricing) {
     return null;
   }
   return `${formatUsd(pricing.input)}/${formatUsd(pricing.output)} per Mtok`;
-}
-
-/** Full standard-tier line for status output. */
-export function formatPricingLine(pricing) {
-  if (!pricing) {
-    return null;
-  }
-  const tierNote = pricing.tier === "fast" ? " (fast)" : "";
-  return `${formatUsd(pricing.input)} in / ${formatUsd(pricing.cachedInput)} cached in / ${formatUsd(pricing.output)} out per Mtok${tierNote}`;
-}
-
-/** Description for Claude Code custom model picker (description field only). */
-export function formatPricingDescription(pricing) {
-  if (!pricing) {
-    return `Fireworks serverless model. Rates: ${FIREWORKS_PRICING_DOCS_URL}`;
-  }
-  const tierNote = pricing.tier === "fast" ? " Fast tier." : "";
-  return `Fireworks serverless (${pricing.label}): ${formatUsd(pricing.input)} in / ${formatUsd(pricing.output)} out per Mtok (${formatUsd(pricing.cachedInput)} cached in).${tierNote}`;
 }
 
 export function attachPricing(modelRef) {

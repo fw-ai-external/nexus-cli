@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, it } from "node:test";
 
@@ -160,6 +160,39 @@ describe("migrateDesktopShimAgentOnUpgrade", () => {
 });
 
 describe("restartClaudeDesktopShimOnUpgrade", () => {
+  it("repairs only the macOS Node argument when the stable binary exists", async () => {
+    await withTempHome("shim-node-repair-", async (home) => {
+      const savedTest = process.env.NEXUS_TEST;
+      delete process.env.NEXUS_TEST;
+      try {
+        const { shimPlistPath } = await import("../../lib/harnesses/claude-desktop/profile-lane.mjs");
+        const file = shimPlistPath(home);
+        const prefix = path.join(home, "brew & more");
+        const cellar = `${prefix}/Cellar/node@24/24.21.0/bin/node`;
+        const stable = `${prefix}/opt/node@24/bin/node`;
+        const dataDir = path.join(home, ".nexus", "claude-desktop");
+        await mkdir(path.dirname(file), { recursive: true });
+        await mkdir(dataDir, { recursive: true });
+        await writeFile(path.join(dataDir, "profile-state.json"), JSON.stringify({ profileId: "test" }));
+        const raw = `<plist>\n<dict><key>ProgramArguments</key>\n<array>\n<string>${cellar.replaceAll("&", "&amp;")}</string>\n<string>${cellar}</string></array>\n</dict></plist>\n`;
+        await writeFile(file, raw);
+        const start = async () => {};
+        await restartClaudeDesktopShimOnUpgrade(home, { platform: "darwin", start });
+        assert.equal(await readFile(file, "utf8"), raw);
+        await mkdir(path.dirname(stable), { recursive: true });
+        await writeFile(stable, "");
+        await restartClaudeDesktopShimOnUpgrade(home, { platform: "darwin", start: async () => {
+          assert.equal(await readFile(file, "utf8"), raw.replace(cellar.replaceAll("&", "&amp;"), stable.replaceAll("&", "&amp;")));
+        } });
+        const before = await stat(file);
+        await restartClaudeDesktopShimOnUpgrade(home, { platform: "darwin", start });
+        assert.equal((await stat(file)).ino, before.ino);
+      } finally {
+        if (savedTest === undefined) delete process.env.NEXUS_TEST;
+        else process.env.NEXUS_TEST = savedTest;
+      }
+    });
+  });
   it("restarts the existing shim service so upgraded code takes effect", async () => {
     await withTempHome("shim-restart-", async (home) => {
       const savedTest = process.env.NEXUS_TEST;

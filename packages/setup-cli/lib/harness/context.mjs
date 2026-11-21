@@ -2,7 +2,6 @@ import {
   resolveDataDir,
   userSettingsPath,
 } from "../harnesses/claude/core.mjs";
-import { claudeDesktopDataDir } from "../harnesses/claude-desktop/core.mjs";
 import {
   codexConfigPath,
   codexCatalogPath,
@@ -13,6 +12,7 @@ import {
   deepseekDataDir,
   deepseekSettingsPath,
 } from "../harnesses/deepseek/core.mjs";
+import { hermesConfigPath, hermesDataDir } from "../harnesses/hermes/core.mjs";
 import {
   opencodeConfigPath,
   opencodeDataDir,
@@ -135,6 +135,16 @@ export function deepseekPathsFor(ctx) {
   };
 }
 
+/**
+ * @param {HarnessContext} ctx
+ */
+export function hermesPathsFor(ctx) {
+  return {
+    configPath: hermesConfigPath(ctx.home, ctx.configPath),
+    dataDir: hermesDataDir(ctx.home, ctx.dataDir),
+  };
+}
+
 /** Per-harness path-override fields + the flag to suggest in the error message. */
 const HOME_VALIDATION = {
   claude: { fields: ["settingsPath"], flag: "--settings-path" },
@@ -148,11 +158,12 @@ const HOME_VALIDATION = {
   vscode: { fields: ["vscodePath"], flag: "--vscode-path" },
   copilot: { fields: ["dbPath"], flag: "--db-path" },
   deepseek: { fields: ["configPath"], flag: "--config-path" },
+  hermes: { fields: ["configPath"], flag: "--config-path" },
 };
 
 /**
  * @param {HarnessContext} ctx
- * @param {"claude" | "opencode" | "codex" | "pi" | "cursor" | "vscode" | "copilot" | "deepseek"} harnessId
+ * @param {"claude" | "opencode" | "codex" | "pi" | "cursor" | "vscode" | "copilot" | "deepseek" | "hermes"} harnessId
  */
 export function ensureHomeForHarness(ctx, harnessId) {
   const req = HOME_VALIDATION[harnessId] ?? HOME_VALIDATION.claude;

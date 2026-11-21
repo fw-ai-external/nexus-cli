@@ -1,6 +1,7 @@
 import {
   AUTO_INSTANT_MODEL_ID,
   AUTO_MODEL_ID,
+  NEXUS_AUTO_MODEL_ID,
   KNOWN_AUTO_MODEL_IDS,
   canonicalAutoModelId,
   isAutoModelId,
@@ -11,6 +12,7 @@ import {
 export {
   AUTO_INSTANT_MODEL_ID,
   AUTO_MODEL_ID,
+  NEXUS_AUTO_MODEL_ID,
   KNOWN_AUTO_MODEL_IDS,
   canonicalAutoModelId,
   isAutoModelId,
@@ -18,6 +20,8 @@ export {
 };
 
 export const FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference";
+/** The global OpenAI-compatible inference URL every OpenAI-style harness config uses. */
+export const FIREWORKS_OPENAI_BASE_URL = `${FIREWORKS_BASE_URL}/v1`;
 export const FIREROUTER_MODEL_ID = "firerouter";
 // Reserved slot value meaning "don't pin this Claude Code slot — let it fall back
 // to Claude's own (Anthropic) default model." The Fireworks gateway serves
@@ -30,14 +34,6 @@ export const CLAUDE_NATIVE_SLOT_LABEL = "Claude default";
 export const CLAUDE_NATIVE_SLOT_ALIAS = "native";
 export const FIREROUTER_ROUTER_ID =
   "accounts/fireworks/routers/firerouter";
-export const GLM_LATEST_ROUTER_ID =
-  "accounts/fireworks/routers/glm-latest";
-export const GLM_FAST_LATEST_ROUTER_ID =
-  "accounts/fireworks/routers/glm-fast-latest";
-export const KIMI_FAST_LATEST_ROUTER_ID =
-  "accounts/fireworks/routers/kimi-fast-latest";
-export const DEEPSEEK_FLASH_LATEST_ROUTER_ID =
-  "accounts/fireworks/routers/deepseek-flash-latest";
 export const DEFAULT_MAIN_MODEL = AUTO_MODEL_ID;
 
 export function resolveDefaultMainModel() {
@@ -47,7 +43,7 @@ export function resolveDefaultMainModel() {
 const PUBLIC_FIREWORKS_MODEL_REF_RE =
   /^accounts\/fireworks\/(?:models|routers)\/([^/]+?)(\[1m\])?$/i;
 
-function stripContextSuffix(model) {
+export function stripContextSuffix(model) {
   return typeof model === "string"
     ? model.replace(/\[1m\]$/i, "")
     : model;

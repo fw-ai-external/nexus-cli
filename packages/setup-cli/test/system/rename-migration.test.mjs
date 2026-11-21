@@ -16,6 +16,7 @@ const RENAME_HEADLINE = renameHeadline();
 import { runRenameMigration } from "../../lib/system/rename-migration.mjs";
 import { telemetryReferer } from "../../lib/telemetry/request-headers.mjs";
 import { itIfSqlite, runFireconnect, withTempHome } from "../helpers.mjs";
+import { createCopilotDb } from "../fixtures/copilot-db.mjs";
 
 async function exists(file) {
   return access(file).then(() => true, () => false);
@@ -132,6 +133,7 @@ describe("runRenameMigration", () => {
   itIfSqlite("retargets the Copilot app's provider row without a re-`on`", async () => {
     await withTempHome("rename-migration-copilot-app-", async (home) => {
       const dbPath = copilotDataDbPath({ home });
+      createCopilotDb(dbPath);
       await upsertFireconnectProvider(dbPath, {
         providerId: "fc-test-provider",
         apiKey: "fw-test-key",
@@ -156,6 +158,7 @@ describe("runRenameMigration", () => {
   itIfSqlite("leaves the Copilot app's row alone while the app is open, and says so", async () => {
     await withTempHome("rename-migration-copilot-app-open-", async (home) => {
       const dbPath = copilotDataDbPath({ home });
+      createCopilotDb(dbPath);
       await upsertFireconnectProvider(dbPath, {
         providerId: "fc-test-provider",
         apiKey: "fw-test-key",

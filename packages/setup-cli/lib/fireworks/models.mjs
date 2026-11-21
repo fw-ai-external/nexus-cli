@@ -9,6 +9,7 @@ import { MISSING_FIREWORKS_API_KEY_MESSAGE } from "../keys/key-type.mjs";
 import { planLimitsCatalogToAuto } from "./account-plan.mjs";
 import {
   FIREWORKS_PRICING_DOCS_URL,
+  isUltrafastEntry,
   lookupModelSpec,
   pricingMatchesModelRefTier,
   requiresFastTierPricing,
@@ -28,7 +29,6 @@ import { stripViaFireworksSuffix } from "./label-suffix.mjs";
 import { refreshListPriceCache } from "../pricing/list-price-cache.mjs";
 
 export const FIREWORKS_GATEWAY_URL = "https://api.fireworks.ai";
-export const PLATFORM_ACCOUNT_ID = "fireworks";
 export const KIND_SERVERLESS = "serverless";
 export const SERVERLESS_CODING_USE_CASE = "coding";
 /** @typedef {{ id: string, shortId: string, displayName: string, baseModelId?: string, kind: "serverless", serverlessMode?: string }} CatalogEntry */
@@ -144,7 +144,7 @@ async function fetchGatewayPage(path, apiKey, signal) {
   // serve the catalog in specs.
   const gatewayUrl = process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL;
   // The serverless listing is read-only and occasionally returns a transient
-  // 5xx ("Error listing serverless models" from the control plane). Retry once
+  // 5xx ("Error listing serverless models" from the Fireworks API). Retry once
   // so a single blip doesn't force every harness `on` into offline mode.
   // Only HTTP 5xx responses are retried: client errors are final, and network
   // errors propagate exactly as before this change — every caller degrades to
@@ -370,7 +370,12 @@ function normalizeRouterEntry({ usageId, baseModel }) {
 // after all mode rows are processed, so an alias can borrow the tier-appropriate
 // row's rates: a fast-latest alias takes the fast router's pricing, a plain
 // -latest alias takes the base model's standard rates.
-function addApiAliasRouters(snapshot, baseModelId, aliases, entries, pricingById, fastRouterId) {
+//
+// The listing leaves out serving modes the account can't use, so an alias is
+// offered only when its model's matching mode is listed: a `-fast-latest`
+// alias needs the fast row, a plain `-latest` alias the standard row. An alias
+// another mode's row still reports would otherwise point at a blocked target.
+function addApiAliasRouters(snapshot, baseModelId, aliases, entries, pricingById, fastRouterId, servedTiers) {
   const modalities = snapshot.inputModalitiesById.get(baseModelId);
   const contextLength = snapshot.contextLengthById.get(baseModelId);
   const supportsTools = snapshot.supportsToolsById.get(baseModelId);
@@ -381,6 +386,10 @@ function addApiAliasRouters(snapshot, baseModelId, aliases, entries, pricingById
       continue;
     }
     const shortId = shortIdFromResourceName(aliasRouterId);
+    const targetTier = aliasTargetTier(shortId);
+    if (targetTier && servedTiers && !servedTiers.has(targetTier)) {
+      continue;
+    }
     entries.push({
       id: aliasRouterId,
       shortId,
@@ -396,10 +405,13 @@ function addApiAliasRouters(snapshot, baseModelId, aliases, entries, pricingById
     // borrows the fast mode router's rates, never the base model's standard
     // ones), and the label carries the same fast/latest suffix policy as
     // entry display names.
+    // A US router bills its own US rates, never its global base model's.
     const wantsFast = requiresFastTierPricing(shortId);
-    const sourcePricing = wantsFast
-      ? (fastRouterId ? pricingById.get(fastRouterId) : undefined)
-      : basePricing;
+    const sourcePricing = shortId.endsWith("-us")
+      ? undefined
+      : wantsFast
+        ? (fastRouterId ? pricingById.get(fastRouterId) : undefined)
+        : basePricing;
     if (sourcePricing && pricingMatchesModelRefTier(shortId, sourcePricing)) {
       pricingById.set(aliasRouterId, {
         ...sourcePricing,
@@ -417,6 +429,18 @@ function addApiAliasRouters(snapshot, baseModelId, aliases, entries, pricingById
       snapshot.supportsToolsById.set(aliasRouterId, supportsTools);
     }
   }
+}
+
+/**
+ * The serving mode a `-latest` alias targets: fast for `*-fast-latest`,
+ * standard for a plain `-latest`; null for any other alias.
+ * @param {string} shortId
+ */
+function aliasTargetTier(shortId) {
+  if (shortId.endsWith("-fast-latest")) {
+    return "fast";
+  }
+  return shortId.endsWith("-latest") ? "standard" : null;
 }
 
 function refreshRouterDisplayNames(snapshot) {
@@ -463,6 +487,9 @@ export function buildServerlessCatalogSnapshot(apiModels) {
   // own mode routers, never a same-family sibling's.
   const aliasRowsByModel = new Map();
   const fastRouterByModel = new Map();
+  // Serving modes listed per model, so an alias whose mode isn't listed is
+  // left out (see addApiAliasRouters).
+  const tiersByModel = new Map();
 
   for (const model of apiModels) {
     const routerAutoId = autoIdOfRouterRow(model);
@@ -472,10 +499,19 @@ export function buildServerlessCatalogSnapshot(apiModels) {
     }
     const modelId = model.name ?? model.id ?? "";
     const tier = flatModeTier(model);
+    const usageId = usageIdOf(model);
+    // Under US data residency the API lists a model the account can call
+    // only in-region through its `-us` router. Its bare id is rejected there,
+    // so that row neither offers the bare id nor prices it.
+    const regional = isUsRouterId(usageId);
     const modelEntry = normalizeModelEntry(model);
     if (!modelEntry) {
       continue;
     }
+    if (!tiersByModel.has(modelId)) {
+      tiersByModel.set(modelId, new Set());
+    }
+    tiersByModel.get(modelId).add(regional ? US_ROUTER_TIER : tier);
     // The cache must hold only facts the API actually reports. Fabricating a
     // default (tool support = true, modalities = text-only) and caching it lets
     // the cache silently override curated static specs — e.g. flipping
@@ -509,22 +545,28 @@ export function buildServerlessCatalogSnapshot(apiModels) {
     // Bare model ids carry standard-tier pricing only; a mode-specific rate
     // (fast, spot, ...) belongs to that mode's usage_identifier router below.
     const rates = tier === "priority" ? null : parseSkuPricing(model.pricing ?? []);
-    if (tier === "standard" && rates) {
+    if (tier === "standard" && !regional && rates) {
       const pricing = buildPricingRecord(modelId, modelEntry.displayName, rates, tier);
       if (pricing) {
         pricingById.set(modelId, pricing);
       }
     }
 
-    const usageId = usageIdOf(model);
     if (usageId.includes("/routers/")) {
       const routerEntry = normalizeRouterEntry({ usageId, baseModel: model });
+      if (regional) {
+        // The bare model has no row of its own here, so the router is named
+        // from this row: "GLM 5.3" -> "GLM 5.3 (US)".
+        routerEntry.displayName = resolveRouterEntryDisplayName(usageId, modelEntry.displayName);
+      }
       entries.push(routerEntry);
       routerBaseModelById.set(usageId, modelId);
-      if (tier === "fast") {
+      if (tier === "fast" && !regional) {
         fastRouterByModel.set(modelId, usageId);
       }
-      if (rates) {
+      // Rates on a -us row are never used; a US router is priced from its US
+      // spec only.
+      if (rates && !regional) {
         const pricing = buildPricingRecord(usageId, routerEntry.displayName, rates, tier);
         if (pricing) {
           pricingById.set(usageId, pricing);
@@ -543,7 +585,28 @@ export function buildServerlessCatalogSnapshot(apiModels) {
   }
 
   for (const [modelId, aliases] of aliasRowsByModel) {
-    addApiAliasRouters(snapshot, modelId, aliases, entries, pricingById, fastRouterByModel.get(modelId));
+    addApiAliasRouters(
+      snapshot,
+      modelId,
+      aliases,
+      entries,
+      pricingById,
+      fastRouterByModel.get(modelId),
+      tiersByModel.get(modelId),
+    );
+  }
+
+  // A bare model id is served in the standard tier (only `fast` has its own
+  // allowance), so a model whose only listed mode is fast is offered through
+  // its fast router alone, never by its bare id: the account can't use that.
+  // Likewise a model listed only through its `-us` router.
+  for (const [modelId, tiers] of tiersByModel) {
+    if (![...tiers].some((tier) => !ROUTER_ONLY_TIERS.has(tier))) {
+      const index = entries.findIndex((entry) => entry.id === modelId);
+      if (index >= 0) {
+        entries.splice(index, 1);
+      }
+    }
   }
 
   // An auto mix routes across models, so it must not inherit the rates,
@@ -574,6 +637,16 @@ function autoIdOfRouterRow(model) {
   }
   const usageId = usageIdOf(model);
   return canonicalAutoModelId(usageId) || canonicalAutoModelId(shortIdFromResourceName(usageId));
+}
+
+// Tier recorded for a row the API serves through a `-us` router.
+const US_ROUTER_TIER = "us";
+// Tiers whose rows offer a model through a router only, never by its bare id.
+const ROUTER_ONLY_TIERS = new Set(["fast", US_ROUTER_TIER]);
+
+/** Whether a usage identifier names a Fireworks US-only router (`…/routers/glm-5p3-us`). */
+function isUsRouterId(usageId) {
+  return usageId.includes("/routers/") && shortIdFromResourceName(usageId).endsWith("-us");
 }
 
 /** A row's usage identifier, from the flat (snake_case) or nested (camelCase) shape. */
@@ -809,7 +882,7 @@ function latestAliasFamily(shortId) {
  * Resolution: exact alias-family match first, then longest alias-family
  * prefix; otherwise the stripped family stands alone.
  */
-function catalogFamilyVersion(shortId = "", aliasFamilies = []) {
+function catalogFamilyVersion(shortId = "", aliasFamilies = [], serverlessMode = "") {
   const aliasFamily = latestAliasFamily(shortId);
   if (aliasFamily !== null) {
     return { family: stripVersionSegments(aliasFamily).family, version: [], latest: true };
@@ -817,7 +890,8 @@ function catalogFamilyVersion(shortId = "", aliasFamilies = []) {
   const { family, version } = stripVersionSegments(shortId);
   // Geography is a serving constraint, not a model-family variant. Keep a US
   // router separate from the global family so `*-latest` does not collapse it.
-  if (shortId.endsWith("-us")) {
+  // Ultra-fast is a serving mode too, with no `*-latest` alias of its own.
+  if (shortId.endsWith("-us") || isUltrafastEntry({ shortId, serverlessMode })) {
     return { family, version, latest: false };
   }
   if (aliasFamilies.includes(family)) {
@@ -839,15 +913,6 @@ function compareVersions(a, b) {
 }
 
 /**
- * Keep the stable aliases users should pin in harness pickers. For each known
- * versioned family:
- *   1. keep `*-latest` and `*-fast-latest` aliases when present;
- *   2. otherwise keep every variant of only the newest concrete version.
- * Standalone/non-versioned models remain untouched.
- * @param {import("./models.mjs").CatalogEntry[]} catalog
- * @returns {import("./models.mjs").CatalogEntry[]}
- */
-/**
  * Families this catalog's own `-latest` alias rows advertise, so versioned
  * entries (including families this CLI has never seen) resolve against them.
  */
@@ -860,11 +925,10 @@ function catalogAliasFamilies(catalog) {
   )];
 }
 
-function parseCatalogFamilies(catalog) {
-  const aliasFamilies = catalogAliasFamilies(catalog);
+function parseCatalogFamilies(catalog, aliasFamilies) {
   return catalog.map((entry) => ({
     entry,
-    ...catalogFamilyVersion(entry.shortId, aliasFamilies),
+    ...catalogFamilyVersion(entry.shortId, aliasFamilies, entry.serverlessMode),
   }));
 }
 
@@ -881,17 +945,39 @@ function newestVersionByFamily(parsed) {
   return newestByFamily;
 }
 
+/**
+ * Keep the stable aliases users should pin in harness pickers. For each known
+ * versioned family:
+ *   1. keep `*-latest` and `*-fast-latest` aliases when present;
+ *   2. keep the newest concrete version if it exceeds every alias target;
+ *   3. without aliases, keep only the newest concrete version.
+ * Standalone/non-versioned models remain untouched.
+ * @param {import("./models.mjs").CatalogEntry[]} catalog
+ * @returns {import("./models.mjs").CatalogEntry[]}
+ */
 export function preferLatestAliases(catalog) {
-  const parsed = parseCatalogFamilies(catalog);
-  const aliasedFamilies = new Set(
-    parsed.filter(({ latest }) => latest).map(({ family }) => family),
-  );
+  const aliasFamilies = catalogAliasFamilies(catalog);
+  const parsed = parseCatalogFamilies(catalog, aliasFamilies);
+  const aliasTargets = new Map();
+  for (const { entry, family, latest } of parsed) {
+    if (!latest) continue;
+    const target = catalogFamilyVersion(shortIdFromResourceName(entry.baseModelId), aliasFamilies);
+    const current = aliasTargets.get(family);
+    if (target.latest || target.family !== family || target.version.length === 0) {
+      aliasTargets.set(family, null);
+    } else if (current !== null && (!current || compareVersions(target.version, current) > 0)) {
+      aliasTargets.set(family, target.version);
+    }
+  }
   const newestByFamily = newestVersionByFamily(parsed);
 
   return parsed
     .filter(({ family, version, latest }) => {
       if (latest) return true;
-      if (aliasedFamilies.has(family)) return false;
+      if (aliasTargets.has(family)) {
+        const target = aliasTargets.get(family);
+        if (!target || compareVersions(version, target) <= 0) return false;
+      }
       const newest = newestByFamily.get(family);
       return !newest || compareVersions(version, newest) === 0;
     })

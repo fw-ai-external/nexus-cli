@@ -1,4 +1,5 @@
 import process from "node:process";
+import { warnInsecureUrlOverride } from "../system/url-override-warning.mjs";
 import { FIREWORKS_BASE_URL } from "../fireworks/model-id.mjs";
 import { AZURE_ON_HARNESS_SET, HARNESSES, HARNESS_ALIASES, AMBIGUOUS_COPILOT_MESSAGE, resolveHarnessAlias } from "../harness/id.mjs";
 import { readConfiguredProviderSync } from "../config/global-config.mjs";
@@ -10,7 +11,7 @@ const GLOBAL_COMMANDS = new Set([
   "help", "key", "banner", "finalize-install",
 ]);
 const KEY_SUBCOMMANDS = new Set(["export"]);
-const HARNESS_VERBS = new Set(["on", "off", "status", "usage", "live", "mcp"]);
+const HARNESS_VERBS = new Set(["on", "off", "status", "usage", "live", "mcp", "restart"]);
 
 /**
  * Flags that were renamed/retired, mapped to their current spelling. Typing an
@@ -54,7 +55,8 @@ const KNOWN_FLAGS = [
   "--providers", "--reset",
   "--force", "--skip-install-check", "--stored-only",
   "--last-n", "--plain", "--verbose", "--routing-preference", "--session", "--days",
-  "--account", "--account-type", "--anthropic", "--openai", "--paste", "--revoke", "--with-token",
+  "--account", "--account-type", "--anthropic", "--openai", "--paste", "--browser", "--no-open", "--signup", "--select-account", "--revoke", "--with-token",
+  "--paste-code",
   "--interactive", "--non-interactive", "--client-id", "--client-secret",
 ];
 
@@ -126,6 +128,12 @@ export function createBaseContext() {
     accountType: "",
     revoke: false,
     paste: false,
+    browser: false,
+    noOpen: false,
+    // "on" with --paste-code (opt-in; the default is the loopback, over SSH too).
+    pasteCode: "",
+    signup: false,
+    selectAccount: "",
     account: "",
     onboardingMode: "auto",
     providers: "",
@@ -197,9 +205,18 @@ export function applyGlobalFlag(ctx, arg, next) {
       return true;
     }
     case "--paste": ctx.paste = true; return false;
+    case "--browser": ctx.browser = true; return false;
+    case "--no-open": ctx.noOpen = true; return false;
+    // Browser approval returns a code to paste instead of redirecting to
+    // this machine's sign-in port (login, logout --revoke).
+    case "--paste-code": ctx.pasteCode = "on"; return false;
+    case "--signup": ctx.signup = true; return false;
     // `login --account <id>`: enterprise SSO sign-in via the account's own
     // identity provider (same semantics as `firectl signin <account-id>`).
     case "--account": ctx.account = requireValue(arg, next); return true;
+    // `login --browser --select-account <id>`: preselect that account on the
+    // authorize page (switching accounts). Not SSO, unlike --account.
+    case "--select-account": ctx.selectAccount = requireValue(arg, next).replace(/^accounts\//, ""); return true;
     case "--revoke": ctx.revoke = true; return false;
     case "--anthropic": ctx.anthropic = true; return false;
     case "--openai": ctx.openai = true; return false;
@@ -227,7 +244,11 @@ export function applyGlobalFlag(ctx, arg, next) {
     case "--home": ctx.home = requireValue(arg, next); return true;
     case "--data-dir": ctx.dataDir = requireValue(arg, next); return true;
     case "--api-key": ctx.apiKey = requireValue(arg, next); ctx.apiKeyFromFlag = true; return true;
-    case "--base-url": ctx.baseUrl = requireValue(arg, next); ctx.baseUrlFromFlag = true; return true;
+    case "--base-url":
+      ctx.baseUrl = requireValue(arg, next);
+      ctx.baseUrlFromFlag = true;
+      warnInsecureUrlOverride(ctx.baseUrl, "--base-url");
+      return true;
     case "--provider": ctx.provider = requireValue(arg, next); return true;
     // A bare provider-key flag (no value, or followed by another flag) asks
     // the command to prompt on the TTY instead of taking the key from argv,
@@ -370,7 +391,7 @@ function parseFlagsAndPositionals(argv) {
               + `\`nexus configure --provider azure --base-url <url> --api-key <key>\`, `
               + `then run \`nexus ${positional[0]} on --azure\`.`
           : `--api-key isn't a ${positional[0]} on option. `
-              + `Sign in once with \`nexus login --api-key <key>\` (or \`nexus login\`), `
+              + `Sign in once with \`nexus login\` (or, without a terminal, \`nexus login --with-token < key.txt\`), `
               + `then run \`nexus ${positional[0]} on\`.`,
       );
     }

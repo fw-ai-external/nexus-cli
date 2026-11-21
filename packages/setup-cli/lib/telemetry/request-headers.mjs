@@ -20,6 +20,7 @@ const HARNESS_TITLES = Object.freeze({
   [HARNESS.COPILOT_APP]: "GitHub Copilot",
   [HARNESS.COPILOT_CLI]: "GitHub Copilot CLI",
   [HARNESS.DEEPSEEK]: "DeepSeek Harness",
+  [HARNESS.HERMES]: "Hermes Agent",
 });
 
 function normalizedVersion(value) {
@@ -66,6 +67,27 @@ function isLegacyFireconnectUserAgent(name, value) {
     && /^(?:fireconnect|nexus)\/(?:unknown|\d+\.\d+\.\d+)$/i.test(String(value).trim());
 }
 
+const ATTRIBUTION_REFERER = /^(?:nexus|fireconnect)\/(?:unknown|v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$/;
+
+/**
+ * Whether a header map carries this CLI's own attribution: the
+ * `HTTP-Referer` value {@link telemetryReferer} writes (or its pre-rename
+ * `fireconnect/` form), or a legacy CLI `User-Agent`. Header names alone
+ * are generic (any client can send `X-Title`); these values are unique to
+ * this CLI, so they mark a provider entry Nexus wrote.
+ * @param {unknown} headers
+ */
+export function hasFireconnectAttributionHeader(headers) {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return false;
+  }
+  return Object.entries(headers).some(([name, value]) => (
+    name.toLowerCase() === "http-referer"
+      && typeof value === "string"
+      && ATTRIBUTION_REFERER.test(value.trim())
+  ) || isLegacyFireconnectUserAgent(name, value));
+}
+
 export function stripFireconnectTelemetryHeaders(headers = {}) {
   return Object.fromEntries(
     Object.entries(headers).filter(
@@ -97,6 +119,26 @@ export function stripFireconnectTelemetryHeaderLines(value) {
         && !isLegacyFireconnectUserAgent(name, headerValue);
     })
     .join("\n");
+}
+
+/**
+ * Whether an ANTHROPIC_CUSTOM_HEADERS value has a telemetry line this CLI
+ * writes. Blank lines and user headers are not telemetry.
+ * @param {unknown} value
+ */
+export function hasFireconnectTelemetryHeaderLine(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  return value.split("\n").some((line) => {
+    const colon = line.indexOf(":");
+    if (colon === -1) {
+      return false;
+    }
+    const name = line.slice(0, colon).trim().toLowerCase();
+    return MANAGED_NAMES.has(name)
+      || isLegacyFireconnectUserAgent(name, line.slice(colon + 1).trim());
+  });
 }
 
 export function mergeFireconnectTelemetryHeaderLines(value, telemetry = {}) {

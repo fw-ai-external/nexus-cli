@@ -1,3 +1,4 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -14,6 +15,7 @@ import {
   buildClaudeCustomHeaders,
   customHeaderValue,
   fireworksKeyFromCustomHeaders,
+  LEGACY_FIREROUTER_FIREWORKS_HEADER,
   NEXUS_PROVIDERS_HEADER,
   OPENAI_BYOK_HEADER,
   openaiKeyFromCustomHeaders,
@@ -25,22 +27,21 @@ import {
 import {
   AUTO_MODEL_ID,
   CLAUDE_NATIVE_MODEL_ID,
-  DEEPSEEK_FLASH_LATEST_ROUTER_ID,
   FIREWORKS_BASE_URL,
-  GLM_FAST_LATEST_ROUTER_ID,
   isClaudeModelAlias,
   isClaudeNativeModel,
-  isFirerouterModelPattern,
   isRetiredModelId,
   shortFireworksModelRef,
 } from "../../fireworks/model-id.mjs";
 import {
   fireworksKeyOrEmpty,
+  isFirePassKey,
   isFireworksShapedKey,
   MISSING_FIREWORKS_API_KEY_MESSAGE,
 } from "../../keys/key-type.mjs";
 import {
   buildFireconnectTelemetryHeaders,
+  hasFireconnectTelemetryHeaderLine,
   mergeFireconnectTelemetryHeaderLines,
   stripFireconnectTelemetryHeaderLines,
 } from "../../telemetry/request-headers.mjs";
@@ -56,6 +57,7 @@ import {
   withFireconnectModelPicker,
 } from "./settings-model-picker.mjs";
 import { fireworksModelDisplayFields } from "./picker-labels.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 export const DEFAULT_DATA_DIR = ".nexus/claude";
 export const USER_SETTINGS_RELATIVE_PATH = ".claude/settings.json";
@@ -263,6 +265,8 @@ export function fireworksHostnameFromBaseUrl(baseUrl) {
  * Recover active Nexus intent from current settings. A Fireworks
  * hostname is not sufficient by itself: backup/state, a managed helper/header,
  * telemetry, or Nexus's model mapping must also identify ownership.
+ * install.sh's claude_is_fireconnect_enabled must give the same answer
+ * (test/install/claude-enabled-parity.test.mjs).
  */
 export function claudeFireconnectIntent(settings, { backup = {}, state = {} } = {}) {
   const env = settings.env ?? {};
@@ -274,18 +278,22 @@ export function claudeFireconnectIntent(settings, { backup = {}, state = {} } = 
   const mapping = mappingFromSettings(settings);
   const headers = env.ANTHROPIC_CUSTOM_HEADERS;
   const hasFireworksMapping = Object.values(mapping).some(Boolean);
-  const hasTelemetry = typeof headers === "string"
-    && stripFireconnectTelemetryHeaderLines(headers) !== headers;
-  const hasCurrentManagedHeader = isFireworksShapedKey(
-    fireworksKeyFromCustomHeaders(headers),
-  ) && hasFireworksMapping;
+  const hasTelemetry = hasFireconnectTelemetryHeaderLine(headers);
+  // Retired Fire Pass (fpk_) keys still mark a header Nexus wrote.
+  const headerKey = fireworksKeyFromCustomHeaders(headers);
+  const hasManagedHeader = (isFireworksShapedKey(headerKey) || isFirePassKey(headerKey))
+    && hasFireworksMapping;
+  const hasLegacyRouterHeader = Boolean(
+    customHeaderValue(headers, [LEGACY_FIREROUTER_FIREWORKS_HEADER]),
+  );
   const hasManagedEvidence = backup.snapshot !== undefined
     || backup.values !== undefined
     || Boolean(state.authMode || state.managedApiKeyHelper)
     || stripManagedApiKeyHelper(settings, state).changed
     || env.ANTHROPIC_API_KEY === "fireconnect"
     || hasTelemetry
-    || hasCurrentManagedHeader;
+    || hasManagedHeader
+    || hasLegacyRouterHeader;
   if (!hasManagedEvidence) {
     return null;
   }
@@ -299,7 +307,7 @@ export function claudeFireconnectIntent(settings, { backup = {}, state = {} } = 
 }
 
 export function providerStatusFromEnv(env) {
-  if (env.ANTHROPIC_BASE_URL === FIREWORKS_BASE_URL) {
+  if (isFireworksInferenceUrl(env.ANTHROPIC_BASE_URL, FIREWORKS_BASE_URL)) {
     return "fireworks";
   }
   if (env.ANTHROPIC_BASE_URL) {
@@ -334,7 +342,7 @@ export async function readRawIfExists(filePath) {
  * @returns {Promise<{ configPath: string, snapshot: { existed: boolean, raw: string } }>} the backup written
  */
 export async function writeSettingsSnapshotBackup({ settingsPath, backupPath }) {
-  await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+  ensurePrivateParent(backupPath);
   const snapshot = await readRawIfExists(settingsPath);
   const backup = { configPath: path.resolve(settingsPath), snapshot };
   await writeJson(backupPath, backup, { mode: 0o600 });
@@ -420,9 +428,7 @@ export function isNexusApiKeyHelper(helper, state = {}) {
 
 /**
  * Remove Nexus-managed apiKeyHelper after disable. Returns
- * { settings, changed } like the sibling strip helpers (stripFireworksOwnedEnv,
- * stripModelMappingEnv) so callers don't have to compare apiKeyHelper before
- * and after to detect a change.
+ * { settings, changed } so callers can detect a change without comparing values.
  * @param {Record<string, unknown>} settings
  * @param {{ authMode?: string, managedApiKeyHelper?: string }} state
  * @returns {{ settings: Record<string, unknown>, changed: boolean }}
@@ -471,12 +477,12 @@ export function stripFireconnectManagedClaudeSettings(settings, state = {}) {
 
 function isFireworksOwnedEnvEntry(key, value, env) {
   if (key === "ANTHROPIC_BASE_URL") {
-    return value === FIREWORKS_BASE_URL;
+    return isFireworksInferenceUrl(value, FIREWORKS_BASE_URL);
   }
   if (key === "ANTHROPIC_API_KEY" || key === "ANTHROPIC_AUTH_TOKEN") {
     return isFireworksShapedKey(value);
   }
-  if (env.ANTHROPIC_BASE_URL === FIREWORKS_BASE_URL) {
+  if (isFireworksInferenceUrl(env.ANTHROPIC_BASE_URL, FIREWORKS_BASE_URL)) {
     return true;
   }
   return false;
@@ -686,22 +692,6 @@ export function stripLegacyAttributionHeaderLeftover(settings, backup = {}) {
   return { settings: nextSettings, backup: nextBackup };
 }
 
-/**
- * Remove client-side model mapping env entries (for FireRouter server-side routing).
- * @param {Record<string, string>} env
- */
-export function stripModelMappingEnv(env) {
-  const nextEnv = { ...env };
-  let changed = false;
-  for (const key of MODEL_MAPPING_ENV_KEYS) {
-    if (Object.hasOwn(nextEnv, key)) {
-      delete nextEnv[key];
-      changed = true;
-    }
-  }
-  return { env: nextEnv, changed };
-}
-
 /** Env keys for the extra /model picker row; not set (main uses top-level `model`). */
 const CUSTOM_MODEL_OPTION_ENV_KEYS = [
   "ANTHROPIC_CUSTOM_MODEL_OPTION",
@@ -780,7 +770,7 @@ export function mergeModelsIntoEnv(env, mapping) {
 
 export function buildFireworksProviderEnv(env, {
   apiKey = "",
-  baseUrl = FIREWORKS_BASE_URL,
+  baseUrl = fireworksInferenceUrl(FIREWORKS_BASE_URL, activeAccountResidency("claude")),
   mapping,
   preset = DEFAULT_FIREWORKS_PRESET,
   anthropicKey = "",
@@ -953,7 +943,7 @@ export function resolveClaudeDefaultModel({
  */
 export function buildFireworksSettings(settings, {
   apiKey = "",
-  baseUrl = FIREWORKS_BASE_URL,
+  baseUrl = fireworksInferenceUrl(FIREWORKS_BASE_URL, activeAccountResidency("claude")),
   mapping = resolveClaudeModelMapping(),
   preset = DEFAULT_FIREWORKS_PRESET,
   anthropicKey = "",
@@ -1035,7 +1025,7 @@ export async function enableFireworksProvider({
   settingsPath,
   dataDir,
   effectiveApiKey,
-  baseUrl = FIREWORKS_BASE_URL,
+  baseUrl = fireworksInferenceUrl(FIREWORKS_BASE_URL, activeAccountResidency("claude")),
   mapping = resolveClaudeModelMapping(),
   preset = DEFAULT_FIREWORKS_PRESET,
   anthropicKey = "",
@@ -1060,7 +1050,7 @@ export async function enableFireworksProvider({
   // already exists (preserve the true original across repeat `on`s) or when the
   // file is already Fireworks/FireRouter-routed (don't capture a
   // fireconnect-modified file as the "original").
-  await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+  ensurePrivateParent(backupPath);
   const existingBackup = await readJsonIfExists(backupPath);
   const alreadyRouted = providerStatusFromEnv(env) === "fireworks";
   const backup = existingBackup.snapshot === undefined && existingBackup.values === undefined && !alreadyRouted

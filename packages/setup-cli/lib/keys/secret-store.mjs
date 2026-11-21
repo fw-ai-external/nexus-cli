@@ -1,11 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { statSync } from "node:fs";
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import {
+  asKeyStoreUndecryptableError,
   builtinDeletePassword,
   builtinFileStoreAvailable,
   builtinGetPassword,
-  builtinHasPassword,
+  isKeyStoreUndecryptableError,
   secretsFilePath,
   storeBuiltinFileSecretVerified,
 } from "./builtin-file-secret-store.mjs";
@@ -30,17 +33,20 @@ import {
   readKeyStorageOverride,
 } from "./storage-env.mjs";
 
+export { KEY_STORAGE_ENV } from "./storage-env.mjs";
 export {
-  KEY_STORAGE_ENV,
-  LEGACY_KEY_STORAGE_ENV as SECRET_BACKEND_ENV,
-} from "./storage-env.mjs";
+  KEY_STORE_UNDECRYPTABLE,
+  KeyStoreUndecryptableError,
+  isKeyStoreUndecryptableError,
+} from "./builtin-file-secret-store.mjs";
 
 import { writeFileAtomic } from "../io/atomic-write.mjs";
 import { KeyringTimeoutError, withKeyringTimeout } from "./keyring-timeout.mjs";
 import { macKeychainItemExists } from "./keychain-item-probe.mjs";
+import { MAC_SECRET_UNREAD, deleteMacSecret, readMacSecret, writeMacSecret } from "./macos-security.mjs";
 import { shouldPreferFileBackendOnLinux } from "../config/secret-storage-policy.mjs";
 import { fileBackendDetectionResult } from "./secret-backend-detect.mjs";
-import { createSecretFallbackHandlers } from "./secret-fallbacks.mjs";
+import { createSecretFallbackHandlers, warnStaleSecretCopy } from "./secret-fallbacks.mjs";
 
 export const SECRET_SERVICE = "FireworksAI";
 export const SECRET_ACCOUNT = "fireworks-api-key";
@@ -125,6 +131,9 @@ function isHomeOverride(resolvedHome) {
   return resolved !== (process.env.HOME?.trim() ?? "");
 }
 
+const homeScopedContext = new AsyncLocalStorage();
+const homeScopedQueue = { tail: Promise.resolve() };
+
 /**
  * Align HOME/XDG with a `--home` override for secure-backend ops only.
  * @template T
@@ -132,7 +141,30 @@ function isHomeOverride(resolvedHome) {
  * @param {() => T | Promise<T>} fn
  * @returns {Promise<T>}
  */
-async function withHomeScopedEnv(resolvedHome, fn) {
+export function withHomeScopedEnv(resolvedHome, fn) {
+  const parent = homeScopedContext.getStore();
+  const queue = parent?.active ? parent : homeScopedQueue;
+  const operation = queue.tail.then(() => {
+    const scope = { tail: Promise.resolve(), active: true };
+    return homeScopedContext.run(scope, async () => {
+      try {
+        return await runHomeScopedEnv(resolvedHome, async () => {
+          try {
+            return await fn();
+          } finally {
+            await scope.tail;
+          }
+        });
+      } finally {
+        scope.active = false;
+      }
+    });
+  });
+  queue.tail = operation.catch(() => {});
+  return operation;
+}
+
+async function runHomeScopedEnv(resolvedHome, fn) {
   if (!isHomeOverride(resolvedHome)) {
     return fn();
   }
@@ -276,6 +308,8 @@ export function resetSecretStoreForTests() {
   keychainModule = null;
   keychainModulePromise = null;
   fallbackHandlers = null;
+  lastReadError = null;
+  lastUndecryptableError = null;
   secureReadCache.clear();
   void clearKeyStorageCache();
   if (weSetCrossKeychainBackendEnv) {
@@ -384,7 +418,7 @@ async function secureBackendKind(home) {
     return "keychain";
   }
   // Same rule ensureBackendEnv applies: SSH/WSL writes go to the file backend.
-  if (!forced && shouldPreferFileBackendOnLinux()) {
+  if (!forced && await withHomeScopedEnv(resolveHome(home), prefersFileBackend)) {
     return "file";
   }
   let backends = [];
@@ -394,6 +428,89 @@ async function secureBackendKind(home) {
     backends = [];
   }
   return pickNativeBackendId(backends) ? "keychain" : "file";
+}
+
+/**
+ * True when the encrypted file holds the key on Linux. A file this session
+ * can't read counts too, so the desktop reports the file error instead of
+ * reading (or starting) a keychain copy the file may have replaced.
+ */
+async function linuxFileKeyPresent() {
+  if (process.platform !== "linux" || effectiveKeyStorageOverride() || !builtinFileStoreAvailable()) {
+    return false;
+  }
+  try {
+    return Boolean((await builtinGetPassword(SECRET_SERVICE, SECRET_ACCOUNT))?.trim());
+  } catch {
+    try {
+      statSync(secretsFilePath());
+      return true;
+    } catch (error) {
+      return /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT";
+    }
+  }
+}
+
+async function prefersFileBackend() {
+  return shouldPreferFileBackendOnLinux()
+    || shouldPreferFileBackendOnLinux({ fileKeyPresent: await linuxFileKeyPresent() });
+}
+
+/**
+ * Delete the OS keychain's copy, also where reads and writes use the
+ * encrypted file. False when a keychain copy may be left: over SSH on a
+ * machine with a keychain (out of reach from here), or the delete failed
+ * (locked, unavailable).
+ * @param {any} keychain
+ * @param {string} [account]
+ */
+async function deleteKeychainCopy(keychain, account = SECRET_ACCOUNT) {
+  const forced = effectiveKeyStorageOverride();
+  try {
+    if (!forced && process.platform === "linux") {
+      const nativeId = pickNativeBackendId(await keychain.listBackends());
+      if (!nativeId) {
+        return true;
+      }
+      if (shouldPreferFileBackendOnLinux()) {
+        return false;
+      }
+      // cross-keychain keeps the backend it loaded first (the file, once the
+      // desktop moved), so reset it around the native delete.
+      const previous = process.env[CROSS_KEYCHAIN_BACKEND_ENV];
+      applyCrossKeychainBackend(nativeId);
+      keychain.setKeyring?.(null);
+      try {
+        await withKeyringTimeout(keychain.deletePassword(SECRET_SERVICE, account), "deletePassword");
+      } finally {
+        if (previous) applyCrossKeychainBackend(previous);
+        keychain.setKeyring?.(null);
+      }
+      return true;
+    } else {
+      if (forced === FILE_BACKEND_ID || forced === NULL_BACKEND_ID) {
+        return true;
+      }
+      await ensureBackendEnv(keychain);
+    }
+    if (await usesMacSecurity(keychain)) {
+      await deleteMacSecret(SECRET_SERVICE, account);
+      return true;
+    }
+    await withKeyringTimeout(
+      keychain.deletePassword(SECRET_SERVICE, account),
+      "deletePassword",
+    );
+    return true;
+  } catch (error) {
+    return /not found/i.test(/** @type {Error} */ (error)?.message ?? "");
+  }
+}
+
+async function usesMacSecurity(keychain) {
+  const backend = process.env[CROSS_KEYCHAIN_BACKEND_ENV]
+    || pickNativeBackendId(await keychain.listBackends());
+  return MACOS_BACKEND_IDS.includes(backend);
 }
 
 /**
@@ -409,6 +526,7 @@ async function storeSecretInSecureBackend(value, home, account = SECRET_ACCOUNT)
       if (useBuiltinFileFallback()) {
         await storeBuiltinFileSecretVerified(SECRET_SERVICE, account, trimmed);
         lastReadError = null;
+        lastUndecryptableError = null;
         secureReadCache.set(secureCacheKey(resolvedHome, account), trimmed);
         return;
       }
@@ -420,10 +538,14 @@ async function storeSecretInSecureBackend(value, home, account = SECRET_ACCOUNT)
 
     try {
       await ensureBackendEnv(keychain);
-      await withKeyringTimeout(
-        keychain.setPassword(SECRET_SERVICE, account, trimmed),
-        "setPassword",
-      );
+      if (await usesMacSecurity(keychain)) {
+        await writeMacSecret(SECRET_SERVICE, account, trimmed);
+      } else {
+        await withKeyringTimeout(
+          keychain.setPassword(SECRET_SERVICE, account, trimmed),
+          "setPassword",
+        );
+      }
     } catch (error) {
       throw friendlySecretError(error, home);
     }
@@ -453,6 +575,7 @@ async function storeSecretInSecureBackend(value, home, account = SECRET_ACCOUNT)
       }
     }
     lastReadError = null;
+    lastUndecryptableError = null;
     // Prime the read cache with the value we just wrote so any later
     // getSecret/hasSecret in this command needs no further keychain access.
     secureReadCache.set(secureCacheKey(resolvedHome, account), trimmed);
@@ -472,9 +595,9 @@ async function fileFallbackCommitted(resolvedHome) {
 
 /**
  * @param {string} [home]
- * @returns {Promise<string | null>}
+ * @returns {Promise<string | null | typeof MAC_SECRET_UNREAD>}
  */
-async function readSecretFromSecureBackend(home, account = SECRET_ACCOUNT) {
+async function readSecretFromSecureBackend(home, account = SECRET_ACCOUNT, { migrateMacItems = true } = {}) {
   const resolvedHome = resolveHome(home);
   const cacheKey = secureCacheKey(resolvedHome, account);
   // Serve repeated reads in the same command from cache so we prompt the OS
@@ -489,9 +612,16 @@ async function readSecretFromSecureBackend(home, account = SECRET_ACCOUNT) {
     if (!keychain) {
       if (builtinFileStoreAvailable()) {
         lastReadError = null;
-        const value = await builtinGetPassword(SECRET_SERVICE, account);
-        secureReadCache.set(cacheKey, value ?? null);
-        return value;
+        try {
+          const value = await builtinGetPassword(SECRET_SERVICE, account);
+          lastUndecryptableError = null;
+          secureReadCache.set(cacheKey, value ?? null);
+          return value;
+        } catch (error) {
+          lastReadError = error;
+          if (isKeyStoreUndecryptableError(error)) lastUndecryptableError = error;
+          return null;
+        }
       }
       lastReadError = new Error("cross-keychain module unavailable");
       return null;
@@ -499,15 +629,22 @@ async function readSecretFromSecureBackend(home, account = SECRET_ACCOUNT) {
 
     try {
       await ensureBackendEnv(keychain);
-      const value = await withKeyringTimeout(
-        keychain.getPassword(SECRET_SERVICE, account),
-        "getPassword",
-      );
+      const macSecurity = await usesMacSecurity(keychain);
+      const value = macSecurity
+        ? await readMacSecret(SECRET_SERVICE, account, { migrate: migrateMacItems })
+        : await withKeyringTimeout(
+          keychain.getPassword(SECRET_SERVICE, account),
+          "getPassword",
+        );
       lastReadError = null;
+      lastUndecryptableError = null;
+      if (value === MAC_SECRET_UNREAD) return value;
       secureReadCache.set(cacheKey, value ?? null);
       return value;
     } catch (error) {
-      lastReadError = /** @type {Error} */ (error);
+      const read = /** @type {Error} */ (asKeyStoreUndecryptableError(error));
+      lastReadError = read;
+      if (isKeyStoreUndecryptableError(read)) lastUndecryptableError = read;
       return null;
     }
   });
@@ -574,31 +711,24 @@ async function hasSecretInSecureBackend(home, account = SECRET_ACCOUNT) {
 async function deleteSecretFromSecureBackend(home, account = SECRET_ACCOUNT) {
   const resolvedHome = resolveHome(home);
   secureReadCache.delete(secureCacheKey(resolvedHome, account));
-  await withHomeScopedEnv(resolvedHome, async () => {
+  return withHomeScopedEnv(resolvedHome, async () => {
     // Delete from both stores unconditionally: a write that fell back to the
     // file after the keychain accepted (then failed readback) leaves a copy
     // in each, and deleting only the cached backend resurrects the other
-    // once the storage cache is cleared. Each delete is best-effort.
+    // once the storage cache is cleared. A failed delete is reported.
+    let fileCleared = true;
     if (builtinFileStoreAvailable()) {
       try {
         await builtinDeletePassword(SECRET_SERVICE, account);
       } catch {
-        // Missing entry is fine.
+        fileCleared = false;
       }
     }
     const keychain = await loadKeychainModule();
     if (!keychain) {
-      return;
+      return fileCleared;
     }
-    try {
-      await ensureBackendEnv(keychain);
-      await withKeyringTimeout(
-        keychain.deletePassword(SECRET_SERVICE, account),
-        "deletePassword",
-      );
-    } catch {
-      // Missing entry is fine.
-    }
+    return (await deleteKeychainCopy(keychain, account)) && fileCleared;
   });
 }
 
@@ -646,7 +776,7 @@ async function finalizeSecureSecretWrite(resolvedHome, home) {
   try {
     await deletePlaintextSecret(resolvedHome);
   } catch {
-    // Secure storage + cache are authoritative once the cache is updated.
+    warnStaleSecretCopy();
   }
 }
 
@@ -697,6 +827,24 @@ let lastReadError = null;
  */
 export function getLastSecretReadError() {
   return lastReadError;
+}
+
+/**
+ * The encrypted key store this process last failed to decrypt, or null. Unlike
+ * `lastReadError`, which every successful read-side op resets (a plaintext
+ * copy, a cache hit, a macOS item probe), this is cleared only when the
+ * encrypted store itself is decrypted or written: a later success for another
+ * purpose can't hide it from the command that needs to explain a missing key,
+ * and a decryptable store can never leave it set.
+ * @type {import("./builtin-file-secret-store.mjs").KeyStoreUndecryptableError | null}
+ */
+let lastUndecryptableError = null;
+
+/**
+ * @returns {import("./builtin-file-secret-store.mjs").KeyStoreUndecryptableError | null}
+ */
+export function getLastKeyStoreUndecryptableError() {
+  return lastUndecryptableError;
 }
 
 /**
@@ -753,7 +901,7 @@ function pickNativeBackendId(backends) {
  */
 async function ensureBackendEnv(keychain) {
   const forced = effectiveKeyStorageOverride();
-  if (!forced && shouldPreferFileBackendOnLinux()) {
+  if (!forced && await prefersFileBackend()) {
     applyCrossKeychainBackend(FILE_BACKEND_ID);
     return;
   }
@@ -814,6 +962,12 @@ function friendlySecretError(error, home) {
   const code = err?.code ?? "";
   const dataRoot = keychainFileDataRoot();
 
+  // cross-keychain's file backend reports a master-key mismatch as a bare
+  // AES-GCM failure; name the cause and the recovery instead.
+  const undecryptable = asKeyStoreUndecryptableError(error);
+  if (isKeyStoreUndecryptableError(undecryptable)) {
+    return undecryptable;
+  }
   if (name === "KeyringLockedError") {
     return new Error(
       "The OS keychain is locked. Unlock it (e.g. sign in to your desktop session / unlock the keyring) and re-run `nexus configure`.",
@@ -1002,17 +1156,19 @@ export async function detectSecretBackend(home = process.env.HOME ?? "") {
 
 /**
  * @param {string} [home]
- * @returns {Promise<string | null>}
+ * @param {{ fresh?: boolean, migrateMacItems?: boolean }} [options]
+ * @returns {Promise<string | null | typeof MAC_SECRET_UNREAD>}
  */
-export async function getSecret(home) {
+export async function getSecret(home, { fresh = false, migrateMacItems = true } = {}) {
   if (useMemoryStore()) {
     await ensureMemoryStoreLoaded(home);
     return memoryGet();
   }
 
   const resolvedHome = resolveHome(home);
+  if (fresh) secureReadCache.delete(secureCacheKey(resolvedHome, SECRET_ACCOUNT));
   const homeOverride = isHomeOverride(resolvedHome);
-  const cacheEntry = await readKeyStorageCacheEntry(resolvedHome);
+  const cacheEntry = await readKeyStorageCacheEntry(resolvedHome, { fresh });
   if (cacheEntry?.storage === "plaintext") {
     try {
       const plaintext = await readPlaintextSecret(resolvedHome);
@@ -1036,7 +1192,8 @@ export async function getSecret(home) {
     }
   }
 
-  const secure = await readSecretFromSecureBackend(home);
+  const secure = await readSecretFromSecureBackend(home, SECRET_ACCOUNT, { migrateMacItems });
+  if (secure === MAC_SECRET_UNREAD) return migrateMacItems ? null : secure;
   if (secure?.trim()) {
     lastReadError = null;
     return secure;
@@ -1081,6 +1238,17 @@ export async function setSecret(value, home) {
   );
   if (outcome === "secure") {
     await finalizeSecureSecretWrite(resolvedHome, home);
+    if (!effectiveKeyStorageOverride() && !shouldPreferFileBackendOnLinux()
+      && (await secureBackendKind(home)) === "file") {
+      // A Linux desktop that moved to the encrypted file: drop the
+      // keychain copy it no longer reads.
+      await withHomeScopedEnv(resolvedHome, async () => {
+        const keychain = await loadKeychainModule();
+        if (keychain && !(await deleteKeychainCopy(keychain))) {
+          warnStaleSecretCopy(new Error("keychain copy not deleted"));
+        }
+      });
+    }
   }
 }
 
@@ -1148,13 +1316,14 @@ export async function deleteSecret(home) {
       await memoryDelete();
     }
     await persistMemoryStoreToDisk(home);
-    return;
+    return true;
   }
 
   const resolvedHome = resolveHome(home);
-  await deleteSecretFromSecureBackend(home);
+  const keychainCleared = await deleteSecretFromSecureBackend(home);
   await deletePlaintextSecret(resolvedHome);
   await clearKeyStorageCache(resolvedHome);
+  return keychainCleared;
 }
 
 /**
@@ -1166,8 +1335,8 @@ export async function deleteSecret(home) {
  * @param {string} key
  * @returns {Promise<boolean>} true when the copy was removed
  */
-async function retireFileFallbackCopy(resolvedHome, key) {
-  await withHomeScopedEnv(resolvedHome, () => builtinDeletePassword(SECRET_SERVICE, SECRET_ACCOUNT)).catch(() => {});
+export async function retireFileFallbackCopy(resolvedHome, key) {
+  await withHomeScopedEnv(resolvedHome, () => builtinDeletePassword(SECRET_SERVICE, SECRET_ACCOUNT)).catch(warnStaleSecretCopy);
   secureReadCache.clear();
   if ((await readSecretFromSecureBackend(resolvedHome))?.trim() === key) {
     return true;
@@ -1182,10 +1351,12 @@ async function retireFileFallbackCopy(resolvedHome, key) {
  * Clear the cached storage choice and try secure storage again. Used by
  * `nexus update` and `NEXUS_REPROBE_KEY_STORAGE=1`. When a key sits in the
  * plaintext or encrypted-file fallback, attempts to move it back to the
- * keychain (or, from plaintext, to the encrypted file).
+ * keychain (or, from plaintext, to the encrypted file). An encrypted store the
+ * current master key cannot decrypt is never replaced by plaintext here; it
+ * comes back as `keyStoreError` for the caller to report.
  *
  * @param {string} [home]
- * @returns {Promise<{ migrated: boolean, movedFrom?: "plaintext" | "file" | null, backend: Awaited<ReturnType<typeof detectSecretBackend>> }>}
+ * @returns {Promise<{ migrated: boolean, movedFrom?: "plaintext" | "file" | null, backend: Awaited<ReturnType<typeof detectSecretBackend>>, keyStoreError?: import("./builtin-file-secret-store.mjs").KeyStoreUndecryptableError }>}
  */
 export async function reprobeKeyStorage(home = process.env.HOME ?? "") {
   const resolvedHome = resolveHome(home);
@@ -1201,9 +1372,22 @@ export async function reprobeKeyStorage(home = process.env.HOME ?? "") {
   }
 
   const plaintextKey = (await readPlaintextSecret(resolvedHome))?.trim() ?? "";
-  const fileFallbackKey = await fileFallbackCommitted(resolvedHome)
-    ? (await readSecretFromSecureBackend(resolvedHome))?.trim() ?? ""
-    : "";
+  let fileFallbackKey = "";
+  if (await fileFallbackCommitted(resolvedHome)) {
+    fileFallbackKey = (await readSecretFromSecureBackend(resolvedHome))?.trim() ?? "";
+    if (isKeyStoreUndecryptableError(lastReadError)) {
+      // The committed file store holds the key but the current master key
+      // can't open it. Keep the storage choice pointing at that file: moving
+      // to a now-available OS keychain would leave the key stranded even after
+      // the previous master key is restored.
+      return {
+        migrated: false,
+        movedFrom: null,
+        backend: await detectSecretBackend(resolvedHome),
+        keyStoreError: lastReadError,
+      };
+    }
+  }
   await clearKeyStorageCache(resolvedHome);
   // Reprobe re-selects the backend and may migrate the key; drop cached reads so
   // the fresh backend choice isn't shadowed by a stale in-process value.
@@ -1213,12 +1397,33 @@ export async function reprobeKeyStorage(home = process.env.HOME ?? "") {
 
   const carriedKey = plaintextKey || fileFallbackKey;
   if (carriedKey) {
-    const outcome = await getFallbackHandlers().storeSecretWithFallbacks(
-      carriedKey,
-      resolvedHome,
-      storeSecretInSecureBackend,
-      { quiet: !plaintextKey },
-    );
+    let outcome;
+    try {
+      outcome = await getFallbackHandlers().storeSecretWithFallbacks(
+        carriedKey,
+        resolvedHome,
+        storeSecretInSecureBackend,
+        { quiet: !plaintextKey },
+      );
+    } catch (error) {
+      if (!isKeyStoreUndecryptableError(error)) throw error;
+      // The encrypted store needs its previous master key back. Leave a
+      // plaintext key where it is (re-recording that choice) so it stays
+      // readable, and report the cause instead of failing the update.
+      if (plaintextKey) {
+        await persistKeyStorageCache(
+          resolvedHome,
+          "plaintext",
+          "The encrypted key store can't be decrypted with the current master key.",
+        );
+      }
+      return {
+        migrated: false,
+        movedFrom: null,
+        backend: await detectSecretBackend(resolvedHome),
+        keyStoreError: error,
+      };
+    }
     let movedFrom = plaintextKey && outcome !== "plaintext" ? "plaintext" : null;
     if (outcome === "secure") {
       await finalizeSecureSecretWrite(resolvedHome, resolvedHome);

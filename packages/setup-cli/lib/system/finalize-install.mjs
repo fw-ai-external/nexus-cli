@@ -37,7 +37,7 @@ export async function refreshModelSources(home) {
       : false,
     refreshListPriceCache({ force: true }),
     isEnabledFireworksHarness(harnesses, HARNESS.CODEX)
-      ? refreshCodexStockModels({ codexHome: path.dirname(codexConfigPath(home)) })
+      ? refreshCodexStockModels({ codexHome: path.dirname(codexConfigPath(home)), home })
       : false,
   ]);
   return { serverless, modelsDev, codex };
@@ -131,6 +131,8 @@ export async function finalizeInstallOrUpgrade({
         log(result.movedFrom === "file"
           ? "Moved the Fireworks API key from the encrypted-file fallback to the OS keychain."
           : "Moved Fireworks API key from plaintext fallback to secure storage.");
+      } else if (result.keyStoreError) {
+        log(result.keyStoreError.message);
       } else if (result.backend?.backend === "plaintext") {
         log(
           "API key is still in the plaintext fallback (~/.nexus/.api-key); "

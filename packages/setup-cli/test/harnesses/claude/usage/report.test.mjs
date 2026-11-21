@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   computeClaudeUsageCost,
+  decodeTokensPerSecond,
   findClaudeSessionLog,
   findClaudeSessionLogs,
   formatClaudeUsageReport,
@@ -103,6 +104,246 @@ describe("claude usage", () => {
     assert.ok(rows[0].cost > 0, "a call with real tokens must not price at zero");
   });
 
+  it("reports generated tokens over generation time, excluding prefill and TTFT", () => {
+    // The first (thinking) block finishes at 2s after streaming for 1s, and
+    // the response finishes at 4s with 1000 output tokens. End-to-end would
+    // read 1000/4 = 250 tok/s; generated-token time is (4 - 2) + 1 = 3s, so
+    // the rate is 1000/3 = 333 tok/s.
+    const text = jsonl([
+      { type: "user", message: { role: "user", content: "go" } },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        thinkingDurationMs: 1_000,
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "thinking", thinking: "plan" }],
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:04.000Z",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 1_000 },
+        },
+      },
+    ]);
+
+    const rows = parseClaudeUsageLog(text);
+    assert.equal(Math.round(rows.lastCallDecodeTps), 333);
+    assert.equal(
+      Math.round(usageReportFromText("session.jsonl", text, { includeTiming: true }).lastCallDecodeTps),
+      333,
+    );
+    // `claude usage --json` keeps its documented shape: timing is opt-in.
+    assert.equal("lastCallDecodeTps" in usageReportFromText("session.jsonl", text), false);
+  });
+
+  it("times a call by the content block that carries its usage", () => {
+    // The thinking block lands first with an all-zero payload; the final block
+    // is the one that knows the output tokens, and it also bounds the window.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:00.500Z",
+        thinkingDurationMs: 500,
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "thinking", thinking: "plan" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+          usage: { input_tokens: 10, output_tokens: 500 },
+        },
+      },
+    ]);
+
+    assert.equal(Math.round(parseClaudeUsageLog(text).lastCallDecodeTps), 250);
+  });
+
+  it("times a tool-first call by the tool input stream time", () => {
+    // A quick turn can open with a tool call and no thinking. The record
+    // carries `toolInputStreamMs`, which is the same block start-to-stop
+    // measurement as `thinkingDurationMs`: (2.5 - 0.5) + 0.5 = 2.5s for 1000
+    // tokens is 400 tok/s.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:00.500Z",
+        toolInputStreamMs: 500,
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:02.500Z",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 1_000 },
+        },
+      },
+    ]);
+
+    assert.equal(Math.round(parseClaudeUsageLog(text).lastCallDecodeTps), 400);
+  });
+
+  it("omits the rate when a text-first block records no stream time", () => {
+    // A text block records no duration, so there is no measured first-token
+    // time; an end-to-end figure would be mislabeled as a generated-token
+    // rate. Price the call; report no rate.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 500 },
+        },
+      },
+    ]);
+
+    const rows = parseClaudeUsageLog(text);
+    assert.equal(rows.lastCallDecodeTps, null);
+    assert.equal("lastCallDecodeTps" in usageReportFromText("session.jsonl", text, { includeTiming: true }), false);
+  });
+
+  it("omits the rate when the newest record has no timestamp", () => {
+    // The final block carries the usage; without its stamp the end of the
+    // generation window is unknown. Falling back to the thinking block's
+    // earlier stamp would report a 0.5s window for a call that took longer.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:00.500Z",
+        thinkingDurationMs: 500,
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "thinking", thinking: "plan" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        // No timestamp on the record that carries the output tokens.
+        type: "assistant",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 1_000 },
+        },
+      },
+    ]);
+
+    assert.equal(parseClaudeUsageLog(text).lastCallDecodeTps, null);
+  });
+
+  it("computes a single call's rate from its timing evidence", () => {
+    // 500 tokens over 2s of generation.
+    assert.equal(decodeTokensPerSecond({
+      outputTokens: 500, firstAt: 1_000, lastAt: 2_500, firstStreamMs: 500,
+    }), 250);
+    // A burst window and a clock step are not generation.
+    assert.equal(decodeTokensPerSecond({
+      outputTokens: 4_000, firstAt: 0, lastAt: 0, firstStreamMs: 1,
+    }), null);
+    assert.equal(decodeTokensPerSecond({
+      outputTokens: 900, firstAt: 2_000, lastAt: 1_000, firstStreamMs: 0,
+    }), null);
+  });
+
+  it("omits a rate whose final stamp precedes the first", () => {
+    // A clock step moved the final block's stamp before the first block.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        thinkingDurationMs: 500,
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "thinking", thinking: "plan" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        message: {
+          id: "msg_1",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 900 },
+        },
+      },
+    ]);
+
+    assert.equal(parseClaudeUsageLog(text).lastCallDecodeTps, null);
+  });
+
+  it("omits the rate when the newest producing call cannot be timed", () => {
+    // A rate belongs to the response the user just watched. Falling back to an
+    // older timed call would show a number from a different response.
+    const text = jsonl([
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:00.500Z",
+        thinkingDurationMs: 500,
+        message: {
+          id: "msg_old",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "thinking", thinking: "plan" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:04.000Z",
+        message: {
+          id: "msg_old",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 10, output_tokens: 400 },
+        },
+      },
+      // The newest call has output but no thinking block, so it has no
+      // measured first-token time.
+      {
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:09.000Z",
+        message: {
+          id: "msg_untimed",
+          model: "accounts/fireworks/models/glm-5p2",
+          content: [{ type: "text", text: "later" }],
+          usage: { input_tokens: 10, output_tokens: 900 },
+        },
+      },
+    ]);
+
+    assert.equal(parseClaudeUsageLog(text).lastCallDecodeTps, null);
+  });
+
   it("counts distinct calls separately and preserves log order", () => {
     const text = jsonl([
       {
@@ -176,6 +417,48 @@ describe("claude usage", () => {
     const rows = parseClaudeUsageLog(text);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].displayModel, "glm-5p2");
+  });
+
+  it("prices a mode-router call as the router Claude Code requested", () => {
+    // Streamed responses name the base model even through a Fast or Ultra-fast router.
+    const text = jsonl([
+      {
+        type: "assistant",
+        requestedModel: "kimi-k3-fast[1m]",
+        message: { id: "msg_fast", model: "accounts/fireworks/models/kimi-k3", usage: { input_tokens: 1_000_000 } },
+      },
+      {
+        type: "assistant",
+        requestedModel: "deepseek-v4p1-flash-1017-ultrafast",
+        message: { id: "msg_ultra", model: "accounts/fireworks/models/deepseek-v4p1-flash-1017", usage: { input_tokens: 1_000_000 } },
+      },
+    ]);
+
+    const rows = parseClaudeUsageLog(text);
+    assert.deepEqual(rows.map((row) => row.displayModel), ["kimi-k3-fast", "deepseek-v4p1-flash-1017-ultrafast"]);
+    assert.deepEqual(rows.map((row) => row.cost), [4.50, 1.20]);
+  });
+
+  it("keeps the served model unless the requested id is a serving-mode router of it", () => {
+    const call = (requestedModel, model) => ({
+      type: "assistant",
+      requestedModel,
+      message: { id: `msg_${requestedModel}_${model}`, model, usage: { input_tokens: 1_000_000 } },
+    });
+    const text = jsonl([
+      call("auto[1m]", "glm-5p3"), // per-turn router: the served model is the point
+      call("firerouter/kimi-k3", "accounts/fireworks/models/kimi-k3"),
+      call("sonnet", "claude-sonnet-4-6"), // Claude alias resolved to a concrete model
+      call("default", "glm-5p3"), // the /model Default slot
+      call("kimi-k3-fast", "accounts/fireworks/models/glm-5p3"), // a mode router of another model
+    ]);
+
+    const rows = parseClaudeUsageLog(text);
+    assert.deepEqual(rows.map((row) => row.displayModel), [
+      "glm-5p3", "kimi-k3", "claude-sonnet-4-6", "glm-5p3", "glm-5p3",
+    ]);
+    assert.equal(rows[1].cost, 3.00, "firerouter/kimi-k3 keeps Kimi K3's rate");
+    assert.equal(rows[2].cost, 3.00, "sonnet keeps claude-sonnet-4-6's rate");
   });
 
   it("does not collapse records that share an empty message id", () => {
@@ -664,7 +947,7 @@ describe("claude usage", () => {
     assert.match(text, /Cost estimate:/);
     assert.match(text, /Reference: https:\/\/platform\.claude\.com\/docs\/en\/about-claude\/pricing/);
     assert.match(text, /Fireworks-served model estimate per request/);
-    assert.match(text, /Anthropic model usage is fetched from session logs; estimated cost is calculated from local rates/);
+    assert.match(text, /Anthropic and OpenAI model usage is fetched from session logs; estimated cost is calculated from local rates/);
     assert.match(text, /\*\*\*All pricing shown below are estimates based on token usage/);
     assert.match(text, /Usage columns:/);
     assert.match(text, /Request #: request number within this section/);

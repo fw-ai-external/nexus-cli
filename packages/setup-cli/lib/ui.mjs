@@ -1,4 +1,3 @@
-import process from "node:process";
 
 import { withSpinner } from "./ui/spinner.mjs";
 import { bold, isStyleEnabled } from "./ui/style.mjs";
@@ -22,7 +21,7 @@ export {
   yesNo,
 } from "./ui/style.mjs";
 
-export { colorsEnabled, isColorEnabled, isInteractiveColorEnabled } from "./ui/color.mjs";
+export { colorsEnabled, isColorEnabled } from "./ui/color.mjs";
 export { ANSI, METER } from "./ui/palette.mjs";
 export { sanitize } from "./ui/sanitize.mjs";
 export { withSpinner };

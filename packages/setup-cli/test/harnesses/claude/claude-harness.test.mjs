@@ -65,7 +65,7 @@ const CATALOG_ROWS = [
     input_modalities: ["text", "image"],
     aliases: ["accounts/fireworks/routers/glm-flash-latest"],
   }),
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/kimi-k3",
     displayName: "Kimi K3",
     input_modalities: ["text", "image"],

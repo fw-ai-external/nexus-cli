@@ -20,7 +20,16 @@ The harness (`../index.mjs`) uses two, depending on the flags:
 - `cost.mjs` — nullable cost representation (`null` means unavailable) and
   null-propagating total arithmetic.
 - `report.mjs` — parses session JSONL, aggregates priced rows, and orchestrates
-  snapshot output.
+  snapshot output. When `requestedModel` names a serving-mode router (such as
+  Fast or Ultra-fast) of the served model, rows use the router's label and
+  rates rather than the base model returned in the response. The `[1m]` suffix
+  is stripped before matching. With a cold catalog cache only serving-mode
+  slugs (such as `-fast` or `-ultrafast`) match, so `-fast-latest` aliases keep the served
+  model's rates until the catalog is cached. Other requests, including `auto`, keep the
+  served model. The statusline reads these same report rows. When the first content
+  block records its stream time (thinking or tool input), it also measures the newest
+  call's generated-token rate (prefill and TTFT excluded); the statusline opts in, so
+  `--json` keeps its report shape.
 - `format.mjs` — cost and cache-percentage strings shared by the meter and both
   pickers.
 - `agents.mjs` — discovers subagent logs and labels them from the `.meta.json`
@@ -37,6 +46,10 @@ it in this list, never below:
   Colour is decided per run, so these are module-level `let`s that
   `applyMeterStyle` sets once; importers see the change through ES module live
   bindings.
+- `meter-hooks.mjs` — the other leaf: like `meter-style.mjs` it imports nothing in this folder, so the two sit together at the bottom. Hooks for a harness whose logs are not Claude Code's: a
+  per-run translator from its log lines to the records the meter tallies, and a
+  throttled background refresh the tail loop never awaits. `codex usage` uses
+  both (see `../../codex/usage/live.mjs`).
 - `meter-layout.mjs` — the column table. Every width in the frame derives from
   `TOKEN_COLUMNS`, so a heading and its cells cannot drift apart.
 - `meter-model.mjs` — pricing one call, `Tally`/`Turn`, and reading prompt text

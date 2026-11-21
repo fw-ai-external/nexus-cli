@@ -5,13 +5,12 @@ import {
 } from "../../cli/messages.mjs";
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
-import process from "node:process";
-import { MISSING_FIREWORKS_API_KEY_MESSAGE } from "../../keys/key-type.mjs";
 import {
   loadRegisterableModels,
 } from "../../fireworks/models.mjs";
-import { harnessFullKey } from "../../keys/harness-api-key.mjs";
+import { harnessFullKey, missingHarnessKeyError } from "../../keys/harness-api-key.mjs";
 import {
   VSCODE_FIREWORKS_MODEL_URL,
   ensureVscodeStopped,
@@ -29,6 +28,7 @@ import {
   readVscodeStoredKeyWithoutKeychain,
   relocateLegacyVscodeBackups,
   vscodeAzureProviderStatus,
+  vscodeProfilesNeedRestore,
   vscodeSecretStored,
   vscodeStoredByokHeaders,
 } from "./core.mjs";
@@ -36,7 +36,7 @@ import { DEFAULT_AZURE_MODEL } from "../../fireworks/azure-core.mjs";
 import {
   byokEnvFromHeaders,
 } from "../../firerouter/core.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import {
   vscodePathsFor,
   ensureHomeForHarness,
@@ -50,6 +50,13 @@ import {
   linuxSafeStorageIsObfuscatedFallback,
   linuxSafeStorageObfuscatedKeyNote,
 } from "./safestorage.mjs";
+import { fireworksInferenceUrl, recordedHarnessResidency } from "../../fireworks/residency.mjs";
+
+export async function vscodeNeedsRestore(ctx) {
+  const paths = vscodePathsFor(ctx);
+  await relocateLegacyVscodeBackups({ home: ctx.home, dataDir: paths.dataDir });
+  return vscodeProfilesNeedRestore({ ...paths, home: ctx.home });
+}
 
 /**
  * Harness-local Fireworks key for VS Code: the key stored (encrypted) in VS
@@ -70,9 +77,19 @@ async function vscodeApiKey(ctx) {
   return harnessFullKey(ctx, vscodeResolveKey);
 }
 
+/** The Fireworks models VS Code selects while routed (see HarnessAdapter.configuredModels). */
+async function vscodeConfiguredModels(ctx) {
+  const arr = await readChatLanguageModels(vscodePathsFor(ctx).vscodePath);
+  if (vscodeAzureProviderStatus(arr) === "azure" || fireworksProviderStatus(arr) !== "fireworks") {
+    return [];
+  }
+  return fireconnectRegisteredModels(arr).map((model) => ({ slot: "picker", model }));
+}
+
 export default defineHarnessProfile({
   id: HARNESS.VSCODE,
   label: "VS Code",
+  configuredModels: vscodeConfiguredModels,
   resolveKey: vscodeResolveKey,
   paths: (ctx) => vscodePathsFor(ctx),
   firerouter: {
@@ -114,7 +131,7 @@ export default defineHarnessProfile({
   resolveOnKey: async (ctx) => {
     const token = await vscodeApiKey(ctx);
     if (!token) {
-      throw new Error(MISSING_FIREWORKS_API_KEY_MESSAGE);
+      throw missingHarnessKeyError();
     }
     return { apiKeyRef: token, effectiveKey: token, reusedExistingKey: false };
   },
@@ -167,12 +184,15 @@ export default defineHarnessProfile({
   prepareOff: (ctx) => ensureVscodeStopped({ force: ctx.force }),
   disable: async ({ ctx, paths, wasEnabled }) => {
     await relocateLegacyVscodeBackups({ home: ctx.home, dataDir: paths.dataDir });
+    const restoreStandardProfiles = (ctx.platform ?? process.platform) === "win32"
+      && (!ctx.vscodePath || ctx.restoreAllVscodeProfiles);
     return disableVscodeFireworks({
-    vscodePath: paths.vscodePath,
-    dataDir: paths.dataDir,
-    wasEnabled,
-    stateDbPath: paths.stateDbPath,
-  });
+      home: restoreStandardProfiles ? ctx.home : undefined,
+      vscodePath: paths.vscodePath,
+      dataDir: paths.dataDir,
+      wasEnabled,
+      stateDbPath: paths.stateDbPath,
+    });
   },
   restartHintOff: () => printRestartHint("Restart VS Code for the change to take effect."),
   async providerStatus(ctx) {
@@ -244,11 +264,13 @@ export default defineHarnessProfile({
       harness: HARNESS.VSCODE,
       enabled,
       provider,
-      modelUrl: registered.length ? VSCODE_FIREWORKS_MODEL_URL : null,
+      modelUrl: registered.length ? fireworksInferenceUrl(VSCODE_FIREWORKS_MODEL_URL, recordedHarnessResidency("vscode", ctx.home)) : null,
       hasKey,
       keyType,
       registeredModels: registered,
     };
+
+    payload.modelAccess = await harnessModelAccess(HARNESS.VSCODE, ctx);
 
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
@@ -263,5 +285,6 @@ export default defineHarnessProfile({
       registeredModels: registered.length === 1 ? [] : registered,
       keySource: harnessStatusKeySource(HARNESS.VSCODE, provider, { whenFireworks: false }),
     });
+    printModelAccessNote(HARNESS.VSCODE, payload.modelAccess);
   },
 });

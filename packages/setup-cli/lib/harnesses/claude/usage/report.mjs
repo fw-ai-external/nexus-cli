@@ -1,5 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { sanitize } from "../../../ui/sanitize.mjs";
 import { FIREWORKS_PRICING_DOCS_URL } from "../../../fireworks/pricing.mjs";
 import {
   UNPRICED_TEXT,
@@ -7,18 +8,21 @@ import {
   sumUsage,
 } from "./cost.mjs";
 import { computeClaudeUsageCost } from "./pricing.mjs";
+import { isModeRouterOf } from "../../../fireworks/model-specs.mjs";
+import { stripClaudeCodeContextSuffix } from "../code-context.mjs";
 import { usageCostDigits } from "./format.mjs";
 import {
   formatCostEstimateNote,
   formatClaudeUsageReportsSummaryDisplay,
   formatClaudeUsageSummaryDisplay,
+  sessionId,
 } from "./display.mjs";
 
 export { computeClaudeUsageCost };
 
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function expandHome(value, home) {
+export function expandHome(value, home) {
   if (!value?.startsWith("~")) {
     return value;
   }
@@ -31,7 +35,7 @@ function expandHome(value, home) {
   return value;
 }
 
-async function fileExists(filePath) {
+export async function fileExists(filePath) {
   try {
     return (await stat(filePath)).isFile();
   } catch {
@@ -89,13 +93,13 @@ async function filesWithMtime(files) {
   );
 }
 
-function parseLastN(value) {
+export function parseLastN(value) {
   if (value === "" || value == null) {
     return 1;
   }
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error("--last_n must be a positive integer.");
+    throw new Error("--last-n must be a positive integer.");
   }
   return parsed;
 }
@@ -160,15 +164,16 @@ export async function findClaudeSessionLogs({ home, session = "", lastN = 1, wit
   return withMtime.slice(0, parseLastN(lastN)).map(({ filePath }) => filePath);
 }
 
-function numberValue(value) {
+export function numberValue(value) {
   return Number.isFinite(value) ? value : 0;
 }
 
-function cleanSessionName(value) {
+export function cleanSessionName(value) {
   if (typeof value !== "string") {
     return "";
   }
-  return value.replace(/\s+/g, " ").trim();
+  // Titles and prompts come from the transcript and are printed to a terminal.
+  return sanitize(value).replace(/\s+/g, " ").trim();
 }
 
 function textFromMessageContent(content) {
@@ -302,6 +307,22 @@ function usageWeight(usage = {}) {
     + numberValue(usage.output_tokens);
 }
 
+/**
+ * The model a call is labeled and priced as. Streams name the base model even
+ * through a Fast or Ultra-fast router (`kimi-fast-latest` streams back
+ * `…/models/kimi-k3`), so a call whose `requestedModel` is a serving-mode router
+ * of the served model takes the router's label and rates. Anything else (Claude
+ * aliases, `default`, `auto`, FireRouter) keeps the served model.
+ * @param {object} entry transcript record
+ * @param {object} message its `message` object
+ * @returns {string}
+ */
+function attributedModel(entry, message) {
+  const served = message.model || entry.model || "?";
+  const requested = stripClaudeCodeContextSuffix(String(entry.requestedModel ?? "").trim());
+  return requested && !isSyntheticModel(served) && isModeRouterOf(requested, served) ? requested : served;
+}
+
 const META_USER_TAG_RE =
   /^<(?:local-command-caveat|command-name|local-command-stdout|command-message|command-args|system-reminder)>/;
 
@@ -312,7 +333,7 @@ export function parseClaudeUsageLog(text) {
   // priced most calls at zero: a real subagent log with 636k tokens reported
   // $0.00. Billing is per API call, so keep one row per id in first-seen order
   // (`slotOf` points an id at the slot it owns) and let the richest usage win.
-  /** @type {{ model: string, usage: object, weight: number, turn: number }[]} */
+  /** @type {{ model: string, usage: object, weight: number, turn: number, firstAt: number | null, lastAt: number | null, firstStreamMs: number | null }[]} */
   const calls = [];
   /** @type {Map<string, number>} */
   const slotOf = new Map();
@@ -349,7 +370,7 @@ export function parseClaudeUsageLog(text) {
       continue;
     }
     const message = entry.message && typeof entry.message === "object" ? entry.message : {};
-    const model = message.model || entry.model || "?";
+    const model = attributedModel(entry, message);
     // `<synthetic>` marks a turn that never reached the API (interrupt, local
     // command) and always carries an all-zero payload — not a billable call.
     if (isSyntheticModel(model)) {
@@ -357,24 +378,43 @@ export function parseClaudeUsageLog(text) {
     }
     const usage = entry.usage || message.usage || {};
     const weight = usageWeight(usage);
+    // A record is written when a content block COMPLETES, not when it starts.
+    // Thinking and tool-input blocks record their own stream time, so the first
+    // record's stamp minus that duration is the moment the first token
+    // appeared — see `lastCallDecodeTokensPerSecond`. A text-first block has no
+    // such measurement, so those calls cannot report a rate.
+    const at = timeOf(entry.timestamp);
+    const firstStreamMs = firstBlockStreamMs(entry, message);
     // `||` not `??`: an empty-string id must fall through to the next
     // candidate, or every id-less record collapses into one bucket.
     const key = message.id || entry.requestId || entry.uuid || "";
     if (!key) {
       // No identity to dedupe on — count it as its own call.
-      calls.push({ model, usage, weight, turn });
+      calls.push({ model, usage, weight, turn, firstAt: at, lastAt: at, firstStreamMs });
       continue;
     }
     const slot = slotOf.get(key);
     if (slot === undefined) {
       slotOf.set(key, calls.length);
-      calls.push({ model, usage, weight, turn });
+      calls.push({ model, usage, weight, turn, firstAt: at, lastAt: at, firstStreamMs });
       continue;
     }
-    // Ties keep the earlier record: repeated all-zero blocks shouldn't churn.
-    if (weight > calls[slot].weight) {
-      calls[slot] = { model: model || calls[slot].model, usage, weight, turn: calls[slot].turn };
+    const prev = calls[slot];
+    // Ties keep the earlier usage record, but every block extends the call: the
+    // LAST record's stamp bounds the decode window. A missing stamp leaves the
+    // end unknown rather than reusing an earlier block's time, which would
+    // shorten the window and inflate the rate. `decodeTokensPerSecond` also
+    // rejects a final stamp that precedes the first.
+    const next = {
+      ...prev,
+      model: weight > prev.weight && model ? model : prev.model,
+      lastAt: at,
+    };
+    if (weight > prev.weight) {
+      next.usage = usage;
+      next.weight = weight;
     }
+    calls[slot] = next;
   }
 
   const rows = calls.map(({ model, usage, turn: rowTurn }) => ({
@@ -382,7 +422,113 @@ export function parseClaudeUsageLog(text) {
     turn: rowTurn,
   }));
   rows.currentTurn = turn;
+  rows.lastCallDecodeTps = lastCallDecodeTokensPerSecond(calls);
   return rows;
+}
+
+/** ISO stamp as epoch ms, or null when absent/unparseable. */
+function timeOf(timestamp) {
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Stream time of a record's first content block, when that block records one.
+ *
+ * Claude Code stamps `thinkingDurationMs` on the record that completes a
+ * thinking block and `toolInputStreamMs` on the record that completes a
+ * tool_use block (block start to block stop). Text blocks record no duration,
+ * so a text-first call has no measured first-token time and reports no rate.
+ *
+ * @param {object} entry transcript record
+ * @param {object} message its `message` object
+ * @returns {number | null}
+ */
+function firstBlockStreamMs(entry, message) {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
+  const type = content[0]?.type;
+  const ms = type === "thinking"
+    ? entry.thinkingDurationMs
+    : type === "tool_use"
+      ? entry.toolInputStreamMs
+      : null;
+  return typeof ms === "number" && Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Generated-token rate of the newest call that produced output.
+ *
+ * A record lands when its content block completes, so the first record's stamp
+ * is the END of the first block, not the first token. Thinking and tool-input
+ * blocks carry their own streaming duration; subtracting it recovers the
+ * first-token moment. The window then runs to the last content block and holds
+ * only generation — prompt prefill and time to first token are excluded.
+ * `output_tokens` counts every token the model emitted (thinking, text, tool
+ * arguments), so this is generated tokens over generated time.
+ *
+ * Only the newest producing call is considered. A call with no output, no
+ * timestamps, or a first block that did not record its duration yields null,
+ * and the caller omits the figure: showing an older call's rate would name a
+ * number the user did not just watch.
+ *
+ * @param {{ usage: object, firstAt: number | null, lastAt: number | null, firstStreamMs: number | null }[]} calls
+ * @returns {number | null}
+ */
+export function lastCallDecodeTokensPerSecond(calls) {
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    const call = calls[index];
+    const outputTokens = numberValue(call.usage?.output_tokens);
+    if (outputTokens > 0) {
+      return decodeTokensPerSecond({
+        outputTokens,
+        firstAt: call.firstAt,
+        lastAt: call.lastAt,
+        firstStreamMs: call.firstStreamMs,
+      });
+    }
+  }
+  return null;
+}
+
+/**
+ * Shortest generation window a rate may claim, in milliseconds.
+ *
+ * Below this, the stamps measure buffering and clock resolution rather than
+ * generation: a proxy that delivers a call's blocks in one burst, or a clock
+ * step that moves the final stamp close to the first, otherwise yields a
+ * finite-looking but invented rate. The line omits the figure instead.
+ */
+const MIN_DECODE_WINDOW_MS = 50;
+
+/**
+ * Generated-token rate for one call with its timing evidence, or null when the
+ * call is unmeasurable. Pure and separate from the transcript walk so it can be
+ * checked on its own. Mirrored in the CLI's internal formal models, which check
+ * it on a finite set of cases: change both together.
+ *
+ * Rejects evidence that cannot describe generation: a negative first-block
+ * duration, a final stamp before the first (clock skew), and a window shorter
+ * than `MIN_DECODE_WINDOW_MS`.
+ *
+ * @param {{ outputTokens?: number, firstAt?: number | null, lastAt?: number | null, firstStreamMs?: number | null }} call
+ * @returns {number | null}
+ */
+export function decodeTokensPerSecond({ outputTokens = 0, firstAt = null, lastAt = null, firstStreamMs = null } = {}) {
+  if (!(outputTokens > 0) || firstAt == null || lastAt == null || firstStreamMs == null) {
+    return null;
+  }
+  if (!(firstStreamMs >= 0) || lastAt < firstAt) {
+    return null;
+  }
+  const decodeMs = (lastAt - firstAt) + firstStreamMs;
+  if (!(decodeMs >= MIN_DECODE_WINDOW_MS)) {
+    return null;
+  }
+  const rate = outputTokens / (decodeMs / 1000);
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
 }
 
 function sumRows(rows) {
@@ -393,7 +539,7 @@ function addTotals(a, b) {
   return addUsage(a, b);
 }
 
-function rowHasUsage(row) {
+export function rowHasUsage(row) {
   return row.input > 0
     || row.cacheWrite5m > 0
     || row.cacheWrite1h > 0
@@ -407,7 +553,7 @@ function reportHasUsage(report) {
   return report.rows.length > 0 || (report.subagents ?? []).some((subagent) => subagent.rows.length > 0);
 }
 
-function reportFromRows(filePath, rows, { sessionName = "" } = {}) {
+function reportFromRows(filePath, rows, { sessionName = "", includeTiming = false } = {}) {
   const usedRows = rows.filter(rowHasUsage);
   const currentTurn = rows.currentTurn ?? 0;
   const lastRow = rows.at(-1);
@@ -420,20 +566,25 @@ function reportFromRows(filePath, rows, { sessionName = "" } = {}) {
     estimated: usedRows.some((row) => row.estimated),
     unpriced: usedRows.filter((row) => row.priced === false).length,
   };
+  // Opt-in: the status line asks for it, while `claude usage --json` stays the
+  // documented report shape it has always had.
+  if (includeTiming && typeof rows.lastCallDecodeTps === "number") {
+    report.lastCallDecodeTps = rows.lastCallDecodeTps;
+  }
   if (sessionName) {
     report.sessionName = sessionName;
   }
   return report;
 }
 
-async function readUsageFile(filePath, { includeSessionName = false } = {}) {
+async function readUsageFile(filePath, { includeSessionName = false, includeTiming = false } = {}) {
   const text = await readFile(filePath, "utf8");
-  return usageReportFromText(filePath, text, { includeSessionName });
+  return usageReportFromText(filePath, text, { includeSessionName, includeTiming });
 }
 
-export function usageReportFromText(filePath, text, { includeSessionName = false } = {}) {
+export function usageReportFromText(filePath, text, { includeSessionName = false, includeTiming = false } = {}) {
   const sessionName = includeSessionName ? parseClaudeSessionName(text) : "";
-  return reportFromRows(filePath, parseClaudeUsageLog(text), { sessionName });
+  return reportFromRows(filePath, parseClaudeUsageLog(text), { sessionName, includeTiming });
 }
 
 async function findSubagentLogs(sessionLogPath) {
@@ -447,8 +598,8 @@ async function findSubagentLogs(sessionLogPath) {
 }
 export { findSubagentLogs };
 
-async function readClaudeUsageAtPath(sessionPath) {
-  const report = await readUsageFile(sessionPath, { includeSessionName: true });
+async function readClaudeUsageAtPath(sessionPath, { includeTiming = false } = {}) {
+  const report = await readUsageFile(sessionPath, { includeSessionName: true, includeTiming });
   const subagents = (await Promise.all(
     (await findSubagentLogs(sessionPath)).map(async (subagentPath) => {
       const subagent = await readUsageFile(subagentPath);
@@ -472,8 +623,8 @@ async function readClaudeUsageAtPath(sessionPath) {
   };
 }
 
-export async function readClaudeUsage({ home, session = "" }) {
-  return readClaudeUsageAtPath(await findClaudeSessionLog({ home, session }));
+export async function readClaudeUsage({ home, session = "", includeTiming = false }) {
+  return readClaudeUsageAtPath(await findClaudeSessionLog({ home, session }), { includeTiming });
 }
 
 export async function readClaudeUsages({ home, session = "", lastN = 1 }) {
@@ -822,13 +973,12 @@ function unpricedNote(report) {
   return [
     `Note: ${report.unpriced} request(s) have no rate available, so their cost is not shown`
     + ` and totals that include them read ${UNPRICED_TEXT}: ${models.join(", ")}.`
-    + ` Refresh the model catalog (nexus model list --refresh) or see ${FIREWORKS_PRICING_DOCS_URL}.`,
+    // A harness that knows why its rows are unpriced (Codex: a router call
+    // whose served model hasn't been looked up) supplies its own advice.
+    + ` ${report.unpricedHint || `Refresh the model catalog (nexus model list --refresh) or see ${FIREWORKS_PRICING_DOCS_URL}.`}`,
   ];
 }
 
-function sessionId(report) {
-  return path.basename(report.path, ".jsonl");
-}
 
 function sessionBannerLabel(report) {
   const id = sessionId(report);

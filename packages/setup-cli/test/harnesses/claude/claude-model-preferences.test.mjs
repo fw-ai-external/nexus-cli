@@ -48,7 +48,7 @@ function seedCatalogFor(home) {
         name: "accounts/fireworks/models/glm-5p2",
         aliases: ["accounts/fireworks/routers/glm-fast-latest"],
       }),
-      mockServerlessModel({
+      ...mockServerlessModelRows({
         name: "accounts/fireworks/models/kimi-k3",
         displayName: "Kimi K3",
         input_modalities: ["text", "image"],

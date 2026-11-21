@@ -1,15 +1,15 @@
-import { mkdtemp, readFile, writeFile, mkdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { piSettingsPath, piAuthPath, piModelsPath, PI_API_KEY_ENV_REF, PI_DATA_RELATIVE_DIR, PI_AZURE_PROVIDER } from "../../../lib/harnesses/pi/core.mjs";
+import { piSettingsPath, piAuthPath, piModelsPath, PI_DATA_RELATIVE_DIR, PI_AZURE_PROVIDER } from "../../../lib/harnesses/pi/core.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import {
   cacheServerlessCatalogSnapshot,
   setServerlessCatalogSnapshot,
 } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
-import { FIRECONNECT_REFERER, mockServerlessModel, runFireconnect, seedServerlessCatalogCache } from "../../helpers.mjs";
+import { mockServerlessModel, runFireconnect } from "../../helpers.mjs";
 import { writeGlobalConfig } from "../../../lib/config/global-config.mjs";
 
 const AZURE_ENDPOINT = "https://example-resource.services.ai.azure.com";

@@ -114,11 +114,48 @@ describe("release notes", () => {
     assert.doesNotMatch(formatted, /\u2014/);
   });
 
+  it("formats the v0.12.0 user-facing summary", async () => {
+    const releases = await readReleaseNotes();
+    const release = releases.find((candidate) => candidate.version === "0.12.0");
+    assert.ok(release);
+    assert.equal(releases[0].version, "0.12.0");
+
+    const formatted = formatReleaseNotes(release);
+    assert.match(formatted, /What's new in Nexus CLI v0\.12\.0/);
+    assert.equal(release.highlights.length, 8);
+    assert.equal(release.improvements.length, 19);
+    assert.match(formatted, /`nexus codex usage` reports your Codex sessions/);
+    assert.match(formatted, /Fireworks now runs auto mode's safety checks on the server/);
+    assert.match(formatted, /Nexus accounts sign in through the Nexus web app/);
+    assert.match(formatted, /sign-in keys expire after 7 days/);
+    assert.match(formatted, /the Claude Code status line warn on the last day/);
+    assert.match(formatted, /`nexus login` and `nexus status` show the expiry date/);
+    assert.match(formatted, /`--paste-code`/);
+    assert.match(formatted, /Fireworks symbol in the Claude Code status line/);
+    assert.match(formatted, /tokens per second \(TPS\)/);
+    assert.match(formatted, /`us\.api\.fireworks\.ai`/);
+    assert.match(formatted, /DeepSeek V4\.1 Flash 1017 Ultra-fast/);
+    assert.match(formatted, /Codex: image generation is off by default/);
+    assert.match(formatted, /Better Windows support/);
+    assert.match(formatted, /`nexus uninstall` finishes removing Nexus after the CLI exits/);
+    assert.match(formatted, /restart your harnesses to load the updated settings/);
+    // Keep the notes simple: no placeholder harness commands.
+    assert.doesNotMatch(formatted, /<harness>/);
+    assert.doesNotMatch(formatted, /\u2014/);
+  });
+
+  it("shows an upgrade from 0.11.0 only the 0.12.0 entry", async () => {
+    // The 0.12.0 entry covers every change since 0.11.0, so there is no 0.11.1
+    // entry: it would repeat them to everyone upgrading from 0.11.0.
+    const releases = await readReleaseNotes();
+    assert.equal(releases.some((release) => release.version === "0.11.1"), false);
+    assert.deepEqual(releaseNotesForRange(releases, "0.11.0", "0.12.0").map((release) => release.version), ["0.12.0"]);
+  });
+
   it("formats the v0.11.0 user-facing summary", async () => {
     const releases = await readReleaseNotes();
     const release = releases.find((candidate) => candidate.version === "0.11.0");
     assert.ok(release);
-    assert.equal(releases[0].version, "0.11.0");
 
     const formatted = formatReleaseNotes(release);
     assert.match(formatted, /What's new in Nexus CLI v0\.11\.0/);

@@ -41,6 +41,8 @@ import { HARNESSES } from "./id.mjs";
  * @property {boolean} [quiet]   // uninstall/upgrade: suppress per-harness on/off narration
  * @property {boolean} [storedOnly] // key export: prefer secret store; env only when nothing stored
  * @property {string} [vscodePath]      // vscode: explicit chatLanguageModels.json path
+ * @property {NodeJS.Platform} [platform] // VS Code restore scope; defaults to process.platform
+ * @property {boolean} [restoreAllVscodeProfiles] // Windows uninstall: include standard profiles even with vscodePath
  */
 
 /**
@@ -54,13 +56,32 @@ import { HARNESSES } from "./id.mjs";
  *   Read the harness's real config and return the active provider, the same
  *   ground truth `status` reports. Used by global `nexus status` so the
  *   per-harness summary reflects what's actually routed, not a stale flag.
+ * @property {(ctx: HarnessContext) => Promise<boolean>} [ownsRouting]
+ *   Whether Nexus wrote the routing `providerStatus` reports (a backup, or
+ *   entries carrying Nexus's markers). Defined where a hand-made config can
+ *   look the same; `isHarnessRouted` counts routing only when this is true.
  * @property {(ctx: HarnessContext) => Promise<string | typeof import("../keys/key-current.mjs").LIVE_KEY | null>} [keyInUse]
  *   The Fireworks key the harness sends while it is on Fireworks: its literal
  *   copy, LIVE_KEY when it fetches the key from Nexus per request, or null when
  *   off, an env reference, or unreadable without a keychain prompt. Never prompts. Feeds `nexus status`'s
  *   `perHarness[].keyCurrent` (see harnessKeyCurrent).
+ * @property {(ctx: HarnessContext) => Promise<Array<{ slot: string, model: string }>>} [configuredModels]
+ *   The Fireworks models the harness's own config selects while it is routed
+ *   through Fireworks (`main`, Claude's tier slots, or `picker` for a
+ *   harness that only keeps a model list); [] when off. Read-only and
+ *   prompt-free. Compared with the served catalog by `status` and `on`.
+ * @property {(modelId: string) => boolean} [servedOutsideCatalog]
+ *   Model ids the harness serves that the catalog never lists.
+ * @property {(ctx: HarnessContext) => Promise<string | null>} [modelAccessKeyInUse]
+ *   A prompt-free stand-in for `keyInUse` in status's model-access check,
+ *   for a harness whose `keyInUse` can read a secret store. null: can't tell.
+ * @property {string} [modelAccessAdvice]
+ *   What `status` tells the user about a blocked model when re-running `on`
+ *   isn't the fix (Claude Desktop keeps saved custom models).
  * @property {(ctx: HarnessContext) => Promise<void>} [usage]
  * @property {(ctx: HarnessContext) => Promise<void>} [live]
+ * @property {(ctx: HarnessContext) => Promise<void>} [restart]
+ *   Restart the harness's background service without changing its config.
  * @property {(ctx: HarnessContext) => Promise<string>} resolveKey
  * @property {(ctx: HarnessContext) => Promise<HarnessContext>} [resolveOnContext]
  *   Resolve state-dependent defaults for `on`; the result is validated and dispatched.
@@ -126,6 +147,14 @@ export async function dispatchHarnessCommand(adapter, route, ctx) {
         );
       }
       await adapter.mcp(ctx, route.args ?? []);
+      return;
+    case "restart":
+      if (typeof adapter.restart !== "function") {
+        throw new Error(
+          `restart is not supported for ${adapter.id}. Run: nexus ${adapter.id} help`,
+        );
+      }
+      await adapter.restart(ctx);
       return;
     case "live":
       if (typeof adapter.live !== "function") {

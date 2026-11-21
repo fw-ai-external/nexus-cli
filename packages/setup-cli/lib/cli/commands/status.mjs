@@ -1,14 +1,35 @@
 import process from "node:process";
-import { keyStatusSummary, resolveFireworksKeyWithSource } from "../../keys/api-key.mjs";
+import { keyStatusSummary, keyStoreUnreadableError, resolveFireworksKeyWithSource } from "../../keys/api-key.mjs";
 import { identityLabel, verifyFireworksApiKey } from "../../keys/verify-api-key.mjs";
 import { detectEnvironment } from "../../system/environment.mjs";
 import { accent } from "../../ui/term.mjs";
 import { muted, primary, symbols } from "../../ui.mjs";
 import { printBoolField, printField, printSectionHeader } from "../../harness/status-display.mjs";
+import { harnessModelAccess } from "../../harness/engine.mjs";
+import {
+  formatBlockedModelsStatusNote,
+  formatModelAccessUncheckedNote,
+  staleCatalogDate,
+} from "../../fireworks/model-access.mjs";
+import { warn } from "../../ui.mjs";
 import { listHarnesses } from "../../harness/registry.mjs";
 import { detectInstalledHarnessesAsync } from "../../harness/detect.mjs";
 import { harnessRows, printHarnessRows } from "./harnesses.mjs";
 import { harnessKeyCurrent } from "../../keys/key-current.mjs";
+import { activeKeySourceNote } from "../../keys/storage-report.mjs";
+import {
+  accountUnsupportedResidency,
+  refreshAccountResidency,
+  residencyInferenceHost,
+  unsupportedResidencyNote,
+} from "../../fireworks/residency.mjs";
+import { readGlobalConfig } from "../../config/global-config.mjs";
+import {
+  apiKeyFingerprint,
+  formatExpiry,
+  keyExpiresSoon,
+  readMintedKeyState,
+} from "../../keys/mint-api-key.mjs";
 
 /**
  * `nexus status`: report sign-in state, machine environment, and where
@@ -57,21 +78,27 @@ export async function runStatusCommand(ctx) {
   // re-reads each routed harness's config (a sqlite3 read for Cursor, VS Code
   // and the Copilot app) — file reads only, in parallel.
   const harnessCtx = { ...ctx, home, settingsPath: "", configPath: "", dataDir: "" };
+  // Each routed harness's configured models against the cached catalog
+  // (file reads only, no network): which of them the account can't use.
   await Promise.all(adapters.map(async (adapter) => {
     const entry = byId.get(adapter.id);
     if (entry) {
       entry.keyCurrent = entry.enabled ? await harnessKeyCurrent(adapter, harnessCtx, active) : null;
+      entry.modelAccess = entry.enabled
+        ? await harnessModelAccess(adapter, harnessCtx, { activeKey: active ?? "" })
+        : null;
     }
   }));
-  // The resolver prefers FIREWORKS_API_KEY, so when it is set it is the
-  // credential actually in effect — phrase rejections around that.
-  const fromEnv = source === "env";
+  const keyExpiresAt = source === "stored" && active ? await storedKeyExpiry(home, active) : "";
 
   // signedIn: true = verified; false = no key or rejected (exit 1);
   // null = a key is present but the API couldn't be reached (exit 0).
-  /** @type {{ signedIn: boolean|null, email: string, accountId: string, reason: string }} */
+  /** @type {{ signedIn: boolean|null, email: string, accountId: string, reason: string, detail?: string }} */
   let auth;
-  if (!active) {
+  const unreadable = active ? null : keyStoreUnreadableError();
+  if (unreadable) {
+    auth = { signedIn: false, email: "", accountId: "", reason: "key-store-undecryptable", detail: unreadable.message };
+  } else if (!active) {
     auth = { signedIn: false, email: "", accountId: "", reason: "no-key" };
   } else {
     const result = await verifyFireworksApiKey(active);
@@ -83,22 +110,49 @@ export async function runStatusCommand(ctx) {
         reason: "",
       };
     } else if (result.reason === "rejected") {
-      auth = { signedIn: false, email: "", accountId: "", reason: "rejected" };
+      auth = { signedIn: false, email: "", accountId: "", reason: "rejected", ...(keyExpired(keyExpiresAt) ? { detail: "expired" } : {}) };
     } else {
       auth = { signedIn: null, email: "", accountId: "", reason: "unreachable" };
     }
+  }
+
+  // The account's data residency decides which inference host its harnesses
+  // must use. Read only for a verified key; a failed read keeps the cached one,
+  // and with none it stays unknown (null): nothing is compared or advised.
+  // The key was verified above, so its account ID skips a second check.
+  const residency = auth.signedIn ? await refreshAccountResidency(active, { accountId: auth.accountId }) : null;
+  const unsupportedResidency = residency === null ? accountUnsupportedResidency() : "";
+  const harnessResidency = (await readGlobalConfig(home)).harnesses;
+  for (const h of summary.perHarness) {
+    // Azure routing doesn't call Fireworks endpoints, so residency doesn't apply.
+    const entry = harnessResidency[h.id];
+    h.residencyCurrent = h.enabled && residency !== null && entry?.provider !== "azure"
+      ? (entry?.residency ?? "") === residency
+      : null;
   }
 
   if (ctx.json) {
     console.log(JSON.stringify({
       auth,
       activeKeySource: source,
+      // When the web app said when the stored key expires (ISO 8601), else null.
+      keyExpiresAt: keyExpiresAt || null,
       environment,
+      residency: residency === null
+        ? null
+        : { value: residency, inferenceHost: residencyInferenceHost(residency) || "api.fireworks.ai" },
+      ...(unsupportedResidency ? { unsupportedResidency } : {}),
       ...summary,
     }, null, 2));
   } else {
-    printAuthLine(auth, fromEnv);
+    printAuthLine(auth, keyExpiresAt);
     printActiveKeyLine(source, summary);
+    printKeyExpiry(keyExpiresAt, auth);
+    if (residency) {
+      printField("Data residency", `${residency} (inference on ${residencyInferenceHost(residency)})`);
+    } else if (unsupportedResidency) {
+      console.log(warn(unsupportedResidencyNote(unsupportedResidency)));
+    }
     console.log("");
     printEnvironment(environment);
     console.log("");
@@ -106,6 +160,8 @@ export async function runStatusCommand(ctx) {
     console.log("");
     printSectionHeader("Harnesses");
     printHarnessRows(rows);
+    printBlockedModelLines(summary.perHarness, adapters);
+    printResidencyMismatchLines(summary.perHarness, adapters, residency);
   }
 
   if (auth.signedIn === false) {
@@ -114,29 +170,61 @@ export async function runStatusCommand(ctx) {
 }
 
 /**
- * State, in one line, exactly which key tools will use — the piece users most
- * often get wrong when both a stored key and a shell FIREWORKS_API_KEY exist.
+ * State, in one line, which key tools will use (the stored credential; a
+ * shell FIREWORKS_API_KEY is never used).
  * @param {import("../../keys/api-key.mjs").FireworksKeySource} source
  * @param {Awaited<ReturnType<import("../../keys/api-key.mjs").keyStatusSummary>>} summary
  */
 function printActiveKeyLine(source, summary) {
-  if (source === "env") {
-    const suffix = summary.keychainPresent
-      ? " (overrides the stored key)"
-      : "";
-    console.log(`Active key: ${accent("FIREWORKS_API_KEY")} from your environment${suffix}.`);
-    return;
-  }
   if (source === "stored") {
     console.log(`Active key: stored credential — ${summary.backendLabel}.`);
   }
 }
 
 /**
- * @param {{ signedIn: boolean|null, email: string, accountId: string, reason: string }} auth
- * @param {boolean} fromEnv
+ * When the stored key expires, from the record browser sign-in keeps (file
+ * read only). "" when unknown or the record is for another key.
+ * @param {string} home
+ * @param {string} key
  */
-function printAuthLine(auth, fromEnv) {
+async function storedKeyExpiry(home, key) {
+  const minted = await readMintedKeyState(home).catch(() => null);
+  return minted?.expiresAt && minted.keyFingerprint === apiKeyFingerprint(key) ? minted.expiresAt : "";
+}
+
+/** @param {string} expiresAt */
+function keyExpired(expiresAt) {
+  return Boolean(expiresAt) && Date.parse(expiresAt) <= Date.now();
+}
+
+/**
+ * The stored key's expiry, and a warning in its last day.
+ * @param {string} expiresAt
+ * @param {{ signedIn: boolean|null }} auth
+ */
+function printKeyExpiry(expiresAt, auth) {
+  if (!expiresAt || auth.signedIn === false) {
+    return;
+  }
+  const remainingMs = Date.parse(expiresAt) - Date.now();
+  if (remainingMs <= 0) {
+    // Expired even if the API couldn't be reached to say so.
+    printField("Key expires", `${expiresAt.slice(0, 10)} (expired)`);
+    console.log(warn(`This machine's API key has expired. Run ${accent("nexus login")} to replace it.`));
+    return;
+  }
+  const days = Math.ceil(remainingMs / 86_400_000);
+  printField("Key expires", `${expiresAt.slice(0, 10)} (${days === 1 ? "in 1 day" : `in ${days} days`})`);
+  if (keyExpiresSoon(expiresAt)) {
+    console.log(warn(`This machine's API key expires ${formatExpiry(expiresAt)}. Run ${accent("nexus login")} to replace it.`));
+  }
+}
+
+/**
+ * @param {{ signedIn: boolean|null, email: string, accountId: string, reason: string, detail?: string }} auth
+ * @param {string} [keyExpiresAt]
+ */
+function printAuthLine(auth, keyExpiresAt = "") {
   if (auth.signedIn === true) {
     console.log(formatSignedInLine(auth));
     return;
@@ -145,19 +233,19 @@ function printAuthLine(auth, fromEnv) {
     console.log(`Not signed in. Run ${accent("nexus login")} to sign in.`);
     return;
   }
-  if (auth.reason === "rejected") {
-    // `login` re-stores a key but cannot touch a FIREWORKS_API_KEY the
-    // shell exports — tell env users the real fix instead of pointing at it.
-    console.log(
-      fromEnv
-        ? `The Fireworks API rejected the FIREWORKS_API_KEY from your environment. Check or unset it to use a stored key instead.`
-        : `A stored key was found, but the Fireworks API rejected it. Run ${accent("nexus login")} to replace it.`,
-    );
+  if (auth.reason === "key-store-undecryptable") {
+    console.log(`Not signed in: the stored key can't be read.\n${auth.detail}`);
     return;
   }
-  console.log(
-    `A Fireworks API key is ${fromEnv ? "set in your environment" : "stored"}, but the Fireworks API couldn't be reached to verify it.`,
-  );
+  if (auth.reason === "rejected" && auth.detail === "expired") {
+    console.log(`This machine's API key expired ${formatExpiry(keyExpiresAt)}. Run ${accent("nexus login")} to sign in again.`);
+    return;
+  }
+  if (auth.reason === "rejected") {
+    console.log(`A stored key was found, but the Fireworks API rejected it. Run ${accent("nexus login")} to replace it.`);
+    return;
+  }
+  console.log("A Fireworks API key is stored, but the Fireworks API couldn't be reached to verify it.");
 }
 
 /**
@@ -193,19 +281,7 @@ function printEnvironment(environment) {
  * @param {import("../../keys/api-key.mjs").FireworksKeySource} source
  */
 function printStorage(summary, source) {
-  const envOnly = source === "env" && !summary.keychainPresent;
-
   printSectionHeader("Storage");
-  if (envOnly) {
-    printField("Key stored", "no");
-    printField("Secret backend", summary.backendLabel);
-    console.log(muted(
-      "Your shell's FIREWORKS_API_KEY is in use; nothing is saved to disk. "
-        + `Run ${accent("nexus login")} to store a key in ${summary.backendLabel}.`,
-    ));
-    return;
-  }
-
   printField("Config ref", summary.configRef);
   printField("Secret backend", summary.backendLabel);
   if (summary.location && summary.keychainPresent) {
@@ -215,12 +291,68 @@ function printStorage(summary, source) {
     printField("Backend issue", summary.backendError);
   }
   printBoolField("Key stored", summary.keychainPresent);
-  printBoolField("FIREWORKS_API_KEY in environment (ignored)", summary.envPresent);
+  // Nexus never reads FIREWORKS_API_KEY; only say so when it explains a
+  // missing key (someone exported one and expected Nexus to use it).
+  if (source === "none" && summary.envPresent) {
+    console.log(muted(activeKeySourceNote("")));
+  }
   if (summary.backend === "file" && summary.keychainPresent) {
     console.log("");
     console.log(muted(
       "Sandbox/CI tip: file-config harnesses bake the API key into their config files. "
         + "To inject the stored key elsewhere, use `nexus key export`.",
+    ));
+  }
+}
+
+/**
+ * One warning per routed harness whose configured models include ones the
+ * account's served catalog doesn't list, and a muted line for a routed
+ * harness whose models couldn't be checked.
+ * @param {Array<{ id: string, modelAccess?: import("../../fireworks/model-access.mjs").ModelAccessReport | null }>} perHarness
+ * @param {Array<{ id: string, modelAccessAdvice?: string }>} [adapters] advice when `on` isn't the fix
+ */
+function printBlockedModelLines(perHarness, adapters = []) {
+  const lines = [];
+  const adviceById = new Map(adapters.map((a) => [a.id, a.modelAccessAdvice]));
+  for (const h of perHarness) {
+    const report = h.modelAccess;
+    if (report?.blocked?.length) {
+      const advice = adviceById.get(h.id);
+      const note = formatBlockedModelsStatusNote(h.id, report.blocked, {
+        ...(advice ? { advice } : {}),
+        asOf: staleCatalogDate(report),
+      });
+      lines.push(warn(`${h.id}: ${note}`));
+    } else if (formatModelAccessUncheckedNote(report)) {
+      lines.push(muted(`${h.id}: ${formatModelAccessUncheckedNote(report)}`));
+    }
+  }
+  if (!lines.length) {
+    return;
+  }
+  console.log("");
+  for (const line of lines) {
+    console.log(line);
+  }
+}
+
+/**
+ * One line per routed harness whose endpoint was written for another residency
+ * than the account's now: its requests get 403 "region not allowed" until a
+ * re-`on` rewrites it.
+ * @param {Array<{ id: string, residencyCurrent?: boolean | null }>} perHarness
+ * @param {Array<{ id: string, label: string }>} adapters
+ * @param {string} residency
+ */
+function printResidencyMismatchLines(perHarness, adapters, residency) {
+  const labels = new Map(adapters.map((a) => [a.id, a.label]));
+  const host = residencyInferenceHost(residency) || "api.fireworks.ai";
+  for (const h of perHarness) {
+    if (h.residencyCurrent !== false) continue;
+    console.log(warn(
+      `${labels.get(h.id) ?? h.id} isn't set up for your account's data residency, so its requests may be refused `
+      + `with "region not allowed". Run: nexus ${h.id} on (it will use ${host}).`,
     ));
   }
 }

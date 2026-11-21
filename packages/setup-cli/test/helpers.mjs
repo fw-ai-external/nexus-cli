@@ -12,6 +12,7 @@ import { OPENCODE_CONFIG_RELATIVE_PATH } from "../lib/harnesses/opencode/core.mj
 import { CODEX_CONFIG_RELATIVE_PATH } from "../lib/harnesses/codex/core.mjs";
 import { buildServerlessCatalogSnapshot } from "../lib/fireworks/models.mjs";
 import { HARNESSES, HARNESS_ALIASES } from "../lib/harness/id.mjs";
+import { loadNodeSqlite } from "../lib/io/sqlite.mjs";
 import {
   cacheServerlessCatalogSnapshot,
   expireCatalogCache,
@@ -131,12 +132,14 @@ export function defaultTestCatalogApiModels() {
       name: "accounts/fireworks/models/glm-5p1",
       context_length: 1_048_576,
     }),
-    mockServerlessModel({
+    // A `-fast-latest` alias needs its model's fast mode listed: the catalog
+    // leaves out modes an account can't use.
+    ...mockServerlessModelRows({
       name: "accounts/fireworks/models/glm-5p2",
       context_length: 1_048_576,
       aliases: ["accounts/fireworks/routers/glm-fast-latest"],
     }),
-    mockServerlessModel({
+    ...mockServerlessModelRows({
       name: "accounts/fireworks/models/kimi-k3",
       context_length: 1_048_576,
       aliases: [
@@ -203,6 +206,9 @@ export const FIREWORKS_INFERENCE_URL = "https://api.fireworks.ai/inference";
 export const HAS_SQLITE = spawnSync("sqlite3", ["-version"], { encoding: "utf8" }).status === 0;
 export const HAS_NPM = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"], { encoding: "utf8" }).status === 0;
 export const itIfSqlite = HAS_SQLITE ? it : it.skip;
+export async function supportsVscodeSqlite() {
+  return HAS_SQLITE || Boolean(await loadNodeSqlite());
+}
 export const itIfNpm = HAS_NPM ? it : it.skip;
 
 /** Expected OpenCode provider.models entry for a latest router alias. */
@@ -266,6 +272,31 @@ export async function withTempHome(prefix, fn) {
   } finally {
     await removeTempDir(home);
   }
+}
+
+/**
+ * {@link withTempHome}, with `process.env.HOME` pointed at the temp home for the
+ * whole (async) callback, for code that resolves paths from `HOME` itself
+ * (for example the recorded harness residency in the global config).
+ * @template T
+ * @param {string} prefix
+ * @param {(home: string) => T | Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withTempHomeEnv(prefix, fn) {
+  return withTempHome(prefix, async (home) => {
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      return await fn(home);
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+    }
+  });
 }
 
 /**
@@ -338,6 +369,35 @@ export function isolatedChildHome(env = {}) {
   return env.HOME ?? mkdtempSync(path.join(os.tmpdir(), "fc-run-home-"));
 }
 
+export function isolatedProfileEnv(home) {
+  return {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: path.join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: path.join(home, "AppData", "Local"),
+    ProgramW6432: path.join(home, "Program Files"),
+    ProgramFiles: path.join(home, "Program Files"),
+    "ProgramFiles(x86)": path.join(home, "Program Files (x86)"),
+    XDG_CACHE_HOME: path.join(home, ".cache"),
+    XDG_CONFIG_HOME: path.join(home, ".config"),
+    XDG_DATA_HOME: path.join(home, ".local", "share"),
+  };
+}
+
+export async function withIsolatedProfileEnv(home, fn) {
+  const env = isolatedProfileEnv(home);
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 const HARNESS_TOKENS = new Set([...HARNESSES, ...Object.keys(HARNESS_ALIASES)]);
 
 /**
@@ -399,6 +459,7 @@ export function splitAzureKeyArgs(args) {
 
 export function runFireconnect(args, env = {}) {
   return new Promise((resolve, reject) => {
+    const home = isolatedChildHome(env);
     if (args.includes("on")) {
       seedOnCommandCatalog(env.HOME, args);
     }
@@ -406,8 +467,9 @@ export function runFireconnect(args, env = {}) {
       env: {
         ...process.env,
         ...TEST_SECRET_STORE_ENV,
+        ...isolatedProfileEnv(home),
         ...env,
-        HOME: isolatedChildHome(env),
+        HOME: home,
         NEXUS_SECRET_STORE: "memory",
         NEXUS_TEST: "1",
         FIREWORKS_API_KEY: env.FIREWORKS_API_KEY ?? "",
@@ -447,7 +509,7 @@ export async function seedKeychainConfig(home, apiKey) {
   }
 }
 
-export async function runCli(args, { home, env = {}, installGate = false } = {}) {
+export async function runCli(args, { home = isolatedChildHome(), env = {}, installGate = false } = {}) {
   return new Promise((resolve, reject) => {
     if (args.includes("on")) {
       seedOnCommandCatalog(home, args);
@@ -456,6 +518,7 @@ export async function runCli(args, { home, env = {}, installGate = false } = {})
       env: {
         ...process.env,
         ...TEST_SECRET_STORE_ENV,
+        ...isolatedProfileEnv(home),
         ...env,
         HOME: home,
         NEXUS_SECRET_STORE: "memory",
@@ -542,4 +605,35 @@ export async function readClaudeSettings(home) {
 
 export async function readOpencodeConfig(home) {
   return JSON.parse(await readFile(path.join(home, OPENCODE_CONFIG_RELATIVE_PATH), "utf8"));
+}
+
+/**
+ * Environment for tests that run a real `pwsh`: no telemetry, update check or
+ * banner, which add to every start.
+ */
+export const POWERSHELL_TEST_ENV = Object.freeze({
+  POWERSHELL_TELEMETRY_OPTOUT: "1",
+  POWERSHELL_UPDATECHECK: "Off",
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1",
+  DOTNET_NOLOGO: "1",
+});
+
+/**
+ * Start `pwsh` once with a generous limit, so its cold start (first-run setup
+ * on a fresh CI runner can take well over 10 seconds) isn't charged to a timed
+ * call in the test that follows. It runs in a temp home with the same isolated
+ * profile dirs as other spawned tests (XDG on Linux and macOS, APPDATA and
+ * LOCALAPPDATA on Windows), so first-run setup never writes to the real home. A missing or failing `pwsh` is left for the tests themselves to report
+ * or skip.
+ * @param {string} [executable]
+ * @returns {Promise<void>}
+ */
+export async function warmPowerShell(executable = process.env.NEXUS_TEST_PWSH || "pwsh") {
+  await withTempHome("pwsh-warmup", async (home) => {
+    spawnSync(executable, ["-NoProfile", "-NonInteractive", "-Command", "exit 0"], {
+      env: { ...process.env, ...POWERSHELL_TEST_ENV, ...isolatedProfileEnv(home) },
+      timeout: 120_000,
+      stdio: "ignore",
+    });
+  });
 }

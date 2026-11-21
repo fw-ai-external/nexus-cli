@@ -378,11 +378,6 @@ const macMasterPasswordCache = new Map();
  */
 const MAC_KEYCHAIN_TIMEOUT_MS = 120_000;
 
-/** Test seam: clear cached macOS Safe Storage master passwords. */
-export function resetMacMasterPasswordCacheForTests() {
-  macMasterPasswordCache.clear();
-}
-
 /**
  * Read the Safe Storage master password from the macOS login keychain.
  * @param {"stable" | "insiders" | "cursor"} [variant]
@@ -592,27 +587,6 @@ function runPowerShell(script) {
 }
 
 /**
- * DPAPI-protect a raw byte buffer (buffer-based to preserve binary data).
- * The previous string-based round-trip corrupted 32-byte keys because it
- * routed raw bytes through a UTF-8 string (yielding 45 bytes for a 32-byte
- * key with high-bit bytes). This function never touches a text encoding.
- * @param {Buffer} buf
- * @returns {Buffer} DPAPI-protected bytes (empty on failure).
- */
-function windowsProtectBuffer(buf) {
-  const b64 = buf.toString("base64");
-  const script = [
-    "$ErrorActionPreference='Stop'",
-    "Add-Type -AssemblyName System.Security",
-    `$bytes=[Convert]::FromBase64String('${b64}')`,
-    "$enc=[System.Security.Cryptography.ProtectedData]::Protect($bytes,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)",
-    "[Convert]::ToBase64String($enc)",
-  ].join(";");
-  const out = runPowerShell(script);
-  return out ? Buffer.from(out, "base64") : Buffer.alloc(0);
-}
-
-/**
  * DPAPI-unprotect a raw byte buffer (buffer-based to preserve binary data).
  * Returns the exact bytes DPAPI produces — no UTF-8 conversion — so 32-byte
  * AES-256 keys survive the round-trip.
@@ -630,17 +604,6 @@ function windowsUnprotectBuffer(blob) {
   ].join(";");
   const out = runPowerShell(script);
   return out ? Buffer.from(out, "base64") : Buffer.alloc(0);
-}
-
-/** @param {string} plaintext @returns {Buffer} DPAPI-protected bytes (empty on failure). */
-function windowsProtect(plaintext) {
-  return windowsProtectBuffer(Buffer.from(plaintext, "utf8"));
-}
-
-/** @param {Buffer} blob @returns {string} the decrypted plaintext (empty on failure). */
-function windowsUnprotect(blob) {
-  const buf = windowsUnprotectBuffer(blob);
-  return buf.length > 0 ? buf.toString("utf8") : "";
 }
 
 /* -------------------------------------------------------------------------- */

@@ -32,7 +32,7 @@ import { isAnthropicShapedKey } from "../firerouter/core.mjs";
 import { HARNESS } from "../harness/id.mjs";
 import { readJsonIfExists } from "../io/json.mjs";
 import { isFireworksShapedKey } from "../keys/key-type.mjs";
-import { opencodeConfigPath, opencodeCurrentModelId, opencodeProviderStatus, readRawIfExists } from "../harnesses/opencode/core.mjs";
+import { opencodeConfigPath, opencodeProviderStatus, readRawIfExists } from "../harnesses/opencode/core.mjs";
 import {
   codexConfigPath,
   codexProviderStatus,

@@ -32,7 +32,7 @@ export async function planLimitsCatalogToAuto(apiKey, { timeoutMs = 0 } = {}) {
   try {
     const gatewayUrl = process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL;
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
-    const verified = await verifyFireworksApiKey(apiKey, { gatewayUrl, timeoutMs });
+    const verified = await verifyFireworksApiKey(apiKey, { gatewayUrl, timeoutMs, quiet: true });
     const accountId = String(verified?.accountId ?? "").trim().replace(/^accounts\//, "");
     if (!verified?.ok || !accountId) {
       return verified?.ok || isDefiniteRefusal(verified?.status) ? false : null;

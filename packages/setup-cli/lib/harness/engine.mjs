@@ -8,6 +8,15 @@ import {
 } from "../cli/messages.mjs";
 import { assertNotFirerouterModelId, canonicalRequestedModelId } from "../fireworks/model-id.mjs";
 import { assertRequestedModelServable } from "../fireworks/model-servability.mjs";
+import {
+  blockedConfiguredModels,
+  hasCachedCatalog,
+  modelAccessReport,
+  offerModelAccessSwitch,
+  pickReplacementModel,
+} from "../fireworks/model-access.mjs";
+import { loadServerlessCatalog } from "../fireworks/models.mjs";
+import { getServerlessCatalogSnapshot } from "../fireworks/serverless-catalog-cache.mjs";
 import { resolveAzureBaseUrl, resolveAzureOnApiKey } from "../fireworks/azure-core.mjs";
 import { assertResolvedKeyNotRejected } from "../keys/api-key.mjs";
 import {
@@ -22,6 +31,7 @@ import {
 } from "../config/global-config.mjs";
 import { autoHarnessSupported, nexusProvidersHeaders } from "../config/auto-providers.mjs";
 import { reconcileShellEnvHook } from "../io/shell-env-hook.mjs";
+import { resolveHarnessResidency } from "../fireworks/residency.mjs";
 import { ensureHomeForHarness } from "./context.mjs";
 import { defineHarness } from "./types.mjs";
 import { buildFireconnectTelemetryHeaders } from "../telemetry/request-headers.mjs";
@@ -56,6 +66,8 @@ import { buildFireconnectTelemetryHeaders } from "../telemetry/request-headers.m
  * @property {(ctx: import("./types.mjs").HarnessContext, paths: object) => Promise<string>} [getExistingHarnessKey]
  * @property {(ctx: import("./types.mjs").HarnessContext, paths: object) => Promise<{ apiKeyRef?: string, effectiveKey: string, reusedExistingKey?: boolean }>} [resolveOnKey]
  *   Custom `on` key resolution (default: resolveHarnessOnApiKey with keyEnvRef + getExistingHarnessKey).
+ * @property {(ctx: import("./types.mjs").HarnessContext) => Promise<Array<{ slot: string, model: string }>>} [configuredModels]
+ *   See HarnessAdapter.configuredModels.
  * @property {(modelId: string) => boolean} [servedOutsideCatalog]  `--model` ids this harness
  *   serves that the serverless catalog never lists (Codex's sign-in GPT models); they skip
  *   the catalog check.
@@ -65,11 +77,12 @@ import { buildFireconnectTelemetryHeaders } from "../telemetry/request-headers.m
  *   Full success-output override (default: connected + restartHint).
  * @property {(modelId: string) => string} [displayModelId]  How the model list after
  *   `printConnected` names a model (Codex prints its FireRouter route as `firerouter`).
- * @property {() => void} [restartHint]
+ * @property {(args: { ctx: object, paths: object, result: object }) => void} [restartHint]
+ *   Paths let a hint name what is still running the old setup (Hermes's gateway).
  * @property {(args: { ctx: object, paths: object, wasEnabled: boolean }) => Promise<"restored"|"stripped"|"unchanged">} [disable]
  * @property {(ctx: object) => Promise<void>} [prepareOff]  Stop the IDE before writing (Cursor/VS Code).
  * @property {boolean} [envHookOff]  Set false to skip the shell env-hook removal on `off` (Cursor/VS Code).
- * @property {(outcome: string) => void} [restartHintOff]
+ * @property {(outcome: string, args: { ctx: object, paths: object }) => void} [restartHintOff]
  * Command overrides — when omitted, the engine's generic implementation is used
  * (except `status`, which is always harness-specific and required):
  * @property {(ctx: import("./types.mjs").HarnessContext) => Promise<void>} status
@@ -78,6 +91,8 @@ import { buildFireconnectTelemetryHeaders } from "../telemetry/request-headers.m
  * @property {(ctx: import("./types.mjs").HarnessContext) => Promise<void>} [usage]
  * @property {(ctx: import("./types.mjs").HarnessContext) => Promise<string | object | null>} [keyInUse]
  *   See HarnessAdapter.keyInUse.
+ * @property {(ctx: import("./types.mjs").HarnessContext) => Promise<boolean>} [ownsRouting]
+ *   See HarnessAdapter.ownsRouting.
  */
 
 /**
@@ -105,8 +120,14 @@ export async function engineOn(profile, ctx) {
 
   const paths = profile.paths(ctx);
   const { apiKeyRef = "", effectiveKey, reusedExistingKey = false } = await resolveOnKey(profile, ctx, paths);
+  // Inference URLs written below use the account's regional endpoint when it
+  // has data residency; the gateway refuses the global one for it.
+  const residencyState = await resolveHarnessResidency(effectiveKey, profile.id, ctx.home, {
+    onNote: (line) => { if (!ctx.quiet) printNote(line); },
+  });
 
-  const modelId = canonicalRequestedModelId(ctx.main);
+  const modelId = canonicalRequestedModelId(ctx.main)
+    || await offerAllowedModelForBlockedSelection(profile, ctx, effectiveKey);
   let byokHeaders = {};
   if (profile.firerouter?.byok === "value") {
     // Re-reading the harness's own headers keeps a provider key added by hand.
@@ -138,7 +159,7 @@ export async function engineOn(profile, ctx) {
       : {},
   });
 
-  await setHarnessEnabled(ctx.home, profile.id, true, "fireworks");
+  await setHarnessEnabled(ctx.home, profile.id, true, "fireworks", residencyState);
   if (profile.envHookOn) {
     await profile.envHookOn(ctx, effectiveKey);
   }
@@ -156,10 +177,11 @@ export async function engineOn(profile, ctx) {
   }
 
   const modelsAdded = result.modelsAdded ?? [result.model];
+  const restartHint = () => profile.restartHint({ ctx, paths, result });
   if (profile.printConnected) {
     await profile.printConnected({ ctx, paths, result, reusedExistingKey });
     const displayModelId = profile.displayModelId ?? ((model) => model);
-    printHarnessOnFootnotes(modelsAdded.map(displayModelId), [], profile.restartHint, {
+    printHarnessOnFootnotes(modelsAdded.map(displayModelId), [], restartHint, {
       primaryModel: displayModelId(result.model),
     });
     return;
@@ -168,7 +190,115 @@ export async function engineOn(profile, ctx) {
     label: profile.label,
     model: result.model,
     modelsAdded,
-    restartHint: profile.restartHint,
+    restartHint,
+  });
+}
+
+/**
+ * A plain re-`on` (no `--model`) keeps the harness's current model. When the
+ * account's served catalog no longer lists that model (its organization's
+ * Model Access policy blocks it, say), tell the user and, at a terminal, ask
+ * whether to switch to an allowed one. Returns the model to select instead,
+ * or "" to keep the current one. Settings are never switched without a yes.
+ *
+ * Picker lists aren't asked about: `on` already reconciles them with the
+ * served catalog. With no cached catalog yet, offline, or with only a stale
+ * or other account's catalog, nothing is compared. Never throws.
+ * @param {HarnessProfile} profile
+ * @param {import("./types.mjs").HarnessContext} ctx
+ * @param {string} apiKey
+ * @returns {Promise<string>}
+ */
+export async function offerAllowedModelForBlockedSelection(profile, ctx, apiKey) {
+  if (typeof profile.configuredModels !== "function") {
+    return "";
+  }
+  try {
+    const configured = (await profile.configuredModels(ctx)).filter((entry) => entry.slot !== "picker");
+    if (!configured.length) {
+      return "";
+    }
+    const { catalog, entries } = await servedCatalogForOn(apiKey);
+    const blocked = blockedConfiguredModels(configured, catalog, {
+      servedOutsideCatalog: profile.servedOutsideCatalog,
+    });
+    if (!blocked.length) {
+      return "";
+    }
+    const replacement = pickReplacementModel(entries, { exclude: blocked.map(({ model }) => model) });
+    const agreed = await offerModelAccessSwitch({ ctx, harnessCommand: profile.id, blocked, replacement });
+    return agreed ? replacement : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * This account's served catalog for `on`'s Model Access checks: `catalog`
+ * (with the `auto` row every served catalog gains) for membership, and
+ * `entries`, the rows the API returned, to pick a replacement from. Empty
+ * when it can't be had: nothing cached yet (a first `on`, or offline, where
+ * the check must add no wait), a failed or stale load, or another account's
+ * copy. Bounded by the cached-catalog budget; never throws. The one rule for
+ * every harness's `on`.
+ * @param {string} apiKey
+ * @returns {Promise<{ catalog: Array<object>, entries: Array<object> }>}
+ */
+export async function servedCatalogForOn(apiKey) {
+  const none = { catalog: [], entries: [] };
+  if (!apiKey || !hasCachedCatalog()) {
+    return none;
+  }
+  try {
+    const { catalog, source } = await loadServerlessCatalog({ apiKey, bounded: true });
+    if (source === "stale") {
+      return none;
+    }
+    return { catalog, entries: getServerlessCatalogSnapshot()?.entries ?? [] };
+  } catch {
+    return none;
+  }
+}
+
+/**
+ * The model-access part of a harness's status: its configured models compared
+ * with the catalog cached under the harness's home, but only when that cache
+ * belongs to the key the harness sends (otherwise `checked: false`). The key
+ * comes from `keyInUse` (never prompts); a harness that fetches the key from
+ * Nexus per request, or reads it from the environment, sends
+ * `FIREWORKS_API_KEY` when it is set, else `activeKey` when the caller already
+ * holds it. Cache only, never throws (see `modelAccessReport`).
+ * @param {string | { configuredModels?: HarnessProfile["configuredModels"], servedOutsideCatalog?: (modelId: string) => boolean, keyInUse?: (ctx: object) => Promise<unknown> }} target
+ *   a harness id or adapter
+ * @param {import("./types.mjs").HarnessContext} ctx
+ * @param {{ activeKey?: string }} [options]
+ * @returns {Promise<import("../fireworks/model-access.mjs").ModelAccessReport>}
+ */
+export async function harnessModelAccess(target, ctx, { activeKey = "" } = {}) {
+  let adapter = target;
+  let configured = [];
+  let apiKey = "";
+  try {
+    if (typeof target === "string") {
+      adapter = (await import("./registry.mjs")).getHarness(target);
+    }
+    configured = typeof adapter?.configuredModels === "function" ? await adapter.configuredModels(ctx) : [];
+    // `modelAccessKeyInUse` replaces `keyInUse` where reading the key could
+    // touch a secret store (status must stay prompt-free).
+    const readKey = adapter?.modelAccessKeyInUse ?? adapter?.keyInUse;
+    const inUse = typeof readKey === "function" ? await readKey.call(adapter, ctx) : null;
+    // A string is the literal key; LIVE_KEY or null means the key is fetched
+    // or read from the environment at request time.
+    apiKey = typeof inUse === "string" && inUse !== ""
+      ? inUse
+      : process.env.FIREWORKS_API_KEY?.trim() || activeKey || "";
+  } catch {
+    // Unreadable config: report what could be read.
+  }
+  return modelAccessReport(configured, {
+    servedOutsideCatalog: adapter?.servedOutsideCatalog,
+    home: ctx?.home,
+    apiKey,
   });
 }
 
@@ -254,8 +384,12 @@ async function resolveOnKey(profile, ctx, paths) {
  * Named for the real condition rather than the flag: `isHarnessEnabled` reads
  * the flag, this reads the config, and the gap between them is the whole point.
  *
- * @param {{ id: string, providerStatus?: (ctx: object) => Promise<string> }} target
- *   a harness profile or adapter; both expose `id` and optional `providerStatus`.
+ * A harness whose own provider looks the same as Nexus's (OpenCode's built-in
+ * Fireworks provider) also defines `ownsRouting`: routing counts only when
+ * Nexus wrote it, so `off` and `uninstall` never remove the user's own setup.
+ *
+ * @param {{ id: string, providerStatus?: (ctx: object) => Promise<string>, ownsRouting?: (ctx: object) => Promise<boolean> }} target
+ *   a harness profile or adapter; both expose `id` and optional `providerStatus` / `ownsRouting`.
  * @param {import("./types.mjs").HarnessContext} ctx
  * @returns {Promise<boolean>}
  */
@@ -263,7 +397,10 @@ export async function isHarnessRouted(target, ctx) {
   if (typeof target.providerStatus === "function") {
     try {
       const provider = await target.providerStatus(ctx);
-      return provider === "fireworks" || provider === "azure";
+      if (provider !== "fireworks" && provider !== "azure") {
+        return false;
+      }
+      return typeof target.ownsRouting === "function" ? await target.ownsRouting(ctx) : true;
     } catch {
       // Config unreadable (e.g. IDE DB locked): fall back to the flag below.
     }
@@ -308,7 +445,7 @@ export async function engineOff(profile, ctx) {
       printHarnessUnchanged(profile.id);
     }
     if (profile.restartHintOff) {
-      profile.restartHintOff(outcome);
+      profile.restartHintOff(outcome, { ctx, paths });
     }
   }
   return outcome;
@@ -370,7 +507,10 @@ export function defineHarnessProfile(profile) {
     off: profile.off ?? ((ctx) => engineOff(profile, ctx)),
     status: profile.status,
     ...(profile.providerStatus ? { providerStatus: profile.providerStatus } : {}),
+    ...(profile.ownsRouting ? { ownsRouting: profile.ownsRouting } : {}),
     ...(profile.keyInUse ? { keyInUse: profile.keyInUse } : {}),
+    ...(profile.configuredModels ? { configuredModels: profile.configuredModels } : {}),
+    ...(profile.servedOutsideCatalog ? { servedOutsideCatalog: profile.servedOutsideCatalog } : {}),
     ...(profile.usage ? { usage: profile.usage } : {}),
     ...(profile.live ? { live: profile.live } : {}),
     ...(profile.resolveOnContext ? { resolveOnContext: profile.resolveOnContext } : {}),

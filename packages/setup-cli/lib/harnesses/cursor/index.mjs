@@ -5,13 +5,13 @@ import {
 } from "../../cli/messages.mjs";
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
 import {
   loadRegisterableModels,
 } from "../../fireworks/models.mjs";
 import { isFireworksKey } from "../../keys/key-type.mjs";
 import {
-  CURSOR_FIREWORKS_BASE_URL,
   CURSOR_DEFAULT_MODE,
   CURSOR_FIREWORKS_ONLY_NOTE,
   ensureCursorStopped,
@@ -25,7 +25,7 @@ import {
   relocateLegacyCursorBackups,
 } from "./core.mjs";
 import { DEFAULT_AZURE_MODEL } from "../../fireworks/azure-core.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import {
   cursorPathsFor,
   ensureHomeForHarness,
@@ -50,9 +50,26 @@ async function cursorResolveKey(ctx) {
   return isFireworksKey(openAIKey) ? openAIKey.trim() : "";
 }
 
+/** The Fireworks models Cursor selects while routed (see HarnessAdapter.configuredModels). */
+async function cursorConfiguredModels(ctx) {
+  const { blob, openAIKey } = await readCursorState(cursorPathsFor(ctx).dbPath, { keychain: false });
+  if (cursorProviderStatus(blob, openAIKey) !== "fireworks") {
+    return [];
+  }
+  const registered = fireconnectRegisteredModels(blob);
+  // Cursor's own models share the selection: only a Nexus-registered pick is ours.
+  const current = cursorCurrentModelId(blob, CURSOR_DEFAULT_MODE);
+  return [
+    // `nexus/auto` is matched as `auto` by the shared catalog check.
+    ...(current && registered.includes(current) ? [{ slot: "main", model: current }] : []),
+    ...registered.map((model) => ({ slot: "picker", model })),
+  ];
+}
+
 export default defineHarnessProfile({
   id: HARNESS.CURSOR,
   label: "Cursor",
+  configuredModels: cursorConfiguredModels,
   resolveKey: cursorResolveKey,
   keyEnvRef: "${FIREWORKS_API_KEY}",
   getExistingHarnessKey: cursorResolveKey,
@@ -216,6 +233,8 @@ export default defineHarnessProfile({
       },
     };
 
+    payload.modelAccess = await harnessModelAccess(HARNESS.CURSOR, ctx);
+
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
       return;
@@ -229,5 +248,6 @@ export default defineHarnessProfile({
       registeredModels: registered,
       keySource: harnessStatusKeySource(HARNESS.CURSOR, provider, { whenFireworks: false }),
     });
+    printModelAccessNote(HARNESS.CURSOR, payload.modelAccess);
   },
 });

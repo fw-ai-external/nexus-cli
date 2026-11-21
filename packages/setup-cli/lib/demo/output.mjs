@@ -12,9 +12,54 @@
  *   {out}/compare.html          self-contained comparison page (also file://-openable)
  */
 
-import { mkdir, writeFile, readdir, readFile, stat } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { writeFileAtomic } from "../io/atomic-write.mjs";
 import { writeJson } from "../io/json.mjs";
+
+function unsafeOutput() {
+  return new Error("Unsafe demo output: symlinks and special files are not allowed.");
+}
+
+async function outputEntry(filePath) {
+  try {
+    return await lstat(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export async function assertOutputDirectory(dir, outDir = dir) {
+  const resolved = path.resolve(dir);
+  const root = path.resolve(outDir);
+  const relative = path.relative(root, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw unsafeOutput();
+  if (resolved !== root) await assertOutputDirectory(path.dirname(resolved), root);
+  const entry = await outputEntry(resolved);
+  if (entry && !entry.isDirectory()) throw unsafeOutput();
+}
+
+async function assertOutputFile(filePath, outDir = path.dirname(filePath)) {
+  await assertOutputDirectory(path.dirname(filePath), outDir);
+  const entry = await outputEntry(filePath);
+  if (entry && !entry.isFile()) throw unsafeOutput();
+}
+
+async function assertOutputTree(dir, outDir = dir) {
+  await assertOutputDirectory(dir, outDir);
+  if (!await outputEntry(dir)) return;
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) await assertOutputTree(full, outDir);
+    else await assertOutputFile(full, outDir);
+  }
+}
+
+async function writeOutputFile(filePath, data, outDir = path.dirname(filePath)) {
+  await assertOutputFile(filePath, outDir);
+  await writeFileAtomic(filePath, data);
+}
 
 /**
  * @param {string} outDir
@@ -27,29 +72,34 @@ import { writeJson } from "../io/json.mjs";
  * @returns {Promise<{ outDir: string, incumbentDir: string, fireworksDir: string }>}
  */
 export async function prepareOutputDir(outDir, header) {
+  await assertOutputTree(outDir);
   const incumbentDir = path.join(outDir, "incumbent");
   const fireworksDir = path.join(outDir, "fireworks");
+  await assertOutputDirectory(incumbentDir, outDir);
+  await assertOutputDirectory(fireworksDir, outDir);
   await mkdir(incumbentDir, { recursive: true });
   await mkdir(fireworksDir, { recursive: true });
-  await writeFile(path.join(outDir, "prompt.txt"), header.prompt.text, "utf8");
+  await writeOutputFile(path.join(outDir, "prompt.txt"), header.prompt.text);
   return { outDir, incumbentDir, fireworksDir };
 }
 
 /**
  * @param {string} dir
  * @param {{ t: number, text: string }[]} tokenLog
+ * @param {string} [outDir]
  */
-export async function writeStreamLog(dir, tokenLog) {
+export async function writeStreamLog(dir, tokenLog, outDir = dir) {
   const lines = tokenLog.map((entry) => JSON.stringify(entry)).join("\n");
-  await writeFile(path.join(dir, "stream.log"), `${lines}\n`, "utf8");
+  await writeOutputFile(path.join(dir, "stream.log"), `${lines}\n`, outDir);
 }
 
 /**
  * @param {string} dir
  * @param {string} html
+ * @param {string} [outDir]
  */
-export async function writeAppHtml(dir, html) {
-  await writeFile(path.join(dir, "app.html"), html, "utf8");
+export async function writeAppHtml(dir, html, outDir = dir) {
+  await writeOutputFile(path.join(dir, "app.html"), html, outDir);
 }
 
 /**
@@ -58,6 +108,8 @@ export async function writeAppHtml(dir, html) {
  * @param {{ incumbent: object, fireworks: object }} rates
  */
 export async function writeResultJson(outDir, result, rates) {
+  await assertOutputFile(path.join(outDir, "result.json"));
+  await assertOutputFile(path.join(outDir, "rates.json"));
   // Atomic (temp + rename) via writeJson, so a Ctrl-C / crash mid-write can't
   // leave a truncated result.json or rates.json for readers to parse.
   await writeJson(path.join(outDir, "result.json"), result);
@@ -69,7 +121,24 @@ export async function writeResultJson(outDir, result, rates) {
  * @param {string} html
  */
 export async function writeCompareHtml(outDir, html) {
-  await writeFile(path.join(outDir, "compare.html"), html, "utf8");
+  await writeOutputFile(path.join(outDir, "compare.html"), html);
+}
+
+/** Preserve scratch artifacts without following existing output links. */
+export async function collectWorkDir(cwd, outDir, side) {
+  if (!cwd) return;
+  try {
+    if ((await readdir(cwd)).length === 0) return;
+  } catch {
+    return;
+  }
+  const dest = path.join(outDir, "work", side);
+  try {
+    await assertOutputTree(dest, outDir);
+    await rm(dest, { recursive: true, force: true });
+    await mkdir(path.dirname(dest), { recursive: true });
+    await cp(cwd, dest, { recursive: true, force: true });
+  } catch { /* artifacts are a nicety; never break the run over them */ }
 }
 
 /**

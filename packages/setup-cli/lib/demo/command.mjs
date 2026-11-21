@@ -5,7 +5,7 @@
 
 import process from "node:process";
 import path from "node:path";
-import { cp, lstat, mkdir, mkdtemp, rm, readdir, stat } from "node:fs/promises";
+import { lstat, mkdtemp, rm, readdir, stat } from "node:fs/promises";
 import os from "node:os";
 
 import { HARNESS } from "../harness/id.mjs";
@@ -14,7 +14,7 @@ import { extractHtml, looksRunnable } from "./html-extract.mjs";
 import { buildResult, formatSpeedRatio, formatUsd, formatSeconds } from "./measurement.mjs";
 import {
   prepareOutputDir, writeStreamLog, writeAppHtml, writeResultJson, writeCompareHtml,
-  readBestHtmlFromDir,
+  readBestHtmlFromDir, assertOutputDirectory, collectWorkDir,
 } from "./output.mjs";
 import { SplitPaneRenderer, isTtyCapable } from "./tui.mjs";
 import { confirmYesNo, pressAnyKeyToExit } from "./key-prompt.mjs";
@@ -105,6 +105,7 @@ export async function findStaleDemoTmp(tmpRoot = os.tmpdir()) {
  */
 export async function runDemoClean(ctx, { tmpRoot = os.tmpdir() } = {}) {
   const outDir = path.resolve(ctx.out || DEFAULT_OUT_DIR);
+  await assertOutputDirectory(outDir);
   const removed = [];
 
   if (await isDemoOutputDir(outDir)) {
@@ -361,12 +362,12 @@ export async function runDemoCommand(ctx) {
     incumbent: result.incumbent.rates,
     fireworks: result.fireworks.rates,
   });
-  await writeAppHtml(dirs.incumbentDir, incumbentAppHtml);
-  await writeAppHtml(dirs.fireworksDir, fireworksAppHtml);
+  await writeAppHtml(dirs.incumbentDir, incumbentAppHtml, outDir);
+  await writeAppHtml(dirs.fireworksDir, fireworksAppHtml, outDir);
   // Token logs come straight off each side's result object — no module-level
   // stash, so a second run in the same process can't cross-contaminate logs.
-  await writeStreamLog(dirs.incumbentDir, incResult?.tokenLog ?? []);
-  await writeStreamLog(dirs.fireworksDir, fwResult?.tokenLog ?? []);
+  await writeStreamLog(dirs.incumbentDir, incResult?.tokenLog ?? [], outDir);
+  await writeStreamLog(dirs.fireworksDir, fwResult?.tokenLog ?? [], outDir);
 
   // ── State 4: verdict ──────────────────────────────────────────────────────
   if (useTui) {
@@ -448,34 +449,6 @@ export async function runDemoCommand(ctx) {
     });
     try { server.close(); } catch { /* noop */ }
   }
-}
-
-/**
- * Copy whatever a side wrote in its isolated tmp cwd into <out>/work/<side> so
- * the artifacts survive the run for inspection. Best-effort: a failure here must
- * never fail the demo, since the comparison itself is already complete.
- * @param {string} cwd  the side's tmp working dir
- * @param {string} outDir
- * @param {string} side "incumbent" | "fireworks"
- */
-async function collectWorkDir(cwd, outDir, side) {
-  if (!cwd) {
-    return;
-  }
-  try {
-    // A model that returns the file as text (rather than calling Write) leaves
-    // an empty scratch dir — don't litter the output with empty work/ folders.
-    const entries = await readdir(cwd);
-    if (entries.length === 0) {
-      return;
-    }
-    const dest = path.join(outDir, "work", side);
-    // Clear any previous run's artifacts first: cp overwrites but never deletes,
-    // so leftovers would mix into this run's work dir and read as its output.
-    await rm(dest, { recursive: true, force: true });
-    await mkdir(path.dirname(dest), { recursive: true });
-    await cp(cwd, dest, { recursive: true, force: true });
-  } catch { /* artifacts are a nicety; never break the run over them */ }
 }
 
 function makeSideProto(side, modelId, rates) {

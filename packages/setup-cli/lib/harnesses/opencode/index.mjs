@@ -1,8 +1,8 @@
 import { printOpenCodeRestartHint } from "../../cli/messages.mjs";
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
-import process from "node:process";
 import { defaultMainModel } from "../../fireworks/model-id.mjs";
 import { readJsonIfExists } from "../../io/json.mjs";
 import {
@@ -13,6 +13,8 @@ import {
   effectiveOpencodeApiKey,
   enableOpencodeAzure,
   enableOpencodeFireworks,
+  hasNexusOpencodeProvider,
+  opencodeBackupPath,
   opencodeCurrentModelId,
   opencodeAuthKeyMode,
   opencodeProviderStatus,
@@ -26,7 +28,7 @@ import {
   loadRegisterableModels,
 } from "../../fireworks/models.mjs";
 import { isFireworksKey } from "../../keys/key-type.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import {
   ensureHomeForHarness,
   opencodePathsFor,
@@ -64,6 +66,17 @@ function opencodeAzureStoredBaseUrl(config) {
   return config.provider?.[OPENCODE_AZURE_PROVIDER_ID]?.options?.baseURL ?? "";
 }
 
+/** The model OpenCode selects while routed through Fireworks (see HarnessAdapter.configuredModels). */
+async function opencodeConfiguredModels(ctx) {
+  const { configPath } = opencodePathsFor(ctx);
+  const config = await readJsonIfExists(configPath);
+  if (opencodeProviderStatus(config) !== "fireworks") {
+    return [];
+  }
+  const model = opencodeCurrentModelId(config);
+  return model ? [{ slot: "main", model }] : [];
+}
+
 /**
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
  * @param {{ baseUrl: string, apiKey: string }} configured
@@ -71,6 +84,7 @@ function opencodeAzureStoredBaseUrl(config) {
 export default defineHarnessProfile({
   id: HARNESS.OPENCODE,
   label: "OpenCode",
+  configuredModels: opencodeConfiguredModels,
   resolveKey: opencodeResolveKey,
   paths: (ctx) => opencodePathsFor(ctx),
   keyEnvRef: OPENCODE_API_KEY_ENV_REF,
@@ -145,6 +159,21 @@ export default defineHarnessProfile({
     const config = await readJsonIfExists(configPath);
     return opencodeProviderStatus(config);
   },
+  async ownsRouting(ctx) {
+    ensureHomeForHarness(ctx, HARNESS.OPENCODE);
+    const { configPath, dataDir } = opencodePathsFor(ctx);
+    let backup;
+    try {
+      backup = await readJsonIfExists(opencodeBackupPath(dataDir, configPath));
+    } catch {
+      // Only Nexus writes the backup file, so an unreadable one still marks the routing as Nexus's.
+      return true;
+    }
+    if (backup.snapshot !== undefined) {
+      return true;
+    }
+    return hasNexusOpencodeProvider(await readJsonIfExists(configPath));
+  },
 
   async keyInUse(ctx) {
     ensureHomeForHarness(ctx, HARNESS.OPENCODE);
@@ -182,6 +211,8 @@ export default defineHarnessProfile({
       current: { main: model },
     };
 
+    payload.modelAccess = await harnessModelAccess(HARNESS.OPENCODE, ctx);
+
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
       return;
@@ -195,6 +226,7 @@ export default defineHarnessProfile({
       endpoint: provider === "azure" ? payload.baseUrl : null,
       keySource: harnessStatusKeySource(HARNESS.OPENCODE, provider),
     });
+    printModelAccessNote(HARNESS.OPENCODE, payload.modelAccess);
   },
 
 });

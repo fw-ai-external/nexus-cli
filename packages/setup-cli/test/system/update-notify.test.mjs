@@ -1,8 +1,12 @@
-import { mkdtemp, mkdir, writeFile, readFile, utimes } from "node:fs/promises";
+import fs from "node:fs";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, utimes } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import os from "node:os";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { withTempHome } from "../helpers.mjs";
 import {
   shouldSpawnChecker,
   hasActiveUpdateLock,
@@ -79,6 +83,30 @@ describe("shouldSpawnChecker", () => {
   });
 });
 
+describe("update-checker.mjs", () => {
+  it("backs off after a failed check when a version is already cached", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-update-checker-"));
+    try {
+      await mkdir(path.join(home, ".nexus"), { recursive: true });
+      const cachePath = path.join(home, ".nexus", "update-check.json");
+      await writeFile(cachePath, JSON.stringify({ checkedAt: Date.now() - DAY - 1000, latestVersion: "0.3.0" }));
+      const checkerUrl = new URL("../../lib/system/update-checker.mjs", import.meta.url).href;
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        globalThis.fetch = async () => { throw new Error("offline"); };
+        await import(${JSON.stringify(checkerUrl)});
+      `], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 10000 });
+      assert.equal(result.status, 0, result.stderr);
+
+      const cache = JSON.parse(await readFile(cachePath, "utf8"));
+      assert.equal(cache.latestVersion, "0.3.0");
+      assert.equal(shouldSpawnChecker(cache, Date.now()), false, "the next run must not start another checker");
+      assert.equal(shouldSpawnChecker(cache, Date.now() + HOUR), true, "it retries after the failure interval");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("tryAcquireUpdateLock", () => {
   it("prevents concurrent workers without touching the version cache", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-update-notify-"));
@@ -113,6 +141,61 @@ describe("tryAcquireUpdateLock", () => {
     assert.equal(hasActiveUpdateLock(home), false);
     assert.equal(tryAcquireUpdateLock(home), true);
   });
+
+  // Run one acquisition and, just before its k-th lock-file call, run a whole
+  // second acquisition: another `nexus` invocation landing at that point.
+  function acquireWithSecondAt(home, k, now) {
+    const names = ["statSync", "unlinkSync", "openSync", "renameSync", "linkSync"];
+    const originals = Object.fromEntries(names.map((name) => [name, fs[name]]));
+    let calls = 0;
+    let second = null;
+    let nested = false;
+    for (const name of names) {
+      fs[name] = (...args) => {
+        if (!nested && second === null && calls++ === k) {
+          nested = true;
+          try {
+            second = tryAcquireUpdateLock(home, now);
+          } finally {
+            nested = false;
+          }
+        }
+        return originals[name](...args);
+      };
+    }
+    syncBuiltinESMExports();
+    try {
+      return { first: tryAcquireUpdateLock(home, now), second };
+    } finally {
+      Object.assign(fs, originals);
+      syncBuiltinESMExports();
+    }
+  }
+
+  for (const start of ["no lock", "a stale lock"]) {
+    it(`two racing invocations never both hold it, starting from ${start}`, async () => {
+      for (let k = 0; ; k += 1) {
+        const home = await mkdtemp(path.join(os.tmpdir(), "fc-update-notify-"));
+        const dir = path.join(home, ".nexus");
+        await mkdir(dir, { recursive: true });
+        const now = Date.now();
+        if (start === "a stale lock") {
+          const lockPath = path.join(dir, "update-check.lock");
+          await writeFile(lockPath, "");
+          const stale = new Date(now - FIVE_MIN - 1000);
+          await utimes(lockPath, stale, stale);
+        }
+        const { first, second } = acquireWithSecondAt(home, k, now);
+        if (second === null) break;
+        assert.equal(
+          Number(first) + Number(second),
+          1,
+          `second invocation at lock call ${k}: first=${first} second=${second}`,
+        );
+        assert.deepEqual(await readdir(dir), ["update-check.lock"]);
+      }
+    });
+  }
 });
 
 describe("shouldPromptUpgrade / snooze", () => {
@@ -234,6 +317,16 @@ describe("promptAndMaybeUpgrade", () => {
 });
 
 describe("checkForUpdates prompt path", () => {
+  it("ignores malformed cached version metadata without prompting or throwing", async () => {
+    await withTempHome("invalid-update-cache-", async (home) => {
+      await mkdir(path.join(home, ".nexus/cli/.git"), { recursive: true });
+      await writeFile(path.join(home, ".nexus/update-check.json"), JSON.stringify({ checkedAt: Date.now(), latestVersion: "9.9.9\nexample" }));
+      await checkForUpdates("help", home, {
+        environment: { HOME: home }, input: { isTTY: true }, output: { isTTY: true }, stdout: { isTTY: true },
+        prompt: async () => assert.fail("must not prompt for malformed metadata"),
+      });
+    });
+  });
   it("prompts on TTY git installs and skips the tip while snoozed", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-check-updates-"));
     await mkdir(path.join(home, ".nexus/cli/.git"), { recursive: true });

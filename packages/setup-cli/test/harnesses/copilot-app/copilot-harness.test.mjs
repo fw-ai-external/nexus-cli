@@ -1,4 +1,5 @@
 import { mkdtemp } from "node:fs/promises";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,7 @@ import {
   resolveCopilotModelId,
 } from "../../../lib/harnesses/copilot-shared.mjs";
 import { copilotDataDbPath } from "../../../lib/harnesses/copilot-app/sqlite.mjs";
+import { createCopilotDb } from "../../fixtures/copilot-db.mjs";
 import {
   copilotCliSelectionId,
   deselectCopilotCliModel,
@@ -248,21 +250,48 @@ describeIf(HAS_SQLITE, "copilot enable/disable (core)", () => {
     });
   });
 
-  itIfSqlite("enable works on a fresh DB with no tables (never-launched app)", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "fc-copilot-fresh-"));
-    const dbPath = path.join(dir, "data.db");
-    try {
-      const { providerId } = await enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY, modelId: "glm-5p2" });
-      assert.match(providerId, /^fc-/);
-      assert.equal(await copilotProviderStatus(dbPath), "fireworks");
+  it("rejects a never-launched app without creating its directory or database", async () => {
+    await withTempHome("copilot-missing-", async (home) => {
+      const dbPath = path.join(home, ".copilot", "data.db");
+      await assert.rejects(enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY }),
+        /Open GitHub Copilot once .* and retry `nexus copilot-app on`/);
+      assert.equal(await disableCopilotFireworks({ dbPath }), "none");
+      assert.equal(await copilotProviderStatus(dbPath), "none");
+      assert.equal(existsSync(path.dirname(dbPath)), false);
+    });
+  });
 
-      // The row holds the API key in a header, so a DB we created ourselves
-      // must not be left world-readable by the process umask.
-      const { statSync } = await import("node:fs");
-      assert.equal(statSync(dbPath).mode & 0o077, 0, "data.db must be owner-only");
-    } finally {
-      await (await import("node:fs/promises")).rm(dir, { recursive: true, force: true });
-    }
+  for (const missing of ["all", "accounts", "model_providers", "provider_models"]) {
+    itIfSqlite(`rejects missing ${missing} tables without changing the database`, async () => {
+      await withTempHome("copilot-schema-", async (home) => {
+        const dbPath = path.join(home, "data.db");
+        createCopilotDb(dbPath);
+        readSql(dbPath, missing === "all"
+          ? "DROP TABLE provider_models; DROP TABLE model_providers; DROP TABLE accounts;"
+          : `DROP TABLE ${missing};`);
+        const before = readFileSync(dbPath);
+        const mode = statSync(dbPath).mode;
+        await assert.rejects(enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY }),
+          /Open GitHub Copilot once/);
+        assert.deepEqual(readFileSync(dbPath), before);
+        assert.equal(statSync(dbPath).mode, mode);
+        assert.deepEqual(readdirSync(home), ["data.db"]);
+      });
+    });
+  }
+
+  itIfSqlite("rolls back provider writes when registering a model fails", async () => {
+    await withCopilotDb(async (dbPath) => {
+      await enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY });
+      readSql(dbPath, "CREATE TRIGGER reject_model BEFORE INSERT ON provider_models BEGIN SELECT RAISE(ABORT, 'model rejected'); END;");
+      const before = readFileSync(dbPath);
+      const providers = listProviders(dbPath);
+      const models = readSql(dbPath, "SELECT * FROM provider_models ORDER BY id;");
+      await assert.rejects(enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY, modelId: "example-model" }), /model rejected/);
+      assert.equal(listProviders(dbPath), providers);
+      assert.equal(readSql(dbPath, "SELECT * FROM provider_models ORDER BY id;"), models);
+      assert.deepEqual(readFileSync(dbPath), before);
+    });
   });
 
   itIfSqlite("keeps previously registered models when the catalog is unavailable", async () => {
@@ -440,7 +469,8 @@ describe("copilot-app CLI config (providers.json)", () => {
     assert.deepEqual(written.models.map((m) => m.id).sort(), ["glm-5p2", "m1"]);
     const ours = written.models.find((m) => m.id === "glm-5p2");
     assert.equal(ours.provider, "fireworks");
-    assert.equal(ours.capabilities.supports.reasoningEffort, true);
+    assert.deepEqual(ours.capabilities.supports.reasoning_effort, ["low", "medium", "high"]);
+    assert.equal(Object.hasOwn(ours.capabilities.supports, "reasoningEffort"), false);
     // glm-5p2 is not in the verified-vision set, so no vision is claimed.
     assert.equal(ours.capabilities.supports.vision, undefined);
     assert.equal(ours.capabilities.limits, undefined);
@@ -509,6 +539,22 @@ describe("copilot-app CLI", () => {
     });
   });
 
+  it("on fails with first-launch guidance; off and status leave a missing DB absent", async () => {
+    await withTempHome("copilot-first-launch-", async (home) => {
+      const dbPath = path.join(home, ".copilot", "data.db");
+      const on = await runCli(["copilot-app", "on", "--db-path", dbPath, "--force"], { home });
+      assert.equal(on.code, 1);
+      assert.match(on.stderr, /Open GitHub Copilot once .* and retry `nexus copilot-app on`/);
+      assert.equal(existsSync(path.join(home, ".nexus", "config.json")), false);
+      const off = await runCli(["copilot-app", "off", "--db-path", dbPath, "--force"], { home });
+      assert.equal(off.code, 0, off.stderr);
+      const status = await runCliJson(["copilot-app", "status", "--db-path", dbPath, "--json"], { home });
+      assert.equal(status.json.provider, "none");
+      assert.equal(status.json.enabled, false);
+      assert.equal(existsSync(path.dirname(dbPath)), false);
+    });
+  });
+
   itIfSqlite("on then off round-trips the provider rows", async () => {
     await withTempHome("copilot-cli-", async (home) => {
       const dbPath = copilotDataDbPath({ home });
@@ -525,6 +571,9 @@ describe("copilot-app CLI", () => {
       assert.match(on.stdout, /Copilot app → Fireworks/);
       assert.equal(await copilotProviderStatus(dbPath), "fireworks");
       assert.ok(listProviders(dbPath).split("\n").some((id) => id.startsWith("fc-")));
+      if (process.platform !== "win32") {
+        assert.equal(statSync(dbPath).mode & 0o077, 0);
+      }
 
       const { json: payload } = await runCliJson(["copilot-app", "status", "--json", "--db-path", dbPath], { home });
       assert.equal(payload.provider, "fireworks");
@@ -563,6 +612,7 @@ describe("migrateCopilotAppFirerouterOnUpgrade", () => {
       const { insertCopilotProviderModel } = await import("../../../lib/harnesses/copilot-app/sqlite.mjs");
       const { migrateCopilotAppFirerouterOnUpgrade } = await import("../../../lib/harnesses/copilot-app/upgrade-migrations.mjs");
       const dbPath = copilotAppPathsFor({ home }).dbPath;
+      createCopilotDb(dbPath);
       const { providerId } = await enableCopilotFireworks({ dbPath, apiKey: FW_OPENCODE_KEY, modelId: "glm-5p2" });
       await insertCopilotProviderModel(dbPath, {
         providerId,

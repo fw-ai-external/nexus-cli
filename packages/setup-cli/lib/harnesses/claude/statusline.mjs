@@ -1,7 +1,7 @@
 /**
  * Claude Code status line: the Fireworks model actually being routed (plus the
- * applied FireRouter routing level when a firerouter slot is active), plus a
- * cost computed from Fireworks rates.
+ * applied FireRouter routing level when a firerouter slot is active), the last
+ * call's generated-token rate, plus a cost computed from Fireworks rates.
  *
  * Claude Code's own `cost.total_cost_usd` prices every call against Anthropic's
  * list, so on a Fireworks gateway it reports a number the user is never billed.
@@ -18,6 +18,8 @@ import { fileURLToPath } from "node:url";
 
 import { shellQuote } from "../../cli/path.mjs";
 import { preferDataDirPath } from "../../system/data-dir.mjs";
+import { stableNodeExec } from "../../system/node-exec.mjs";
+import { keyExpiresSoon, readMintedKeyState } from "../../keys/mint-api-key.mjs";
 import {
   appendLatestRouterSuffix,
   lookupModelSpec,
@@ -38,8 +40,10 @@ import {
 } from "../../fireworks/model-id.mjs";
 import { autoDisplayName, firerouterDisplayName, prettyModelName } from "../../fireworks/models.mjs";
 import { stripViaFireworksSuffix } from "../../fireworks/label-suffix.mjs";
+import { LOGO_CELLS_STATUS_LINE, besideLogo } from "../../ui/brand-logo.mjs";
 import { truecolor } from "../../ui/palette.mjs";
-import { DATA_COLORS } from "../../ui/tokens.mjs";
+import { terminalTheme } from "../../ui/color.mjs";
+import { CLI_COLORS, DATA_COLORS } from "../../ui/tokens.mjs";
 import { UNPRICED_TEXT, addUsage } from "./usage/cost.mjs";
 import {
   formatUsageCost,
@@ -68,15 +72,15 @@ const STATUSLINE_MARKER = "bin/claude-statusline.mjs";
  * (same reason apiKeyHelper embeds it — see fireconnectExportCommand).
  */
 export function claudeStatusLineCommand() {
-  return `${shellQuote(process.execPath)} ${shellQuote(statusLineScript())}`;
+  return `${shellQuote(stableNodeExec(process.execPath))} ${shellQuote(statusLineScript())}`;
 }
 
 /**
  * The `statusLine` block Nexus writes into settings.json.
  *
- * No `refreshInterval`: the cost only changes when a call completes, and Claude
- * Code already re-runs the command on every assistant message. A timer would
- * re-read the transcript for an unchanged number.
+ * No `refreshInterval`: cost and the last call's rate only change when a call
+ * completes, and Claude Code already re-runs the command on every assistant
+ * message. A timer would re-read the transcript for unchanged numbers.
  */
 export function claudeStatusLineSettings() {
   return { type: "command", command: claudeStatusLineCommand() };
@@ -93,7 +97,7 @@ export function isFireconnectStatusLine(statusLine) {
     return false;
   }
   const command = /** @type {{ command?: unknown }} */ (statusLine).command;
-  return typeof command === "string" && command.includes(STATUSLINE_MARKER);
+  return typeof command === "string" && command.replaceAll("\\", "/").includes(STATUSLINE_MARKER);
 }
 
 /**
@@ -134,10 +138,12 @@ export function stripClaudeStatusLine(settings) {
 }
 
 // Raw ANSI escapes (stdout is a pipe, not a TTY). Every SGR must end with `m`.
+const BRAND_HEX = (CLI_COLORS[terminalTheme()] ?? CLI_COLORS.dark).primary;
 const COLOR = process.env.NO_COLOR ? null : {
   bold: "\x1b[1m",
   primary: "\x1b[39m",
   secondary: "\x1b[2m\x1b[39m",
+  accent: truecolor(BRAND_HEX),
   reset: "\x1b[0m",
 };
 
@@ -158,6 +164,77 @@ const SERIES_COLORS = Object.freeze([
 /** @param {keyof typeof COLOR} name @param {string} text */
 function paint(name, text) {
   return COLOR ? `${COLOR[name]}${text}${COLOR.reset}` : String(text);
+}
+
+/** Blend `hex` toward `toward` (both #RRGGBB); amount is 0..1. */
+function blendHex(hex, toward, amount) {
+  const parse = (value) => Number.parseInt(value.slice(1), 16);
+  const [from, to] = [parse(hex), parse(toward)];
+  const channel = (shift) => Math.round(
+    (((from >> shift) & 255) * (1 - amount)) + (((to >> shift) & 255) * amount),
+  );
+  return `#${[16, 8, 0].map((shift) => channel(shift).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * Rate intensity rises with speed: brand, bold brand, then bold and brighter
+ * (lighter on a dark terminal, darker on a light one). The number is always
+ * readable; faster responses gain contrast.
+ */
+const RATE_TIERS = COLOR ? (() => {
+  const theme = terminalTheme();
+  const bright = blendHex(BRAND_HEX, theme === "light" ? "#000000" : "#FFFFFF", 0.35);
+  return [
+    { below: 500, sgr: truecolor(BRAND_HEX) },
+    { below: 1_000, sgr: `\x1b[1m${truecolor(BRAND_HEX)}` },
+    { below: Number.POSITIVE_INFINITY, sgr: `\x1b[1m${truecolor(bright)}` },
+  ];
+})() : null;
+
+/** Paint a rate with the tier for its speed; plain text without color. */
+function rateTier(tps) {
+  // Tier on the displayed magnitude, so a 99.6 that reads "100" is not faint.
+  const magnitude = tps >= 10 ? Math.round(tps) : tps;
+  return RATE_TIERS?.find((entry) => magnitude < entry.below) ?? RATE_TIERS?.at(-1);
+}
+
+function paintRate(tps, text) {
+  const tier = rateTier(tps);
+  return tier ? `${tier.sgr}${text}${COLOR.reset}` : String(text);
+}
+
+/**
+ * Five full-height cells, each shaded by how much of it is filled. Partial
+ * block glyphs left the rest of their cell blank, which read as a gap; shade
+ * density keeps the bar continuous and thick.
+ */
+const RATE_BAR_WIDTH = 5;
+const RATE_BAR_MAX = 2_000;
+const RATE_SHADES = ["▒", "▓", "█"];
+
+function rateBar(tps) {
+  // Square root, not linear: most real rates sit in the hundreds, and a linear
+  // scale left them as a sliver. Full still means RATE_BAR_MAX.
+  const ratio = Math.min(1, Math.max(0, tps / RATE_BAR_MAX));
+  const filled = Math.sqrt(ratio) * RATE_BAR_WIDTH;
+  let filledText = "";
+  let emptyCount = 0;
+  for (let cell = 0; cell < RATE_BAR_WIDTH; cell += 1) {
+    const level = Math.min(1, Math.max(0, filled - cell));
+    if (level <= 0) {
+      emptyCount += 1;
+      continue;
+    }
+    const shade = RATE_SHADES[
+      Math.min(RATE_SHADES.length - 1, Math.floor(level * RATE_SHADES.length))
+    ];
+    filledText += shade;
+  }
+  const tier = rateTier(tps);
+  const empty = "░".repeat(emptyCount);
+  return tier
+    ? `${tier.sgr}${filledText}${COLOR.reset}${paint("secondary", empty)}`
+    : `${filledText}${empty}`;
 }
 
 /** A mark in a series hue: bar segment or swatch, never prose. */
@@ -185,7 +262,10 @@ function joinParts(parts) {
  */
 const BAR_MARK = "━";
 
-const ROUTED_MODEL_LABEL = "routed model:";
+// Multiple rightwards arrows: the slot routed this turn to one of several
+// models, rather than pinning one directly. Lone glyph so the status line's
+// width goes to the model name.
+const ROUTED_MODEL_MARK = "⇉";
 
 /**
  * Stacked bar by spend share (not call count). Width only — no in-bar labels.
@@ -288,7 +368,7 @@ async function isFile(filePath) {
  * Fireworks-accurate usage for the session (parent + subagents).
  * @param {string} transcriptPath
  * @param {{ home?: string }} [opts]
- * @returns {Promise<{ cost: number, estimated: boolean, lastModel: string, models: Array<{ label: string, share: number, calls: number, cost: number }>, cachePct: string } | null>}
+ * @returns {Promise<{ cost: number, estimated: boolean, lastModel: string, tps: number | null, models: Array<{ label: string, share: number, calls: number, cost: number }>, cachePct: string } | null>}
  */
 export async function claudeStatusLineUsage(transcriptPath, { home = process.env.HOME ?? "" } = {}) {
   const target = String(transcriptPath ?? "").trim();
@@ -296,7 +376,7 @@ export async function claudeStatusLineUsage(transcriptPath, { home = process.env
     return null;
   }
   const { readClaudeUsage } = await import("./usage/report.mjs");
-  const report = await readClaudeUsage({ home, session: target });
+  const report = await readClaudeUsage({ home, session: target, includeTiming: true });
   const lastModel = report.currentTurnModel ?? report.rows.at(-1)?.model ?? "";
   const allRows = [
     ...report.rows,
@@ -353,6 +433,9 @@ export async function claudeStatusLineUsage(transcriptPath, { home = process.env
     cost: report.grandTotals.cost,
     estimated: report.estimated,
     lastModel,
+    // The parent transcript's own last call: subagent logs carry their own
+    // timing, but the line describes what the user just watched complete.
+    tps: typeof report.lastCallDecodeTps === "number" ? report.lastCallDecodeTps : null,
     models,
     cachePct: formatUsageCachePct(report.grandTotals),
   };
@@ -361,7 +444,69 @@ export async function claudeStatusLineUsage(transcriptPath, { home = process.env
 const MODEL_BAR_WIDTH = 16;
 
 /**
- * Build the two-line status line from Claude Code's stdin payload.
+ * The last call's generated-token rate as status-line text, or "" when
+ * unmeasured.
+ *
+ * Compact magnitudes at 1k/1M keep the segment a stable width, so a rate
+ * crossing 999 -> 1000 does not shift everything after it. One decimal below
+ * 10 so a slow model still reads as a rate rather than rounding to 0. Empty
+ * (not "0 tok/s") when the transcript had no timing: the line omits figures it
+ * cannot measure rather than making one up.
+ * @param {number | null | undefined} tps
+ * @returns {string}
+ */
+export function formatTokensPerSecond(tps) {
+  if (typeof tps !== "number" || !Number.isFinite(tps) || !(tps > 0)) {
+    return "";
+  }
+  const shown = tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10;
+  if (shown >= 1_000_000) {
+    return `${(shown / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (shown >= 1_000) {
+    return `${(shown / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return shown > 0 ? String(shown) : "";
+}
+
+/** "5h", "45m": the time left on a key in its last day. */
+function formatTimeLeft(ms) {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000));
+  return minutes < 60 ? `${minutes}m` : `${Math.ceil(minutes / 60)}h`;
+}
+
+/**
+ * A warning for the key browser sign-in stored on this machine: in its last
+ * day "key expires in 5h · run nexus login", after it "key expired · run nexus
+ * login". Claude Code sends that key to Fireworks as is, and Fireworks only
+ * says a rejected key is invalid, so this is where users learn what to do.
+ * Reads the local sign-in record only (no keychain, no network); storing any
+ * other key clears that record. Unlike `nexus status`, it can't check the
+ * record's fingerprint against the key in use, because reading that key could
+ * prompt the keychain on every turn. So it skips a record with no fingerprint
+ * (written before fingerprints existed), which may describe a key this machine
+ * no longer uses. "" otherwise, and on any error.
+ * @param {string} home
+ * @param {number} [now]
+ * @returns {Promise<string>}
+ */
+export async function claudeStatusLineKeyExpiry(home, now = Date.now()) {
+  try {
+    const minted = home ? await readMintedKeyState(home) : null;
+    const expiresAt = minted?.keyFingerprint ? minted.expiresAt : "";
+    if (!expiresAt || !keyExpiresSoon(expiresAt, now)) {
+      return "";
+    }
+    const left = Date.parse(expiresAt) - now;
+    const text = left > 0 ? `key expires in ${formatTimeLeft(left)}` : "key expired";
+    return `${paint("accent", `⚠ ${text}`)} ${paint("secondary", "· run")} ${paint("primary", "nexus login")}`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Build the two-row status line from Claude Code's stdin payload.
  * @param {{
  *   model?: { id?: string, display_name?: string },
  *   transcript_path?: string,
@@ -441,13 +586,23 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
     ? labels[currentIndex]
     : ownLabel && labels.includes(compactModelLabel(ownLabel)) ? ownLabel : compactModelLabel(ownLabel);
   const routedModel = bar && isRouter && routedLabel && (multi || currentIndex === -1)
-    ? `${paint("secondary", ROUTED_MODEL_LABEL)} ${paint("primary", routedLabel)}`
+    ? `${paint("accent", ROUTED_MODEL_MARK)} ${paint("primary", routedLabel)}`
     : "";
+  const rate = formatTokensPerSecond(usage?.tps);
+  // Gauge, then value: the bar shows relative speed at a glance, the number
+  // supplies the measurement, and both gain contrast as the rate rises.
+  const tps = rate
+    ? `${rateBar(usage.tps)} ${paintRate(usage.tps, rate)} ${paint("primary", "TPS")}`
+    : "";
+  const keyExpiry = await claudeStatusLineKeyExpiry(home);
   const line1 = joinParts([
+    // First, so a narrow terminal never cuts it off.
+    keyExpiry,
     bar || paint("secondary", slotLabel),
     usage && (usage.cost == null
       ? paint("secondary", `cost ${UNPRICED_TEXT}`)
       : `${usage.estimated ? "~" : ""}${COLOR ? COLOR.bold : ""}${paint("primary", formatUsageCost(usage.cost))}`),
+    tps,
     routedModel,
   ]);
 
@@ -461,5 +616,24 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
   }) ?? [];
   const line2 = joinParts(legend);
 
-  return [line1, line2].filter(Boolean).join("\n");
+  return withStatusLineLogo([line1, line2].filter(Boolean)).join("\n");
+}
+
+/**
+ * Prefix the status line's two rows with the Fireworks symbol: two rows of
+ * Braille cell art in the logo gradient, so the line keeps its height. It uses
+ * the status-line mark (smaller, with an empty bottom dot row) because users
+ * see it all the time.
+ *
+ * Claude Code strips inline-image escapes from status lines, so cell art is the
+ * only way to draw the mark here. Skipped without color (bare dots read as
+ * noise).
+ * @param {string[]} lines
+ * @returns {string[]}
+ */
+export function withStatusLineLogo(lines) {
+  if (!COLOR) {
+    return lines;
+  }
+  return besideLogo(lines, { gap: " ", cells: LOGO_CELLS_STATUS_LINE });
 }

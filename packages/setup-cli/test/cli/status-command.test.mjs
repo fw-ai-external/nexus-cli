@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { HARNESSES } from "../../lib/harness/id.mjs";
 import { runCli, runCliJson, seedKeychainConfig, withTempHome, writeClaudeSettings } from "../helpers.mjs";
+import { writeMintedKeyState } from "../../lib/keys/mint-api-key.mjs";
 
 const VALID_KEY = "fw_status_test_key_0000000000000000";
 const REJECTED_KEY = "fw_status_rejected_key_0000000000";
@@ -59,6 +60,7 @@ describe("fireconnect status", () => {
       // The storage report renders regardless of auth state.
       assert.match(result.stdout, /Config ref:/);
       assert.match(result.stdout, /Harnesses:/);
+      assert.doesNotMatch(result.stdout, /FIREWORKS_API_KEY/);
     });
   });
 
@@ -70,6 +72,9 @@ describe("fireconnect status", () => {
       });
       assert.equal(result.code, 1);
       assert.match(result.stdout, /Not signed in/);
+      // Explains why the exported key didn't count, without echoing it.
+      assert.match(result.stdout, /FIREWORKS_API_KEY.*is set in your shell but Nexus ignores it/);
+      assert.doesNotMatch(result.stdout, new RegExp(VALID_KEY));
     });
   });
 
@@ -97,6 +102,8 @@ describe("fireconnect status", () => {
       // FIREWORKS_API_KEY sitting in the environment.
       assert.match(result.stdout, new RegExp(`Signed in as ${EMAIL}`));
       assert.match(result.stdout, /Active key: stored credential/);
+      // With a key stored, the env var is noise: no field, no note.
+      assert.doesNotMatch(result.stdout, /FIREWORKS_API_KEY/);
     });
   });
 
@@ -146,6 +153,67 @@ describe("fireconnect status", () => {
       assert.equal(summary.activeKeySource, "stored");
       assert.equal(summary.keychainPresent, true);
       assert.ok(Array.isArray(summary.perHarness));
+    });
+  });
+
+  it("shows when a browser sign-in's key expires, and warns in its last day", async () => {
+    await withTempHome("status-expiry-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      const day = 86_400_000;
+      const record = (expiresAt, apiKey = VALID_KEY) => writeMintedKeyState(home, {
+        keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-cli-host", apiKey, expiresAt,
+      });
+
+      const far = new Date(Date.now() + 60 * day).toISOString();
+      await record(far);
+      let result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.match(result.stdout, new RegExp(`Key expires:\\s+${far.slice(0, 10)} \\(in (59|60) days\\)`));
+      assert.doesNotMatch(result.stdout, /Run nexus login to replace it/);
+      assert.equal((await runCliJson(["status", "--json"], { home, env: gatewayEnv })).json.keyExpiresAt, far);
+
+      // A key with days left (a fresh 7-day key) gets no warning.
+      const days = new Date(Date.now() + 3 * day).toISOString();
+      await record(days);
+      result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.match(result.stdout, new RegExp(`Key expires:\\s+${days.slice(0, 10)} \\(in (3|4) days\\)`));
+      assert.doesNotMatch(result.stdout, /Run nexus login to replace it/);
+
+      const soon = new Date(Date.now() + day / 2).toISOString();
+      await record(soon);
+      result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.match(result.stdout, new RegExp(`This machine's API key expires on ${soon.slice(0, 10)}\\. Run nexus login to replace it\\.`));
+
+      // A record for some other key says nothing about this one.
+      await record(soon, "fw_some_other_key_000000000000000");
+      result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.doesNotMatch(result.stdout, /Key expires/);
+      assert.equal((await runCliJson(["status", "--json"], { home, env: gatewayEnv })).json.keyExpiresAt, null);
+    });
+  });
+
+  it("never shows a past expiry as still valid", async () => {
+    await withTempHome("status-past-expiry-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      const past = new Date(Date.now() - 86_400_000).toISOString();
+      await writeMintedKeyState(home, {
+        keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-cli-host", apiKey: VALID_KEY, expiresAt: past,
+      });
+      const result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.match(result.stdout, new RegExp(`Key expires:\\s+${past.slice(0, 10)} \\(expired\\)`));
+      assert.doesNotMatch(result.stdout, /in 0 days/);
+    });
+  });
+
+  it("names an expired key as expired and points at nexus login", async () => {
+    await withTempHome("status-expired-", async (home) => {
+      await seedKeychainConfig(home, REJECTED_KEY);
+      const expired = new Date(Date.now() - 86_400_000).toISOString();
+      await writeMintedKeyState(home, {
+        keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-cli-host", apiKey: REJECTED_KEY, expiresAt: expired,
+      });
+      const result = await runCli(["status"], { home, env: gatewayEnv });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, new RegExp(`This machine's API key expired on ${expired.slice(0, 10)}\\. Run nexus login to sign in again\\.`));
     });
   });
 

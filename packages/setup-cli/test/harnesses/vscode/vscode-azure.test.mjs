@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { fireconnectSecretId, findFireconnectProvider, buildAzureModelEntry } from "../../../lib/harnesses/vscode/core.mjs";
+import { fireconnectSecretId, findFireconnectProvider } from "../../../lib/harnesses/vscode/core.mjs";
 import { lookupAzureFoundryModelLimits } from "../../../lib/fireworks/azure-core.mjs";
 import { runCli as baseRunCli, runCliJson, splitAzureKeyArgs, withTempHome, itIfSqlite } from "../../helpers.mjs";
 import { writeGlobalConfig } from "../../../lib/config/global-config.mjs";

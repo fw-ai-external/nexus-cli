@@ -141,9 +141,64 @@ export function serverlessLineup(entries, catalog) {
     models,
     modelMap: {
       models: Object.fromEntries(modelMapEntries),
-      families: { ...DEFAULT_MODEL_MAP.families },
+      families: servedFamilies(entries),
       labels: { ...DEFAULT_MODEL_MAP.labels },
     },
   };
 }
 
+/**
+ * Whether the served catalog lists `route`. The `auto` mix is always served.
+ * @param {string} route
+ * @param {Array<{ shortId?: string }>} entries
+ */
+function isServedRoute(route, entries) {
+  return route === AUTO_MODEL_ID || (entries ?? []).some((e) => e?.shortId === route);
+}
+
+/**
+ * Family fallbacks (any `claude-*-sonnet-*` name, say) that only route to
+ * served models: a family whose curated target the account's catalog
+ * doesn't list goes to `auto`.
+ * @param {Array<{ shortId?: string }>} entries
+ */
+export function servedFamilies(entries) {
+  return Object.fromEntries(Object.entries(DEFAULT_MODEL_MAP.families)
+    .map(([family, route]) => [family, isServedRoute(route, entries) ? route : AUTO_MODEL_ID]));
+}
+
+/**
+ * The curated line-up for when the full one can't be built (no signed
+ * catalog, or no served catalog at all), cut down to what the served catalog
+ * lists: a route it doesn't list is never offered, and every name still maps
+ * somewhere served. With no catalog (cold cache, offline) that is `auto`
+ * alone, never the whole curated list.
+ * @param {Array<{ shortId?: string }>} entries
+ */
+export function servedStaticLineup(entries) {
+  return {
+    models: PICKER_MODELS.filter((m) => isServedRoute(m.route, entries)),
+    modelMap: {
+      models: Object.fromEntries(Object.entries(DEFAULT_MODEL_MAP.models)
+        .map(([name, route]) => [name, isServedRoute(route, entries) ? route : AUTO_MODEL_ID])),
+      families: servedFamilies(entries),
+      labels: { ...DEFAULT_MODEL_MAP.labels },
+    },
+  };
+}
+
+
+/**
+ * Whether Desktop's picker should list a model added with `on --model`: only
+ * while the served catalog lists it (any catalog row with that short id).
+ * With no catalog to go by, every saved model stays listed. A saved model
+ * the catalog drops is kept on disk and listed again once the account can
+ * use it; its route stays mapped so a turn already pointed at it gets the
+ * gateway's own answer instead of quietly going to another model.
+ * @param {{ shortId?: string }} custom
+ * @param {Array<{ shortId?: string }>} entries
+ */
+export function isCustomModelOffered(custom, entries) {
+  if (!entries?.length) return true;
+  return entries.some((e) => e?.shortId === custom?.shortId);
+}

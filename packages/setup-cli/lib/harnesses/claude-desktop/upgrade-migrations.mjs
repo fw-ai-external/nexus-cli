@@ -10,9 +10,17 @@ import { DATA_DIRNAME, retargetLegacyPath } from "../../system/data-dir.mjs";
 import { claudeDesktopDataDir } from "./core.mjs";
 import { thirdPartyDir } from "./lineup.mjs";
 import {
-  LEGACY_SHIM_AGENT_LABEL, SHIM_AGENT_LABEL, launchAgentPlistPath, startLaunchAgent, startShimService, stopLaunchAgent,
+  LEGACY_SHIM_AGENT_LABEL, SHIM_AGENT_LABEL, launchAgentPlistPath, stableNodeExec, startLaunchAgent, startShimService, stopLaunchAgent,
 } from "./platform.mjs";
-import { egressHosts, readProfileState, shimPlistPath, shimServicePath, shimStatePath } from "./profile-lane.mjs";
+import { egressHosts, readProfileState, refreshClaudeDesktopGatewayKey, shimPlistPath, shimServicePath, shimStatePath } from "./profile-lane.mjs";
+import { tryReadKeychainSecret } from "../../keys/api-key.mjs";
+
+export async function migrateClaudeDesktopCredentialOnUpgrade(home) {
+  const state = await readProfileState(home);
+  if (!state?.enabled) return false;
+  const fireworksKey = await tryReadKeychainSecret(home);
+  return refreshClaudeDesktopGatewayKey({ home, fireworksKey });
+}
 
 /**
  * @param {string} file
@@ -179,6 +187,15 @@ export async function restartClaudeDesktopShimOnUpgrade(home, {
   const servicePath = platform === "linux" ? shimServicePath(home) : shimPlistPath(home);
   if (!existsSync(servicePath)) {
     return false;
+  }
+  if (platform === "darwin") {
+    const raw = await readFile(servicePath, "utf8");
+    const next = raw.replace(/(<key>ProgramArguments<\/key>\s*<array>\s*<string>)([^<]*)(<\/string>)/u, (match, before, encoded, after) => {
+      const node = encoded.replace(/&(amp|lt|gt|quot|apos);/gu, (_, entity) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" })[entity]);
+      if (stableNodeExec(node) === node) return match;
+      return before + encoded.replace(/\/Cellar\/([^/]+)\/[^/]+\/bin\/node$/u, "/opt/$1/bin/node") + after;
+    });
+    if (next !== raw) await writeFileAtomic(servicePath, next);
   }
   await start(servicePath, { allowSystemChanges: true, label: SHIM_AGENT_LABEL, platform });
   return true;

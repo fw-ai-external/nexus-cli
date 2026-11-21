@@ -1,7 +1,8 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   defaultMainModel,
@@ -58,6 +59,7 @@ import {
   readItemTableValue,
   writeItemTableValue,
 } from "./vscdb-sqlite.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 /**
  * VS Code Chat's custom language models live in `chatLanguageModels.json` (a
@@ -114,7 +116,21 @@ export function chatLanguageModelsPath({ home = "", vscodePath = "" } = {}) {
   // and the keychain service always target the same variant (stable vs
   // Insiders). Falls back to the stable "Code" folder when no install is found.
   const folder = detectVscodeInstall()?.folder || "Code";
+  return vscodeProfileModelsPath(home, folder);
+}
+
+function vscodeProfileModelsPath(home, folder) {
   return path.join(appUserDataDir(home || process.env.HOME || "", folder), "User", "chatLanguageModels.json");
+}
+
+function vscodeProfilePaths(vscodePath, home) {
+  const paths = [path.resolve(vscodePath)];
+  if (home) {
+    for (const folder of ["Code", "Code - Insiders"]) {
+      paths.push(path.resolve(vscodeProfileModelsPath(home, folder)));
+    }
+  }
+  return [...new Set(paths)];
 }
 
 /**
@@ -179,10 +195,16 @@ function parseChatLanguageModelsRaw(raw, filePath) {
  * @returns {Promise<object[]>}
  */
 export async function readChatLanguageModels(filePath) {
-  if (!filePath || !existsSync(filePath)) {
+  if (!filePath) {
     return [];
   }
-  const raw = await readFile(filePath, "utf8");
+  let raw;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
   return parseChatLanguageModelsRaw(raw, filePath);
 }
 
@@ -288,7 +310,7 @@ export function vscodeAzureProviderStatus(arr) {
   const first = (provider.models ?? [])[0];
   if (first
     && typeof first.url === "string"
-    && first.url !== VSCODE_FIREWORKS_MODEL_URL) {
+    && !isFireworksInferenceUrl(first.url, VSCODE_FIREWORKS_MODEL_URL)) {
     return "azure";
   }
   return "none";
@@ -380,7 +402,7 @@ export function buildModelEntry(modelId) {
       : isAutoModelId(modelId)
         ? autoDisplayName(modelId)
         : prettyModelName(modelId),
-    url: VSCODE_FIREWORKS_MODEL_URL,
+    url: fireworksInferenceUrl(VSCODE_FIREWORKS_MODEL_URL, activeAccountResidency("vscode")),
     ...resolveModelDisplayMetadata(modelId),
   };
 }
@@ -599,9 +621,8 @@ export async function relocateLegacyVscodeBackups({ home, dataDir }) {
  */
 export async function writeVscodeBackup(dataDir, filePath, snapshot) {
   const backupPath = vscodeBackupPath(dataDir, filePath);
-  await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
-  await writeJson(backupPath, { filePath: path.resolve(filePath), snapshot });
-  await chmod(backupPath, 0o600);
+  ensurePrivateParent(backupPath);
+  await writeJson(backupPath, { filePath: path.resolve(filePath), snapshot }, { mode: 0o600 });
 }
 
 /** @param {string} dataDir @param {string} filePath @returns {Promise<void>} */
@@ -857,10 +878,36 @@ export function computeVscodeModels(existing, resolvedModel, catalogModelIds = [
  * restore the file byte-for-byte and delete the nexus secrets from
  * `state.vscdb`; otherwise strip only the fireconnect-owned provider + secrets.
  *
- * @param {{ vscodePath: string, dataDir: string, wasEnabled?: boolean, stateDbPath?: string }} opts
+ * @param {{ vscodePath: string, dataDir: string, wasEnabled?: boolean, stateDbPath?: string, home?: string }} opts
  * @returns {Promise<"restored" | "stripped" | "none">}
  */
-export async function disableVscodeFireworks({
+export async function disableVscodeFireworks({ home, ...options }) {
+  const [primary, ...others] = vscodeProfilePaths(options.vscodePath, home);
+  let outcome = await disableVscodeProfile({ ...options, vscodePath: primary });
+  for (const vscodePath of others) {
+    const result = await disableVscodeProfile({ vscodePath, dataDir: options.dataDir });
+    if (result === "restored" || outcome === "none") outcome = result;
+  }
+  return outcome;
+}
+
+export async function vscodeProfilesNeedRestore({ home, vscodePath, dataDir }) {
+  for (const profilePath of vscodeProfilePaths(vscodePath, home)) {
+    try {
+      const backup = await readVscodeBackup(dataDir, profilePath);
+      if (backup.snapshot !== undefined || findFireconnectProvider(await readChatLanguageModels(profilePath))) {
+        return true;
+      }
+    } catch {
+      // Retry in the restore phase so an unreadable profile cannot veto
+      // other harnesses' restores or allow uninstall to delete its backup.
+      return true;
+    }
+  }
+  return false;
+}
+
+async function disableVscodeProfile({
   vscodePath,
   dataDir,
   wasEnabled = false,
