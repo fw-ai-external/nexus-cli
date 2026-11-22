@@ -10,6 +10,7 @@ import { reasoningConfigFor } from "../../fireworks/reasoning.mjs";
 import { autoDisplayName, buildServerlessCatalogSnapshot, firerouterDisplayName, prettyModelName } from "../../fireworks/models.mjs";
 import {
   AUTO_MODEL_ID,
+  NEXUS_AUTO_MODEL_ID,
   FIREROUTER_MODEL_ID,
   FIREROUTER_ROUTER_ID,
   canonicalAutoModelId,
@@ -56,6 +57,21 @@ export const CODEX_CONSTANT_FIELDS = {
   supports_search_tool: true,
 };
 
+// Windows-only additions to CODEX_CONSTANT_FIELDS. Codex's native patch tool
+// edits files without going through the Windows shell; other platforms keep
+// Codex's default of shell edits.
+export const CODEX_WINDOWS_FIELDS = Object.freeze({
+  apply_patch_tool_type: "freeform",
+});
+
+/**
+ * The constant fields for a generated row on this platform.
+ * @param {NodeJS.Platform} [platform]
+ */
+export function codexConstantFields(platform = process.platform) {
+  return platform === "win32" ? { ...CODEX_CONSTANT_FIELDS, ...CODEX_WINDOWS_FIELDS } : CODEX_CONSTANT_FIELDS;
+}
+
 // The constants every row needs to work through the Fireworks gateway. Stock
 // Codex's own GPT rows get only these, keeping the rest of Codex's row,
 // tool search included.
@@ -74,7 +90,7 @@ function stockSupportsSearchTool(slug, stock) {
 }
 
 /**
- * Re-stamp CODEX_CONSTANT_FIELDS onto catalog rows written by an earlier
+ * Re-stamp this platform's constant fields onto catalog rows written by an earlier
  * release, so a changed value reaches rows that `codex on` keeps as-is
  * (`--model` re-runs, offline re-runs, router rows the API no longer lists).
  * Stock Codex's rows, the only ones with base
@@ -87,6 +103,7 @@ function stockSupportsSearchTool(slug, stock) {
  * @returns {T[]}
  */
 export function withCodexConstantFields(models = [], stock = cachedCodexStockModels()) {
+  const constants = codexConstantFields();
   return models.map((row) => {
     if (!row || typeof row !== "object") {
       return row;
@@ -94,37 +111,112 @@ export function withCodexConstantFields(models = [], stock = cachedCodexStockMod
     if (row.base_instructions) {
       return { ...row, ...CODEX_TRANSPORT_FIELDS, supports_search_tool: stockSupportsSearchTool(row.slug, stock) };
     }
-    return { ...row, ...CODEX_CONSTANT_FIELDS };
+    return { ...row, ...constants };
   });
+}
+
+/**
+ * Codex's slug for the `auto` mix, in config.toml's `model` and the catalog.
+ * The ChatGPT app treats a model named exactly `auto` as its own Auto
+ * feature: it lists it apart at the top of the picker, allows it only in a
+ * new chat ("Start a new chat to use Auto.") and hides its effort control.
+ * Codex sends the slug to the gateway as the model ID (a catalog row has no
+ * separate wire ID), and the gateway serves `nexus/auto` as the `auto` mix,
+ * the same ID Cursor sends.
+ */
+export const CODEX_AUTO_MODEL_SLUG = NEXUS_AUTO_MODEL_ID;
+
+/**
+ * The slug Codex uses for a Nexus model ID: `nexus/auto` for the `auto` mix,
+ * the ID itself otherwise.
+ * @param {string} modelId
+ * @returns {string}
+ */
+export function codexModelSlug(modelId) {
+  return canonicalAutoModelId(modelId ?? "") === AUTO_MODEL_ID ? CODEX_AUTO_MODEL_SLUG : modelId;
+}
+
+/**
+ * The Nexus model ID for a Codex slug: `auto` for `nexus/auto` (and the bare
+ * `auto` earlier releases wrote), the short ref otherwise.
+ * @param {string} slug
+ * @returns {string}
+ */
+export function codexModelRef(slug) {
+  const raw = String(slug ?? "").trim();
+  return raw.toLowerCase() === CODEX_AUTO_MODEL_SLUG ? AUTO_MODEL_ID : shortFireworksModelRef(raw);
+}
+
+/** Whether a catalog row is the `auto` mix, under its current or an earlier slug. */
+function isCodexAutoRow(row) {
+  return isAutoModelId(codexModelRef(row?.slug ?? ""));
+}
+
+/**
+ * Whether a config.toml `model` or catalog slug is the bare `auto` earlier
+ * releases wrote, which the ChatGPT app takes for its own Auto.
+ * @param {unknown} slug
+ */
+export function isLegacyCodexAutoSlug(slug) {
+  return typeof slug === "string" && canonicalAutoModelId(slug) === AUTO_MODEL_ID;
 }
 
 /** Whether an auto row carries an earlier release's label. */
 export function isStaleCodexAutoLabel(row) {
-  return isAutoModelId(row?.slug ?? "") && row.display_name !== autoDisplayName(row.slug);
+  return isCodexAutoRow(row) && row.display_name !== autoDisplayName(codexModelRef(row.slug));
+}
+
+/**
+ * Whether a GPT row Nexus built itself (no stock Codex row, so no base
+ * instructions) carries an earlier release's effort ladder, such as the
+ * three-level one before `xhigh` was added.
+ */
+export function isStaleCodexOpenaiFallbackLadder(row) {
+  return typeof row?.slug === "string"
+    && !row.base_instructions
+    && isCodexOpenaiModelSlug(row.slug)
+    && JSON.stringify(row.supported_reasoning_levels) !== JSON.stringify(CODEX_OPENAI_FALLBACK_LEVELS);
 }
 
 /** Whether an auto row carries an earlier release's effort ladder. */
 export function isStaleCodexAutoLadder(row) {
-  return isAutoModelId(row?.slug ?? "")
-    && JSON.stringify(row.supported_reasoning_levels) !== JSON.stringify(reasoningConfigFor(row.slug).levels);
+  return isCodexAutoRow(row)
+    && JSON.stringify(row.supported_reasoning_levels)
+      !== JSON.stringify(reasoningConfigFor(codexModelRef(row.slug)).levels);
 }
 
 /**
- * Bring auto rows an earlier release wrote up to the current label and effort
- * ladder. `codex on` otherwise keeps them verbatim (offline re-runs, `--model`
- * re-runs).
+ * Bring auto rows an earlier release wrote up to the current slug, label and
+ * effort ladder. `codex on` otherwise keeps them verbatim (offline re-runs,
+ * `--model` re-runs). A bare `auto` row becomes `nexus/auto`; when both are
+ * present, the first is kept.
  * @template {{ slug?: string, display_name?: string, supported_reasoning_levels?: object[] }} T
  * @param {T[]} models
  * @returns {T[]}
  */
 export function withCodexAutoRows(models = []) {
-  return models.map((row) => (isAutoModelId(row?.slug ?? "")
-    ? {
-      ...row,
-      display_name: autoDisplayName(row.slug),
-      supported_reasoning_levels: reasoningConfigFor(row.slug).levels,
+  const seen = new Set();
+  const rows = [];
+  for (const row of models) {
+    if (!isCodexAutoRow(row)) {
+      rows.push(row);
+      continue;
     }
-    : row));
+    const ref = codexModelRef(row.slug);
+    const slug = codexModelSlug(ref);
+    if (seen.has(slug)) {
+      continue;
+    }
+    seen.add(slug);
+    rows.push({
+      ...row,
+      slug,
+      display_name: autoDisplayName(ref),
+      supported_reasoning_levels: reasoningConfigFor(ref).levels,
+      ...(Object.hasOwn(row, "auto_review_model_override") ? { auto_review_model_override: slug } : {}),
+    });
+  }
+  return rows;
 }
 
 // Auto-compact at 80% of the window, not Codex's 90% default for an unset
@@ -209,7 +301,7 @@ export function buildCodexCatalogEntry(model) {
     slug,
     display_name: model.displayName ?? model.name,
     description: model.description ?? "",
-    ...CODEX_CONSTANT_FIELDS,
+    ...codexConstantFields(),
     priority: CODEX_FIREWORKS_PRIORITY,
     // Guardian auto-review defaults to the OpenAI-only `codex-auto-review`
     // model, which the Fireworks gateway has no deployment for (404 on
@@ -286,6 +378,15 @@ const CODEX_OPENAI_FALLBACK_IDS = Object.freeze({
 // the family on models.dev but aren't listed.
 const CODEX_OPENAI_ID_RE = /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/;
 const CODEX_OPENAI_FALLBACK_CONTEXT_WINDOW = 1_050_000;
+// Effort tiers for a GPT row built without stock Codex's own row, in Codex's
+// wording. Every GPT model stock Codex lists accepts these; `max` and above
+// vary by model, so they come only from stock Codex's rows.
+export const CODEX_OPENAI_FALLBACK_LEVELS = Object.freeze([
+  { effort: "low", description: "Fast responses with lighter reasoning" },
+  { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
+  { effort: "high", description: "Greater reasoning depth for complex problems" },
+  { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
+]);
 
 /** Compare dotted versions numerically: "6.1" > "6" > "5.6". */
 function compareVersions(a, b) {
@@ -399,6 +500,7 @@ export function buildCodexOpenaiCatalogEntry(
     }),
     slug: id,
     auto_review_model_override: id,
+    supported_reasoning_levels: CODEX_OPENAI_FALLBACK_LEVELS.map((level) => ({ ...level })),
     default_reasoning_level: "medium",
   };
 }
@@ -460,14 +562,9 @@ export function buildCodexAutoCatalogEntry(modelId = AUTO_MODEL_ID) {
       supportsImageInput: spec?.capabilities.vision ?? false,
       supportsTools: spec?.capabilities.toolCalling ?? true,
     }),
-    slug: stored,
-    auto_review_model_override: stored,
+    slug: codexModelSlug(stored),
+    auto_review_model_override: codexModelSlug(stored),
   };
-}
-
-/** Whether a catalog row has a usable context window. */
-export function codexRowHasUsableContext(row) {
-  return (row?.context_window ?? row?.max_context_window ?? 0) > 0;
 }
 
 function findSnapshotEntry(snapshot, modelId) {
@@ -526,11 +623,11 @@ export function refreshCodexCatalogRows(models = [], snapshot = null, freshModel
     currentIds: [...currentBySlug.keys()],
     freshIds: [...freshBySlug.keys()],
     catalogAvailable,
-    selectedId: selected,
+    selectedId: selected ? codexModelSlug(selected) : selected,
     keepUnserved: (slug) => (
       !isCodexUnsupportedMiniMaxModel(slug)
       && !isFirerouterModelPattern(slug)
-      && (canonicalAutoModelId(slug) === AUTO_MODEL_ID
+      && (canonicalAutoModelId(codexModelRef(slug)) === AUTO_MODEL_ID
         || isCodexOpenaiModelSlug(slug)
         || Boolean(findSnapshotEntry(snapshot, slug)))
     ),
@@ -587,8 +684,8 @@ function snapshotModelMetadata(snapshot, modelId) {
     ?? DEFAULT_MODEL_CAPABILITIES.toolCalling;
   if (!entry) {
     // The entry row itself can be pruned from the iterated set while the
-    // snapshot maps still carry its metadata: preferLatestAliases drops base
-    // models whose family has a -latest alias, so offline/stale-cache builds
+    // snapshot maps still carry its metadata: preferLatestAliases drops concrete
+    // models at or below their alias targets, so offline/stale-cache builds
     // (no rawModels to borrow from) would otherwise lose every alias router.
     // Synthesize from the maps; ids the snapshot never saw stay null.
     if (!snapshot.contextLengthById.has(modelId)
@@ -689,8 +786,9 @@ export function codexCatalogContainsModel(catalog, modelId) {
   if (!catalog?.models?.length || !modelId) {
     return false;
   }
-  const stored = shortFireworksModelRef(modelId);
+  // `nexus/auto` and `auto` both name the auto mix.
+  const stored = codexModelRef(modelId);
   return catalog.models.some(
-    (entry) => shortFireworksModelRef(entry.slug) === stored,
+    (entry) => codexModelRef(entry.slug) === stored,
   );
 }

@@ -18,9 +18,9 @@
  * {@link refreshListPriceCache} without awaiting fresh data.
  */
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import path from "node:path";
-import { catalogTtlMs, scopedCacheFilePath } from "../fireworks/serverless-catalog-cache.mjs";
+import { readFileSync, rmSync } from "node:fs";
+import { writeFileAtomicSync } from "../io/atomic-write.mjs";
+import { catalogTtlMs, ensureCacheParent, scopedCacheFilePath } from "../fireworks/serverless-catalog-cache.mjs";
 import { fetchModelsDevApi } from "./models-dev.mjs";
 
 /** Where cached rows claim their rates came from. */
@@ -246,8 +246,8 @@ export function deletePersistedListPriceCache() {
 function persistListPriceCache(rates) {
   try {
     const file = cacheFile();
-    mkdirSync(path.dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ cachedAt: Date.now(), rates }));
+    ensureCacheParent(file);
+    writeFileAtomicSync(file, JSON.stringify({ cachedAt: Date.now(), rates }), { mode: 0o600 });
   } catch {
     // Best-effort — a failed persist must never break pricing lookups.
   }

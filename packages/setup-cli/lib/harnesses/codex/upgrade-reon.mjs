@@ -5,7 +5,13 @@ import { autoProviderKeysInScope } from "../../config/auto-providers.mjs";
 import { HARNESS } from "../../harness/id.mjs";
 import { readJsonIfExists } from "../../io/json.mjs";
 import { isRetiredModelId } from "../../fireworks/model-id.mjs";
-import { isStaleCodexAutoLabel, isStaleCodexAutoLadder, missingCodexSignInRows } from "./catalog.mjs";
+import {
+  isLegacyCodexAutoSlug,
+  isStaleCodexAutoLabel,
+  isStaleCodexAutoLadder,
+  isStaleCodexOpenaiFallbackLadder,
+  missingCodexSignInRows,
+} from "./catalog.mjs";
 import {
   CODEX_PROVIDER_TABLE,
   codexCatalogPath,
@@ -46,8 +52,19 @@ export const CODEX_AUTO_RENAME_NOTE =
 export const CODEX_AUTO_EFFORT_NOTE =
   "Added Extra High and Max effort to Nexus Auto in Codex. Restart Codex to pick it up.";
 
+export const CODEX_GPT_EFFORT_NOTE =
+  "Added Extra High effort to the GPT models in Codex. Restart Codex to pick it up.";
+
+export const CODEX_AUTO_SLUG_NOTE =
+  "Nexus Auto now shows in the ChatGPT app's model picker as a regular model, with its effort "
+  + "control and usable mid-chat: Codex names it nexus/auto instead of auto, which the app took "
+  + "for its own Auto. Restart Codex to pick it up.";
+
 export const CODEX_UPGRADE_REON_FAILURE =
   "Couldn't update Codex's Fireworks settings. Run nexus codex on.";
+
+export const CODEX_IMAGE_GENERATION_NOTE =
+  "Disabled Codex image generation unless you already set a preference. Restart Codex to pick it up.";
 
 /**
  * Whether the gateway provider still reads a provider key from the
@@ -90,6 +107,9 @@ async function codexReonReason(home) {
   if (hasEnvProviderKeyHeaders(doc.tables[CODEX_PROVIDER_TABLE])) {
     return CODEX_ENV_PROVIDER_KEYS_NOTE;
   }
+  if (!Object.hasOwn(doc.tables.features ?? {}, "image_generation") && !Object.hasOwn(doc.root, "features")) {
+    return CODEX_IMAGE_GENERATION_NOTE;
+  }
   const { anthropicKey } = autoProviderKeysInScope(await readGlobalConfig(home));
   const headers = doc.tables[CODEX_PROVIDER_TABLE]?.http_headers ?? {};
   if (anthropicKey && headers["x-anthropic-api-key"] !== anthropicKey) {
@@ -97,6 +117,9 @@ async function codexReonReason(home) {
   }
   if (isRetiredModelId(codexCurrentModelId(doc) ?? "")) {
     return CODEX_FIREROUTER_MIGRATION_NOTE;
+  }
+  if (isLegacyCodexAutoSlug(doc.root.model)) {
+    return CODEX_AUTO_SLUG_NOTE;
   }
   if (!doc.root.model_catalog_json) {
     return "";
@@ -106,6 +129,9 @@ async function codexReonReason(home) {
   if (models.some((row) => isRetiredModelId(row?.slug ?? ""))) {
     return CODEX_FIREROUTER_MIGRATION_NOTE;
   }
+  if (models.some((row) => isLegacyCodexAutoSlug(row?.slug))) {
+    return CODEX_AUTO_SLUG_NOTE;
+  }
   const missing = missingCodexSignInRows(models);
   if (missing.length) {
     return modelsAddedNote(missing);
@@ -113,7 +139,10 @@ async function codexReonReason(home) {
   if (models.some(isStaleCodexAutoLabel)) {
     return CODEX_AUTO_RENAME_NOTE;
   }
-  return models.some(isStaleCodexAutoLadder) ? CODEX_AUTO_EFFORT_NOTE : "";
+  if (models.some(isStaleCodexAutoLadder)) {
+    return CODEX_AUTO_EFFORT_NOTE;
+  }
+  return models.some(isStaleCodexOpenaiFallbackLadder) ? CODEX_GPT_EFFORT_NOTE : "";
 }
 
 /**

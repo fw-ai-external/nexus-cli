@@ -1,5 +1,6 @@
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
 import {
   PROVIDER_KEYS_DOCS_URL,
@@ -7,14 +8,12 @@ import {
   printNote,
 } from "../../cli/messages.mjs";
 import path from "node:path";
-import process from "node:process";
 import {
   FIREROUTER_MODEL_ID,
   firerouterNamesAnthropicModel,
   isFirerouterModel,
   isRetiredModelId,
 } from "../../fireworks/model-id.mjs";
-import { isFirerouterModelPattern } from "../../fireworks/model-specs.mjs";
 import {
   CODEX_API_KEY_ENV_REF,
   CODEX_AZURE_PROVIDER_ID,
@@ -39,7 +38,7 @@ import {
 import { DEFAULT_AZURE_MODEL } from "../../fireworks/azure-core.mjs";
 import { isFireworksKey } from "../../keys/key-type.mjs";
 import { finishEnvHarnessOn } from "../../harness/env-hook.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import { readProviderSettings } from "../../config/global-config.mjs";
 import { ANTHROPIC_BYOK_HEADER, byokEnvFromHeaders } from "../../firerouter/core.mjs";
 import { resolveAutoProviderKeyHeaders } from "../../firerouter/flag.mjs";
@@ -54,8 +53,34 @@ import {
 import { ensureChatGptStopped, ensureCodexSessionsClosed, isCodexSessionRunning } from "./ide-running.mjs";
 import { refreshCodexStockModels } from "./stock-models.mjs";
 import { HARNESS } from "../../harness/id.mjs";
-import { harnessStatusKeySource } from "../../keys/api-key.mjs";
+import { harnessStatusKeySource, resolveFireworksKeyWithSource } from "../../keys/api-key.mjs";
 import { existsSync } from "node:fs";
+import { fireworksInferenceUrl, recordedHarnessResidency } from "../../fireworks/residency.mjs";
+import { warmServerlessPricingCache } from "../../fireworks/models.mjs";
+import {
+  canRunClaudeUsageInteractiveDisplay,
+  hasClaudeUsageRows,
+  playUsageIntroAnimation,
+  runClaudeUsageInteractiveDisplay,
+} from "../claude/usage/display.mjs";
+import { formatClaudeUsageReport, formatClaudeUsageReports, parseLastN } from "../claude/usage/report.mjs";
+import { findCodexRollouts, readCodexUsage, readCodexUsages } from "./usage/report.mjs";
+import { promptCodexUsageSession, runCodexUsageLive } from "./usage/live.mjs";
+import { shouldRunClaudeUsageLive } from "../claude/usage/live.mjs";
+import { resolveServedModels, SERVED_LOOKUP_RATE_LIMITED } from "./usage/served-models.mjs";
+
+/** `codex usage` on a TTY lists this many days of sessions by default. */
+const CODEX_USAGE_DEFAULT_DAYS = 3;
+/** The error the readers throw when there is no Codex session log to report. */
+const NO_CODEX_LOGS_RE = /^No Codex session logs found/;
+/** Cap on the sessions the default TTY view loads and prices. */
+const CODEX_USAGE_SESSION_CAP = 25;
+/**
+ * Most sessions `--last-n` loads: each uncached one is a served-model lookup,
+ * and the route rate-limits an account's lookups, so a larger cold run would
+ * mostly come back n/a.
+ */
+const CODEX_USAGE_MAX_LAST_N = 30;
 
 const CODEX_PROVIDER_KEYS_REMOVED_NOTE =
   "Codex now pays for GPT turns only with its own sign-in, so Nexus CLI removed the "
@@ -67,7 +92,7 @@ const CODEX_PROVIDER_KEYS_REMOVED_NOTE =
 // while either is up changes nothing it serves, so wait for both to be closed.
 async function ensureCodexStopped(ctx) {
   await ensureChatGptStopped({ force: ctx.force });
-  await ensureCodexSessionsClosed({ force: ctx.force });
+  await ensureCodexSessionsClosed({ force: ctx.force, home: ctx.home });
 }
 
 // Codex's own sign-in pays for GPT turns, so Nexus forwards no provider key.
@@ -86,6 +111,29 @@ async function codexResolveKey(ctx) {
   return isFireworksKey(key) ? key.trim() : "";
 }
 
+/**
+ * The key `codex usage` prices and looks up served models with: Codex's own
+ * Fireworks key while it is routed, else the stored Nexus key (past sessions
+ * stay priceable after `codex off`). Never throws.
+ */
+async function codexUsageKey(ctx) {
+  // An explicit --api-key wins, as in every other command's key precedence;
+  // it must not depend on reading Codex's config.
+  if (isFireworksKey(ctx.apiKey)) return ctx.apiKey.trim();
+  try {
+    const routed = await codexResolveKey(ctx);
+    if (routed) return routed;
+  } catch {
+    /* an unreadable Codex config falls through to the stored key */
+  }
+  try {
+    const { key } = await resolveFireworksKeyWithSource({ apiKey: ctx.apiKey, home: ctx.home });
+    return isFireworksKey(key) ? key.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 async function codexResolveOnContext(ctx) {
   // Codex CLI 0.160+ dropped `wire_api = "chat"`, the only transport Foundry
   // offers. Reject --azure and a persisted `provider: azure` up front instead
@@ -100,7 +148,7 @@ async function codexResolveOnContext(ctx) {
   // The GPT rows, and which GPT IDs `--model` accepts, follow stock Codex's own
   // list, so read it before anything checks the requested model.
   if (ctx.home?.trim()) {
-    await refreshCodexStockModels({ codexHome: path.dirname(codexPathsFor(ctx).configPath) });
+    await refreshCodexStockModels({ codexHome: path.dirname(codexPathsFor(ctx).configPath), home: ctx.home });
   }
   // Any spelling of bare `firerouter` is stored as the bare route id.
   if (ctx.main?.trim()) {
@@ -122,9 +170,26 @@ async function codexResolveOnContext(ctx) {
   return { ...ctx, main: CODEX_DEFAULT_MODEL };
 }
 
+/** Codex's sign-in GPT models: served, never in the catalog. */
+function codexServedOutsideCatalog(modelId) {
+  return isCodexOpenaiModelSlug(modelId);
+}
+
+/** The Fireworks models Codex selects while routed (see HarnessAdapter.configuredModels). */
+async function codexConfiguredModels(ctx) {
+  const { configPath } = codexPathsFor(ctx);
+  const { doc } = await readCodexTomlIfExists(configPath);
+  if (codexProviderStatus(doc) !== "fireworks") {
+    return [];
+  }
+  const model = codexCurrentModelId(doc);
+  return model ? [{ slot: "main", model }] : [];
+}
+
 export default defineHarnessProfile({
   id: HARNESS.CODEX,
   label: "Codex",
+  configuredModels: codexConfiguredModels,
   resolveKey: codexResolveKey,
   resolveOnContext: codexResolveOnContext,
   paths: (ctx) => codexPathsFor(ctx),
@@ -138,7 +203,7 @@ export default defineHarnessProfile({
     // when switching from Foundry back to the gateway.
     return codexProviderStatus(doc) === "fireworks" ? codexStoredAuthRef(doc) : "";
   },
-  servedOutsideCatalog: (modelId) => isCodexOpenaiModelSlug(modelId),
+  servedOutsideCatalog: codexServedOutsideCatalog,
   enable: async ({
     ctx,
     paths,
@@ -270,7 +335,7 @@ export default defineHarnessProfile({
     const payload = {
       harness: HARNESS.CODEX,
       provider,
-      baseUrl: CODEX_FIREWORKS_BASE_URL,
+      baseUrl: fireworksInferenceUrl(CODEX_FIREWORKS_BASE_URL, recordedHarnessResidency("codex", ctx.home)),
       modelProvider: CODEX_FIREWORKS_PROVIDER_ID,
       hasAuthToken: Boolean(effectiveCodexApiKey(storedAuth)),
       chatgptLogin,
@@ -283,6 +348,8 @@ export default defineHarnessProfile({
         exists: existsSync(catalogPath),
       },
     };
+
+    payload.modelAccess = await harnessModelAccess(HARNESS.CODEX, ctx);
 
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
@@ -298,6 +365,133 @@ export default defineHarnessProfile({
         ? `Codex sign-in; Fireworks key in ${CODEX_CHATGPT_FIREWORKS_KEY_HEADER} header in config.toml`
         : harnessStatusKeySource(HARNESS.CODEX, provider),
     });
+    printModelAccessNote(HARNESS.CODEX, payload.modelAccess);
+  },
+
+  async usage(ctx) {
+    ensureHomeForHarness(ctx, HARNESS.CODEX);
+    const apiKey = await codexUsageKey(ctx);
+    // Same best-effort warm as `claude usage`: live Fireworks prices when a
+    // genuine fw_ key is configured, static spec prices otherwise.
+    try {
+      await warmServerlessPricingCache(apiKey);
+    } catch {
+      /* fall back to static spec pricing */
+    }
+    const codexHome = path.dirname(codexPathsFor(ctx).configPath);
+    // `auto` calls are priced as the model that served them, looked up from
+    // Fireworks (short timeout, cached, n/a on any failure).
+    // Why lookups got nothing (HTTP 403, timeout, tracing off), for --verbose:
+    // otherwise a key that is refused every run just shows n/a forever.
+    /** @type {Map<string, number>} */
+    const lookupFailures = new Map();
+    const resolveServed = (lookups) => resolveServedModels({
+      sessions: lookups,
+      apiKey,
+      home: ctx.home,
+      onFailure: (reason) => lookupFailures.set(reason, (lookupFailures.get(reason) ?? 0) + 1),
+    });
+    const printLookupFailures = () => {
+      for (const [reason, count] of lookupFailures) {
+        // Rate limiting explains a run of n/a rows, so it shows without -v too.
+        if (!ctx.verbose && reason !== SERVED_LOOKUP_RATE_LIMITED) continue;
+        console.error(`served-model lookup failed for ${count} session${count === 1 ? "" : "s"} (${reason})`);
+      }
+    };
+    // The session picker lists up to 100 sessions and redraws on every Esc, so
+    // it prices from the on-disk cache only; the meter it opens looks models
+    // up in the background for the one session it tracks.
+    const resolveCached = (lookups) => resolveServedModels({
+      sessions: lookups,
+      apiKey,
+      home: ctx.home,
+      env: { ...process.env, NEXUS_SERVED_MODEL_LOOKUP: "0" },
+    });
+
+    // On a TTY with no snapshot flag: pick a session, then live-track it, as
+    // `claude usage` does.
+    if (shouldRunClaudeUsageLive(ctx)) {
+      const withinDays = ctx.days || CODEX_USAGE_DEFAULT_DAYS;
+      const session = ctx.session
+        ? (await findCodexRollouts({ codexHome, home: ctx.home, session: ctx.session, lastN: 1 })).parents[0]?.filePath
+        : await promptCodexUsageSession({ codexHome, home: ctx.home, withinDays, resolveServedForPicker: resolveCached });
+      if (!session) return;
+      await runCodexUsageLive({ home: ctx.home, codexHome, session, apiKey, withinDays, resolveServedForPicker: resolveCached });
+      return;
+    }
+
+    const interactive = !ctx.json && !ctx.verbose && !ctx.plain
+      && canRunClaudeUsageInteractiveDisplay();
+
+    // A single session: --session, or the newest one off a TTY (as `claude
+    // usage` reports the latest session when it cannot show the picker).
+    if (ctx.session || (!ctx.lastN && !interactive)) {
+      let report;
+      try {
+        report = await readCodexUsage({ codexHome, home: ctx.home, session: ctx.session ?? "", withinDays: ctx.days || undefined, resolveServed });
+      } catch (error) {
+        // No Codex logs yet (or none in --days) is an empty report, not a
+        // failure; a --session that matches nothing still errors, logs or not.
+        if (ctx.session || !(error instanceof Error && NO_CODEX_LOGS_RE.test(error.message))) throw error;
+        console.log(ctx.json ? "null" : "No Codex session usage found.");
+        return;
+      }
+      if (ctx.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+      if (interactive && hasClaudeUsageRows(report)) {
+        await playUsageIntroAnimation();
+        if (await runClaudeUsageInteractiveDisplay(report)) {
+          // A paused TTY stdin still holds a libuv ref; exit once the display
+          // has restored the terminal (same as `claude usage`).
+          process.exit(0);
+        }
+      }
+      console.log(formatClaudeUsageReport(report, { verbose: ctx.verbose, plain: ctx.plain }));
+      printLookupFailures();
+      return;
+    }
+
+    // Several sessions: --last-n, or on a TTY every session from the last
+    // --days (default 3), which the interactive display lets you drill into.
+    let lastN = CODEX_USAGE_SESSION_CAP;
+    if (ctx.lastN) {
+      lastN = parseLastN(ctx.lastN);
+      if (lastN > CODEX_USAGE_MAX_LAST_N) {
+        console.error(`--last-n is capped at ${CODEX_USAGE_MAX_LAST_N} for codex usage; showing the newest ${CODEX_USAGE_MAX_LAST_N} sessions.`);
+        lastN = CODEX_USAGE_MAX_LAST_N;
+      }
+    }
+    let reportGroup;
+    try {
+      reportGroup = await readCodexUsages({
+        codexHome,
+        home: ctx.home,
+        lastN,
+        withinDays: ctx.days || (ctx.lastN ? undefined : CODEX_USAGE_DEFAULT_DAYS),
+        resolveServed,
+      });
+    } catch (error) {
+      if (ctx.session || !(error instanceof Error && NO_CODEX_LOGS_RE.test(error.message))) throw error;
+      reportGroup = { sessions: [], grandRequests: 0, lastN: 0, sessionCount: 0 };
+    }
+    if (ctx.json) {
+      console.log(JSON.stringify(reportGroup, null, 2));
+      return;
+    }
+    if (reportGroup.sessions.length === 0) {
+      console.log("No Codex session usage found.");
+      return;
+    }
+    if (interactive && hasClaudeUsageRows(reportGroup)) {
+      await playUsageIntroAnimation();
+      if (await runClaudeUsageInteractiveDisplay(reportGroup)) {
+        process.exit(0);
+      }
+    }
+    console.log(formatClaudeUsageReports(reportGroup, { verbose: ctx.verbose, plain: ctx.plain }));
+    printLookupFailures();
   },
 
 });

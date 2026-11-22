@@ -5,21 +5,26 @@ import { fileURLToPath } from "node:url";
 import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { userSettingsPath } from "../../../lib/harnesses/claude/core.mjs";
+import { disableFireworksProvider, userSettingsPath } from "../../../lib/harnesses/claude/core.mjs";
+import { migrateClaudeStatusLinePathOnUpgrade } from "../../../lib/harnesses/claude/upgrade-migrations.mjs";
+import { FIREWORKS_BASE_URL } from "../../../lib/fireworks/model-id.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
 import { lookupFireworksPricing } from "../../../lib/fireworks/pricing.mjs";
 import {
   claudeStatusLineCommand,
+  claudeStatusLineKeyExpiry,
   claudeStatusLineModelLabel,
   claudeStatusLineSettings,
   claudeStatusLineUsage,
+  formatTokensPerSecond,
   isFireconnectStatusLine,
   renderClaudeStatusLine,
   stripClaudeStatusLine,
   withClaudeStatusLine,
 } from "../../../lib/harnesses/claude/statusline.mjs";
-import { mockServerlessModel, runFireconnect, withTempHome } from "../../helpers.mjs";
+import { mockServerlessModel, mockServerlessModelRows, runFireconnect, withTempHome } from "../../helpers.mjs";
+import { mintedKeyStatePath, writeMintedKeyState } from "../../../lib/keys/mint-api-key.mjs";
 
 const USER_STATUS_LINE = { type: "command", command: "~/my-own-statusline.sh" };
 
@@ -35,7 +40,7 @@ const STATUSLINE_CATALOG_ROWS = [
     displayName: "GLM 5.3",
     aliases: ["accounts/fireworks/routers/glm-latest"],
   }),
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/glm-5p2",
     aliases: ["accounts/fireworks/routers/glm-fast-latest"],
   }),
@@ -50,7 +55,7 @@ const STATUSLINE_CATALOG_ROWS = [
     ],
     aliases: ["accounts/fireworks/routers/glm-fast-latest"],
   }),
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/kimi-k3",
     displayName: "Kimi K3",
     input_modalities: ["text", "image"],
@@ -218,7 +223,7 @@ describe("claude status line", () => {
   it("invokes the helper with an absolute node and script path", () => {
     const command = claudeStatusLineCommand();
     // Claude Code spawns through a shell whose PATH need not contain our Node.
-    assert.match(command, /bin\/claude-statusline\.mjs/);
+    assert.match(command, /bin[/\\]claude-statusline\.mjs/);
     assert.ok(
       path.isAbsolute(command.split(" ").at(-1).replace(/^'|'$/g, "")),
       command,
@@ -262,6 +267,40 @@ describe("claude status line", () => {
     assert.deepEqual(refreshed.statusLine, claudeStatusLineSettings());
   });
 
+  it("recognizes, refreshes, and removes a Windows status line", async () => {
+    const statusLine = {
+      type: "command",
+      command: String.raw`'C:\node\node.exe' 'C:\Users\x\.nexus\cli\packages\setup-cli\bin\claude-statusline.mjs'`,
+    };
+    assert.equal(isFireconnectStatusLine(statusLine), true);
+    assert.deepEqual(withClaudeStatusLine({ statusLine }).statusLine, claudeStatusLineSettings());
+    assert.deepEqual(stripClaudeStatusLine({ statusLine }), { settings: {}, changed: true });
+
+    await withTempHome("statusline-windows", async (home) => {
+      const settingsPath = userSettingsPath(home);
+      const settings = { env: { ANTHROPIC_BASE_URL: FIREWORKS_BASE_URL }, statusLine, theme: "dark" };
+      await mkdir(path.dirname(settingsPath), { recursive: true });
+      await writeFile(settingsPath, JSON.stringify(settings));
+      assert.equal(await migrateClaudeStatusLinePathOnUpgrade(home), true);
+      assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")).statusLine, claudeStatusLineSettings());
+
+      await writeFile(settingsPath, JSON.stringify(settings));
+      await disableFireworksProvider({ settingsPath, dataDir: path.join(home, ".nexus", "claude"), wasEnabled: true });
+      const restored = JSON.parse(await readFile(settingsPath, "utf8"));
+      assert.equal(Object.hasOwn(restored, "statusLine"), false);
+      assert.equal(restored.theme, "dark");
+    });
+  });
+
+  it("does not claim an unrelated Windows status line", () => {
+    const settings = {
+      statusLine: { type: "command", command: String.raw`'C:\Users\x\bin\my-statusline.mjs'` },
+    };
+    assert.equal(isFireconnectStatusLine(settings.statusLine), false);
+    assert.equal(withClaudeStatusLine(settings), settings);
+    assert.deepEqual(stripClaudeStatusLine(settings), { settings, changed: false });
+  });
+
   it("prices a transcript at Fireworks rates, not Anthropic's", async () => {
     await withTempHome("statusline-cost", async (home) => {
       const transcript = path.join(home, "session.jsonl");
@@ -292,6 +331,84 @@ describe("claude status line", () => {
       assert.doesNotMatch(plain, /ctx/, plain);
       assert.doesNotMatch(plain, /12%/, plain);
     });
+  });
+
+  it("shows the last call's generated-token rate", async () => {
+    await withTempHome("statusline-tps", async (home) => {
+      const transcript = path.join(home, "session.jsonl");
+      await writeFile(transcript, [
+        // First block: thinking, 0.5s of stream, finished at +0.5s.
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-01-01T00:00:00.500Z",
+          thinkingDurationMs: 500,
+          message: {
+            id: "msg_1",
+            model: "accounts/fireworks/models/deepseek-v4-flash",
+            content: [{ type: "thinking", thinking: "plan" }],
+            usage: { input_tokens: 10, output_tokens: 0 },
+          },
+        }),
+        // Response ends at +2.5s with 1000 tokens: (2.5 - 0.5) + 0.5 = 2.5s.
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-01-01T00:00:02.500Z",
+          message: {
+            id: "msg_1",
+            model: "accounts/fireworks/models/deepseek-v4-flash",
+            content: [{ type: "text", text: "done" }],
+            usage: { input_tokens: 10, output_tokens: 1_000 },
+          },
+        }),
+      ].join("\n"));
+
+      const usage = await claudeStatusLineUsage(transcript, { home });
+      assert.equal(usage.tps, 400);
+
+      const plain = stripAnsi(await renderClaudeStatusLine({
+        model: { id: "deepseek-flash-latest[1m]" },
+        transcript_path: transcript,
+      }, { home }));
+      assert.match(plain, /[█▓▒░]+ 400 TPS/, plain);
+      // The rate is its own figure, not part of the cost.
+      assert.match(plain, /\$[\d.e-]+ · [█▓▒░]+ 400 TPS/, plain);
+    });
+  });
+
+  it("omits the rate when the first token time is not recorded", async () => {
+    await withTempHome("statusline-tps-unmeasured", async (home) => {
+      const transcript = path.join(home, "session.jsonl");
+      await writeFile(transcript, [
+        // No thinking block, so the transcript has no measured first-token
+        // time. An end-to-end figure would not be a generated-token rate.
+        assistantLine({
+          id: "msg_1",
+          model: "accounts/fireworks/models/deepseek-v4-flash",
+          output: 1_000,
+        }),
+      ].join("\n"));
+
+      const usage = await claudeStatusLineUsage(transcript, { home });
+      assert.equal(usage.tps, null);
+
+      const plain = stripAnsi(await renderClaudeStatusLine({
+        model: { id: "deepseek-flash-latest[1m]" },
+        transcript_path: transcript,
+      }, { home }));
+      assert.doesNotMatch(plain, /TPS/, plain);
+      // A missing rate must not hide the cost the line can measure.
+      assert.match(plain, /\$0\.0007/, plain);
+    });
+  });
+
+  it("formats rates compactly and rejects unmeasured ones", () => {
+    assert.equal(formatTokensPerSecond(1_234.5), "1.2k");
+    assert.equal(formatTokensPerSecond(2_000), "2k");
+    assert.equal(formatTokensPerSecond(1_500_000), "1.5M");
+    assert.equal(formatTokensPerSecond(7.53), "7.5");
+    assert.equal(formatTokensPerSecond(0), "");
+    assert.equal(formatTokensPerSecond(Number.NaN), "");
+    assert.equal(formatTokensPerSecond(null), "");
   });
 
   it("says the cost is unavailable rather than quoting a rate it does not have", async () => {
@@ -598,11 +715,18 @@ describe("claude status line", () => {
       });
 
       assert.match(line, /Auto/, line);
+      // The logo sits beside the rows; it never adds one.
+      assert.ok(line.trimEnd().split("\n").length <= 2, `status line grew past two rows: ${JSON.stringify(line)}`);
+      assert.match(line, /[⠀-⣿]/u, "logo is drawn when color is on");
       // Secondary text must not pin an absolute color: the status line cannot
       // know the surface it lands on, and a fixed light grey validated for a
       // dark theme washes out on a light one. Faint + default foreground
       // de-emphasizes relative to whatever the user's theme provides.
-      const seriesStripped = line.replace(/\x1b\[38;2;\d+;\d+;\d+m[━ ]*\x1b\[0m/g, "");
+      // The logo's dots are a mark in the brand gradient, not text: strip
+      // them like the series marks.
+      const seriesStripped = line
+        .replace(/(?:\x1b\[38;[25];[\d;]+m[\u2800-\u28FF])+\x1b\[0m/gu, "")
+        .replace(/\x1b\[38;2;\d+;\d+;\d+m[━ ]*\x1b\[0m/g, "");
       assert.doesNotMatch(seriesStripped, /\x1b\[38;2;/, `text pinned a truecolor: ${JSON.stringify(line)}`);
       assert.doesNotMatch(seriesStripped, /\x1b\[38;5;/, `text pinned a 256-color: ${JSON.stringify(line)}`);
       assert.match(line, /\x1b\[2m/, `expected faint for de-emphasis: ${JSON.stringify(line)}`);
@@ -664,12 +788,15 @@ describe("claude status line", () => {
   });
 
   it("survives a malformed payload without throwing", async () => {
-    assert.equal(typeof await renderClaudeStatusLine({}), "string");
-    assert.equal(typeof await renderClaudeStatusLine({ model: {} }), "string");
-    assert.equal(
-      typeof await renderClaudeStatusLine({ transcript_path: "/nope/nothing.jsonl" }),
-      "string",
-    );
+    // A temp home: the line reads the sign-in record under home, never the real one.
+    await withTempHome("statusline-malformed", async (home) => {
+      assert.equal(typeof await renderClaudeStatusLine({}, { home }), "string");
+      assert.equal(typeof await renderClaudeStatusLine({ model: {} }, { home }), "string");
+      assert.equal(
+        typeof await renderClaudeStatusLine({ transcript_path: "/nope/nothing.jsonl" }, { home }),
+        "string",
+      );
+    });
   });
 
   it("merges alias and full-path model ids into one legend row", async () => {
@@ -854,10 +981,10 @@ describe("claude status line", () => {
         }, { home }));
         const [line1, legend] = plain.split("\n");
 
-        assert.match(line1, /routed model: Claude Opus 5/, `${slotId}: ${line1}`);
-        assert.doesNotMatch(line1, /routed model: GLM/, `${slotId}: ${line1}`);
-        assert.doesNotMatch(legend, /routed model/, `${slotId}: ${legend}`);
-        assert.equal((plain.match(/routed model:/g) ?? []).length, 1, `${slotId}: ${plain}`);
+        assert.match(line1, /⇉ Claude Opus 5/, `${slotId}: ${line1}`);
+        assert.doesNotMatch(line1, /⇉ GLM/, `${slotId}: ${line1}`);
+        assert.doesNotMatch(legend, /⇉/, `${slotId}: ${legend}`);
+        assert.equal((plain.match(/⇉/g) ?? []).length, 1, `${slotId}: ${plain}`);
       }
     });
   });
@@ -880,7 +1007,7 @@ describe("claude status line", () => {
           model: { id: staticSlot },
           transcript_path: transcript,
         }, { home }));
-        assert.doesNotMatch(plain, /routed model/, `${staticSlot}: ${plain}`);
+        assert.doesNotMatch(plain, /⇉/, `${staticSlot}: ${plain}`);
       }
     });
   });
@@ -899,7 +1026,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.match(first, /routed model: GLM 5\.2/, first);
+      assert.match(first, /⇉ GLM 5\.2/, first);
 
       // A new user prompt has been submitted (including one starting with `<`
       // such as HTML/XML), and no assistant response has arrived for turn 3
@@ -913,7 +1040,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.doesNotMatch(pending, /routed model/, pending);
+      assert.doesNotMatch(pending, /⇉/, pending);
 
       // Harness metadata tags (`<system-reminder>`, `<local-command-stdout>`)
       // and `tool_result` continuations inside turn 2 are not new user turns,
@@ -930,7 +1057,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.match(toolCont, /routed model: GLM 5\.2/, toolCont);
+      assert.match(toolCont, /⇉ GLM 5\.2/, toolCont);
 
       // Modern transcripts: harness-injected user records carry no
       // `promptSource` key value, so they are not new turns either, while a
@@ -945,7 +1072,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.match(injected, /routed model: GLM 5\.2/, injected);
+      assert.match(injected, /⇉ GLM 5\.2/, injected);
 
       await writeFile(transcript, [
         ...opusFirst,
@@ -955,7 +1082,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.doesNotMatch(stamped, /routed model/, stamped);
+      assert.doesNotMatch(stamped, /⇉/, stamped);
 
       await writeFile(transcript, [
         ...pendingTurn3,
@@ -965,8 +1092,8 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.match(second, /routed model: Claude Opus 5/, second);
-      assert.doesNotMatch(second, /routed model: GLM/, second);
+      assert.match(second, /⇉ Claude Opus 5/, second);
+      assert.doesNotMatch(second, /⇉ GLM/, second);
     });
   });
 
@@ -987,7 +1114,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home })).split("\n")[0];
-      assert.match(line1, /routed model: GLM 5\.2/, line1);
+      assert.match(line1, /⇉ GLM 5\.2/, line1);
       assert.doesNotMatch(line1, /DeepSeek/, line1);
     });
   });
@@ -1004,7 +1131,7 @@ describe("claude status line", () => {
         model: { id: "auto[1m]" },
         transcript_path: transcript,
       }, { home }));
-      assert.doesNotMatch(plain, /routed model/, plain);
+      assert.doesNotMatch(plain, /⇉/, plain);
     });
   });
 
@@ -1030,7 +1157,7 @@ describe("claude status line", () => {
           transcript_path: transcript,
         }, { home }));
         const [line1, legend] = plain.split("\n");
-        assert.doesNotMatch(line1, /routed model|\?|unknown model/, `model ${JSON.stringify(model)}: ${line1}`);
+        assert.doesNotMatch(line1, /⇉|\?|unknown model/, `model ${JSON.stringify(model)}: ${line1}`);
         assert.match(legend, /GLM 5\.2/, legend);
       }
     });
@@ -1055,7 +1182,7 @@ describe("claude status line", () => {
         transcript_path: transcript,
       }, { home }));
       const [unbilledLine1, unbilledLegend] = unbilled.split("\n");
-      assert.match(unbilledLine1, /routed model: Claude Opus 5/, unbilledLine1);
+      assert.match(unbilledLine1, /⇉ Claude Opus 5/, unbilledLine1);
       assert.doesNotMatch(unbilledLegend, /Claude Opus 5/, unbilledLegend);
 
       // `<synthetic>` never reached the API: the parser drops it, so the
@@ -1069,9 +1196,9 @@ describe("claude status line", () => {
         transcript_path: transcript,
       }, { home }));
       const [syntheticLine1, syntheticLegend] = synthetic.split("\n");
-      assert.match(syntheticLine1, /routed model: DeepSeek V4 Flash/, syntheticLine1);
+      assert.match(syntheticLine1, /⇉ DeepSeek V4 Flash/, syntheticLine1);
       assert.doesNotMatch(syntheticLine1, /synthetic/, syntheticLine1);
-      const named = syntheticLine1.match(/routed model: (.+)$/);
+      const named = syntheticLine1.match(/⇉ (.+)$/);
       assert.ok(syntheticLegend.includes(`━ ${named[1]} $`), `${syntheticLine1} vs ${syntheticLegend}`);
     });
   });
@@ -1091,7 +1218,7 @@ describe("claude status line", () => {
       }, { home }));
       const [line1, legend] = plain.split("\n");
 
-      assert.match(line1, /routed model: DeepSeek V4 Flash/, line1);
+      assert.match(line1, /⇉ DeepSeek V4 Flash/, line1);
       assert.match(legend, /GLM 5\.2/, legend);
       assert.match(legend, /DeepSeek V4 Flash/, legend);
     });
@@ -1115,7 +1242,7 @@ describe("claude status line", () => {
       }, { home }));
       const [line1, legend] = plain.split("\n");
 
-      const named = line1.match(/routed model: (.+)$/);
+      const named = line1.match(/⇉ (.+)$/);
       assert.ok(named, `no routed-model name in: ${line1}`);
       assert.ok(legend.includes(`━ ${named[1]} $`), `${line1} vs ${legend}`);
       assert.doesNotMatch(line1, /\(US\)/, line1);
@@ -1137,8 +1264,8 @@ describe("claude status line", () => {
       }, { home }));
       const [line1, legend] = plain.split("\n");
 
-      assert.match(line1, /routed model: GLM 5\.3 Flash \(US\)/, line1);
-      const named = line1.match(/routed model: (.+)$/);
+      assert.match(line1, /⇉ GLM 5\.3 Flash \(US\)/, line1);
+      const named = line1.match(/⇉ (.+)$/);
       assert.ok(legend.includes(`━ ${named[1]} $`), `${line1} vs ${legend}`);
     });
   });
@@ -1157,7 +1284,7 @@ describe("claude status line", () => {
         transcript_path: transcript,
       }, { home }));
       const [line1, legend] = plain.split("\n");
-      assert.match(line1, /routed model: Kimi K3 Fast(?! \(Latest\))/, line1);
+      assert.match(line1, /⇉ Kimi K3 Fast(?! \(Latest\))/, line1);
       assert.doesNotMatch(line1, /\(Latest\)/, line1);
       assert.match(legend, /Kimi K3 Fast/, legend);
     });
@@ -1261,6 +1388,66 @@ describe("claude status line", () => {
         JSON.parse(await readFile(settingsPath, "utf8")).statusLine,
         USER_STATUS_LINE,
       );
+    });
+  });
+});
+
+describe("claude status line key expiry", () => {
+  const HOUR = 3_600_000;
+  const record = (home, expiresAt) => writeMintedKeyState(home, {
+    keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-test", apiKey: "fw_example_key_000000000000000000", expiresAt,
+  });
+
+  it("says nothing without a sign-in record, an expiry, or in a key's first six days", async () => {
+    await withTempHome("statusline-key-none", async (home) => {
+      const now = Date.parse("2027-01-01T00:00:00Z");
+      assert.equal(await claudeStatusLineKeyExpiry(home, now), "");
+      await record(home, "");
+      assert.equal(await claudeStatusLineKeyExpiry(home, now), "");
+      await record(home, new Date(now + 7 * 24 * HOUR).toISOString());
+      assert.equal(await claudeStatusLineKeyExpiry(home, now), "");
+      await record(home, new Date(now + 25 * HOUR).toISOString());
+      assert.equal(await claudeStatusLineKeyExpiry(home, now), "");
+      assert.equal(await claudeStatusLineKeyExpiry("", now), "");
+    });
+  });
+
+  it("warns in the key's last day and after it expires, pointing at nexus login", async () => {
+    await withTempHome("statusline-key-soon", async (home) => {
+      const now = Date.parse("2027-01-01T00:00:00Z");
+      await record(home, new Date(now + 5 * HOUR - 60_000).toISOString());
+      assert.equal(stripAnsi(await claudeStatusLineKeyExpiry(home, now)), "⚠ key expires in 5h · run nexus login");
+      await record(home, new Date(now + 30 * 60_000).toISOString());
+      assert.equal(stripAnsi(await claudeStatusLineKeyExpiry(home, now)), "⚠ key expires in 30m · run nexus login");
+      await record(home, new Date(now - HOUR).toISOString());
+      assert.equal(stripAnsi(await claudeStatusLineKeyExpiry(home, now)), "⚠ key expired · run nexus login");
+    });
+  });
+
+  it("says nothing for a record with no key fingerprint", async () => {
+    await withTempHome("statusline-key-legacy", async (home) => {
+      // Written without the key, as before fingerprints existed.
+      await writeMintedKeyState(home, {
+        keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-test",
+        expiresAt: new Date(Date.now() - HOUR).toISOString(),
+      });
+      assert.equal(await claudeStatusLineKeyExpiry(home), "");
+    });
+  });
+
+  it("never throws on an unreadable record", async () => {
+    await withTempHome("statusline-key-bad", async (home) => {
+      await mkdir(path.dirname(mintedKeyStatePath(home)), { recursive: true });
+      await writeFile(mintedKeyStatePath(home), "{not json");
+      assert.equal(await claudeStatusLineKeyExpiry(home), "");
+    });
+  });
+
+  it("leads the first row of the rendered line", async () => {
+    await withTempHome("statusline-key-render", async (home) => {
+      await record(home, new Date(Date.now() + 2 * HOUR).toISOString());
+      const plain = stripAnsi(await renderClaudeStatusLine({ model: { id: "claude-sonnet-4-5" } }, { home }));
+      assert.match(plain.split("\n")[0], /^(?:\S+ )?⚠ key expires in [23]h · run nexus login/, plain);
     });
   });
 });

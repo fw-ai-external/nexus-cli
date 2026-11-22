@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
+import os from "node:os";
 
-import { findCommand } from "../../harness/detect.mjs";
+import { harnessCommandEnv, resolveHarnessCommand } from "../../harness/detect.mjs";
 import { compareVersions } from "../../system/release-notes.mjs";
 
 /**
@@ -27,21 +28,21 @@ export function parseClaudeCodeVersion(output) {
  * The Claude Code version on PATH, or "" when it can't be read. Never
  * throws and never waits more than a few seconds. Specs describe the
  * installed version in NEXUS_TEST_CLAUDE_VERSION instead of running it.
- * @param {{ env?: NodeJS.ProcessEnv, platform?: string }} [options]
+ * @param {{ env?: NodeJS.ProcessEnv, platform?: string, root?: string, home?: string }} [options]
  */
-export function installedClaudeCodeVersion({ env = process.env, platform = process.platform } = {}) {
+export function installedClaudeCodeVersion({ env = process.env, platform = process.platform, root = "/", home = env.HOME || os.homedir() } = {}) {
   if (env.NEXUS_TEST === "1") {
     return parseClaudeCodeVersion(env.NEXUS_TEST_CLAUDE_VERSION);
   }
   try {
-    const bin = findCommand("claude", { env, platform });
-    // npm's Windows shims only run through a shell; skip them rather than spawn one.
-    if (!bin || /\.(cmd|bat)$/i.test(bin)) {
+    const bin = resolveHarnessCommand("claude", home, { env, platform, root });
+    // The resolver excludes shell-only shims.
+    if (!bin) {
       return "";
     }
     const result = spawnSync(bin, ["--version"], {
       encoding: "utf8",
-      env,
+      env: harnessCommandEnv(bin, env),
       stdio: ["ignore", "pipe", "ignore"],
       timeout: VERSION_PROBE_TIMEOUT_MS,
     });

@@ -168,7 +168,8 @@ describe("syncBakedKeysAfterStore", () => {
 
         const again = await runCli(["login", "--api-key", NEW_KEY], { home, env });
         assert.equal(again.code, 0, `stderr: ${again.stderr}`);
-        assert.doesNotMatch(again.stdout, /Claude Desktop/);
+        assert.doesNotMatch(again.stdout, /Updated Claude Desktop/);
+        assert.match(again.stdout, /background shim can't unlock key storage/);
       });
     } finally {
       server.close();

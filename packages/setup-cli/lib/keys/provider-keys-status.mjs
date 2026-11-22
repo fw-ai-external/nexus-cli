@@ -10,7 +10,7 @@ import { verifyFireworksApiKey } from "./verify-api-key.mjs";
  *
  * This module only reads binding state for display. Upload and bind stay
  * admin surfaces (dashboard and firectl); the CLI never sends a provider
- * key to the control plane.
+ * key to the Fireworks API.
  */
 
 export const PROVIDER_KEYS_SETTINGS_URL = "https://app.fireworks.ai/settings/provider-keys";

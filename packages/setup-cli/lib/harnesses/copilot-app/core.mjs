@@ -22,6 +22,8 @@ import {
   listCopilotProviders,
   listCopilotProviderModels,
   newCopilotProviderId,
+  recoverCopilotStubDatabase,
+  requireCopilotDatabase,
   removeFireconnectProvider,
   upsertFireconnectProvider,
 } from "./sqlite.mjs";
@@ -139,10 +141,12 @@ export async function enableCopilotFireworks({
   extraModels = [],
   extraHeaders = {},
   catalogUnavailable = false,
+  force = false,
 }) {
   if (!apiKey) {
     throw new Error(MISSING_FIREWORKS_API_KEY_MESSAGE);
   }
+  await requireCopilotDatabase(dbPath, { recoverStub: true, force });
 
   const resolvedModel = shortFireworksModelRef(resolveCopilotModelId(modelId?.trim()));
 
@@ -187,7 +191,10 @@ export async function enableCopilotFireworks({
  * @param {{ dbPath: string }} opts
  * @returns {Promise<"restored" | "none">}
  */
-export async function disableCopilotFireworks({ dbPath }) {
+export async function disableCopilotFireworks({ dbPath, force = false }) {
+  if (await recoverCopilotStubDatabase(dbPath, { force })) {
+    return "restored";
+  }
   const providers = await findFireconnectProviders(dbPath);
   for (const provider of providers) {
     await removeFireconnectProvider(dbPath, provider.id);

@@ -50,7 +50,7 @@ describe("FireRouter path catalog sequences across harnesses", () => {
       await onOk(home, ["codex", "on", "--api-key", API_KEY]);
       await onRejected(home, ["codex", "on", "--api-key", API_KEY, "--model", FIREROUTER_TEST_PATH]);
       let config = await readFile(codexConfigPath(home), "utf8");
-      assert.match(config, /^model = "auto"$/m, "rejection left the plain-on config alone");
+      assert.match(config, /^model = "nexus\/auto"$/m, "rejection left the plain-on config alone");
 
       // What an earlier release wrote for `--model firerouter/test-model`.
       await writeFile(
@@ -64,7 +64,7 @@ describe("FireRouter path catalog sequences across harnesses", () => {
 
       await onOk(home, ["codex", "on", "--api-key", API_KEY]);
       config = await readFile(codexConfigPath(home), "utf8");
-      assert.match(config, /^model = "auto"$/m);
+      assert.match(config, /^model = "nexus\/auto"$/m);
       const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8"))
         .models
         .map((row) => row.slug);
@@ -72,7 +72,7 @@ describe("FireRouter path catalog sequences across harnesses", () => {
 
       await onRejected(home, ["codex", "on", "--api-key", API_KEY, "--model", "firerouter"]);
       config = await readFile(codexConfigPath(home), "utf8");
-      assert.match(config, /^model = "auto"$/m);
+      assert.match(config, /^model = "nexus\/auto"$/m);
     });
   });
 

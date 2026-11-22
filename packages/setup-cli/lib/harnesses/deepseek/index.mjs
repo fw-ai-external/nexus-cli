@@ -1,10 +1,12 @@
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
 import {
   printDeepseekRestartHint,
 } from "../../cli/messages.mjs";
 import { defaultMainModel } from "../../fireworks/model-id.mjs";
+import { loadRegisterableModels } from "../../fireworks/models.mjs";
 import { byokEnvFromHeaders } from "../../firerouter/core.mjs";
 import {
   DEEPSEEK_API_KEY_ENV,
@@ -20,13 +22,14 @@ import {
 } from "./core.mjs";
 import { harnessHasFullKey } from "../../keys/harness-api-key.mjs";
 import { finishEnvHarnessOn } from "../../harness/env-hook.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import {
   deepseekPathsFor,
   ensureHomeForHarness,
 } from "../../harness/context.mjs";
 import { HARNESS } from "../../harness/id.mjs";
 import { harnessStatusKeySource } from "../../keys/api-key.mjs";
+import { fireworksInferenceUrl, recordedHarnessResidency } from "../../fireworks/residency.mjs";
 
 /**
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
@@ -54,9 +57,20 @@ function deepseekAuthModeFor(provider, credentials) {
   return typeof stored === "string" && stored.trim() ? "literal" : "env-reference";
 }
 
+/** The Fireworks models DeepSeek Harness selects while routed (see HarnessAdapter.configuredModels). */
+async function deepseekConfiguredModels(ctx) {
+  const { settingsPath } = deepseekPathsFor(ctx);
+  const { settings } = await readDeepseekSettingsIfExists(settingsPath);
+  const effective = await deepseekEffectiveFireworksState(settingsPath, settings);
+  return effective.provider === "fireworks" && effective.model
+    ? [{ slot: "main", model: effective.model }]
+    : [];
+}
+
 export default defineHarnessProfile({
   id: HARNESS.DEEPSEEK,
   label: "DeepSeek Harness",
+  configuredModels: deepseekConfiguredModels,
   resolveKey: deepseekResolveKey,
   paths: (ctx) => deepseekPathsFor(ctx),
   keyEnvRef: DEEPSEEK_API_KEY_ENV,
@@ -85,14 +99,24 @@ export default defineHarnessProfile({
     const { credentials } = await readDeepseekCredentialsIfExists(paths.credentialsPath);
     return credentials[DEEPSEEK_API_KEY_ENV] ?? "";
   },
-  enable: ({ paths, effectiveKey, modelId, byokHeaders = {}, telemetryHeaders = {} }) => enableDeepseekFireworks({
-    settingsPath: paths.settingsPath,
-    credentialsPath: paths.credentialsPath,
-    dataDir: paths.dataDir,
-    effectiveApiKey: effectiveKey,
-    modelId,
-    headers: { ...telemetryHeaders, ...byokHeaders },
-  }),
+  enable: async ({ paths, effectiveKey, modelId, byokHeaders = {}, telemetryHeaders = {} }) => {
+    // Register the account's catalog, like the other picker harnesses. A
+    // TTL-cached snapshot serves offline; a cold start with no network fails
+    // the `on` rather than register a list that was never fetched.
+    const { ids: catalogModelIds, available: catalogAvailable } = await loadRegisterableModels({
+      apiKey: effectiveKey,
+    });
+    return enableDeepseekFireworks({
+      settingsPath: paths.settingsPath,
+      credentialsPath: paths.credentialsPath,
+      dataDir: paths.dataDir,
+      effectiveApiKey: effectiveKey,
+      modelId,
+      headers: { ...telemetryHeaders, ...byokHeaders },
+      catalogModelIds,
+      catalogAvailable,
+    });
+  },
   envHookOn: (ctx, effectiveKey) => finishEnvHarnessOn(ctx.home, {
     harnessId: "deepseek",
     expectedKey: effectiveKey,
@@ -155,13 +179,15 @@ export default defineHarnessProfile({
     const payload = {
       harness: HARNESS.DEEPSEEK,
       provider,
-      baseUrl: DEEPSEEK_FIREWORKS_BASE_URL,
+      baseUrl: fireworksInferenceUrl(DEEPSEEK_FIREWORKS_BASE_URL, recordedHarnessResidency("deepseek", ctx.home)),
       modelProvider: DEEPSEEK_FIREWORKS_PROVIDER_ID,
       hasAuthToken,
       apiKeyMode,
       defaults: { main: defaultMainModel() },
       current: { main: model },
     };
+
+    payload.modelAccess = await harnessModelAccess(HARNESS.DEEPSEEK, ctx);
 
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
@@ -175,5 +201,6 @@ export default defineHarnessProfile({
       model: payload.current.main,
       keySource: harnessStatusKeySource(HARNESS.DEEPSEEK, payload.provider),
     });
+    printModelAccessNote(HARNESS.DEEPSEEK, payload.modelAccess);
   },
 });

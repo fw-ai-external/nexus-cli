@@ -55,6 +55,7 @@ export function resolveClaudeActivationPlan({
   ctx,
   snapshot,
   activeMappingIsCurrent,
+  isServed,
 }) {
   // Every tier slot defaults to native, but explicit `--opus` … `--subagent`
   // flags pin slots and re-`on` preserves pins saved by an earlier `on` (saved
@@ -65,8 +66,8 @@ export function resolveClaudeActivationPlan({
     ? snapshot.intent.mapping
     : {};
   const overrides = claudeSlotOverridesFromCtx(ctx);
-  const migratedSaved = migrateLegacyClaudeModelMapping(saved).mapping;
-  const migratedActive = migrateLegacyClaudeModelMapping(active).mapping;
+  const migratedSaved = migrateLegacyClaudeModelMapping(saved, { isServed }).mapping;
+  const migratedActive = migrateLegacyClaudeModelMapping(active, { isServed }).mapping;
   return {
     mapping: resolveClaudeModelMapping(
       mergeClaudeModelMappings(

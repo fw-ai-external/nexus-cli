@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { FIREWORKS_API_KEY_KEYCHAIN_REF, readGlobalConfig, writeGlobalConfig } from "../../lib/config/global-config.mjs";
-import { chatLanguageModelsPath } from "../../lib/harnesses/vscode/core.mjs";
+import { FIREWORKS_API_KEY_KEYCHAIN_REF } from "../../lib/config/global-config.mjs";
 import { runFireconnect, runCli, seedKeychainConfig, withTempHome } from "../helpers.mjs";
 
 const FW_KEY = "fw_test_fireworks_key_00000000000000";

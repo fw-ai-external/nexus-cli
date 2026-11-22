@@ -4,11 +4,15 @@ import {
   closeSync,
   unlinkSync,
   statSync,
+  renameSync,
+  linkSync,
 } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import { isReleaseVersion } from "./tarball-update.mjs";
 import { promptYesNo } from "../auth/login/prompts.mjs";
 import { readLocalVersion } from "./version.mjs";
 import {
@@ -110,25 +114,37 @@ export function hasActiveUpdateLock(home, now = Date.now()) {
   return lockAgeMs(home, now) < PENDING_TTL_MS;
 }
 
+function createLock(lockPath) {
+  try {
+    closeSync(openSync(lockPath, "wx"));
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") return false;
+    throw error;
+  }
+}
+
 export function tryAcquireUpdateLock(home, now = Date.now()) {
   const lockPath = updateLockPath(home);
   try {
     mkdirSync(path.dirname(lockPath), { recursive: true });
-    if (hasActiveUpdateLock(home, now)) {
+    if (createLock(lockPath)) return true;
+    if (hasActiveUpdateLock(home, now)) return false;
+    // Move the stale lock aside and check the file actually moved: if another
+    // process replaced it since our check, put its fresh lock back.
+    const aside = `${lockPath}.${process.pid}-${randomBytes(4).toString("hex")}`;
+    renameSync(lockPath, aside);
+    if (now - statSync(aside).mtimeMs < PENDING_TTL_MS) {
+      try {
+        linkSync(aside, lockPath);
+      } finally {
+        unlinkSync(aside);
+      }
       return false;
     }
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // No stale lock to remove.
-    }
-    const fd = openSync(lockPath, "wx");
-    closeSync(fd);
-    return true;
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      return false;
-    }
+    unlinkSync(aside);
+    return createLock(lockPath);
+  } catch {
     return false;
   }
 }
@@ -255,7 +271,7 @@ export async function checkForUpdates(command, homeOverride, options = {}) {
 
   const localVersion = readLocalVersion();
   const cache = readUpdateCache(home);
-  const latestVersion = typeof cache?.latestVersion === "string" ? cache.latestVersion : "";
+  const latestVersion = isReleaseVersion(cache?.latestVersion) ? cache.latestVersion : "";
   const gitInstall = isGitInstall(home);
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stderr;

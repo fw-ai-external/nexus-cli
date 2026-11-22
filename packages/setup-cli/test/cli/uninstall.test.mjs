@@ -1,18 +1,27 @@
-import { mkdtemp, readFile, writeFile, mkdir, access, lstat, symlink } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, access, lstat, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { userSettingsPath } from "../../lib/harnesses/claude/core.mjs";
-import { opencodeConfigPath } from "../../lib/harnesses/opencode/core.mjs";
+import { thirdPartyDir } from "../../lib/harnesses/claude-desktop/profile-lane.mjs";
+import { opencodeBackupPath, opencodeConfigPath, opencodeDataDir } from "../../lib/harnesses/opencode/core.mjs";
+import { piAuthPath, piModelsPath, piSettingsPath } from "../../lib/harnesses/pi/core.mjs";
 import { codexBackupPath, codexConfigPath, codexDataDir, CODEX_CATALOG_TOML_REF } from "../../lib/harnesses/codex/core.mjs";
 import { patchCodexCatalogRefRaw } from "../../lib/harnesses/codex/toml-patch.mjs";
 import { globalConfigPath, writeGlobalConfig } from "../../lib/config/global-config.mjs";
 import { writeJson } from "../../lib/io/json.mjs";
-import { runFireconnect } from "../helpers.mjs";
+import { isolatedProfileEnv, runCli, runFireconnect, supportsVscodeSqlite, withIsolatedProfileEnv, withTempHome } from "../helpers.mjs";
+import { fileURLToPath } from "node:url";
 import * as registry from "../../lib/harness/registry.mjs";
 import { HARNESS } from "../../lib/harness/id.mjs";
 import { runUninstallCommand } from "../../lib/cli/commands/global.mjs";
+import { vscodeDataDir, vscodeStateDbPath, writeVscodeBackup } from "../../lib/harnesses/vscode/core.mjs";
+import { detectVscodeInstall } from "../../lib/harnesses/vscode/install.mjs";
+import { ensureItemTable, readItemTableValue, writeItemTableValue } from "../../lib/harnesses/vscode/vscdb-sqlite.mjs";
+import { appUserDataDir } from "../../lib/io/user-data-dir.mjs";
+
+const hasVscodeSqlite = await supportsVscodeSqlite();
 
 async function pathExists(filePath) {
   try {
@@ -24,6 +33,104 @@ async function pathExists(filePath) {
 }
 
 describe("uninstall", () => {
+  it("does not discover VS Code profiles under the parent process's app data roots", async () => {
+    await withTempHome("uninstall-parent-profile-", async (parentHome) => {
+      const env = isolatedProfileEnv(parentHome);
+      const profilePath = path.join(appUserDataDir(parentHome, "Code - Insiders", { env }), "User", "chatLanguageModels.json");
+      await mkdir(path.dirname(profilePath), { recursive: true });
+      await writeFile(profilePath, "not valid JSON");
+
+      await withTempHome("uninstall-isolated-profile-", async (home) => {
+        const result = await withIsolatedProfileEnv(parentHome, () => runFireconnect(["uninstall", "--force"], { HOME: home }));
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(await readFile(profilePath, "utf8"), "not valid JSON");
+      });
+    });
+  });
+
+  for (const platform of ["win32", "linux", "darwin"]) {
+    const restoresStandardProfiles = platform === "win32";
+    const scope = restoresStandardProfiles ? "the explicit and standard" : "only the explicit";
+    it(`${platform}: uninstall --vscode-path restores ${scope} VS Code profiles and clears the install directory`, { skip: !hasVscodeSqlite }, async () => {
+      await withTempHome("uninstall-vscode-explicit-profile-", async (home) => {
+        const env = isolatedProfileEnv(home);
+        const vscodePath = path.join(home, "custom", "User", "chatLanguageModels.json");
+        const standardPaths = ["Code", "Code - Insiders"].map((folder) =>
+          path.join(appUserDataDir(home, folder, { env }), "User", "chatLanguageModels.json"));
+        const original = '[{"name":"User provider"}]\n';
+        const routed = '[{"apiKey":"${input:chat.lm.secret.fw-abcdef}"}]';
+        const secretId = "chat.lm.secret.fw-abcdef";
+        const secretKey = `secret://${secretId}`;
+        const profilePaths = [vscodePath, ...standardPaths];
+        for (const profilePath of profilePaths) {
+          await mkdir(path.dirname(profilePath), { recursive: true });
+          await writeFile(profilePath, routed);
+          const dbPath = vscodeStateDbPath({ vscodePath: profilePath });
+          await ensureItemTable(dbPath);
+          await writeItemTableValue(dbPath, secretKey, "test-value");
+          await writeVscodeBackup(vscodeDataDir(home), profilePath, {
+            fileExisted: true, fileRaw: original, secretIds: [secretId],
+          });
+        }
+        await writeFile(path.join(home, ".nexus", "update-check.json"), "{}");
+
+        await withIsolatedProfileEnv(home, () => runUninstallCommand(
+          { home, platform, vscodePath, force: true }, { checkProcesses: async () => {} },
+        ));
+        for (const profilePath of profilePaths) {
+          const shouldRestore = restoresStandardProfiles || profilePath === vscodePath;
+          assert.equal(await readFile(profilePath, "utf8"), shouldRestore ? original : routed, profilePath);
+          assert.equal(await readItemTableValue(vscodeStateDbPath({ vscodePath: profilePath }), secretKey), shouldRestore ? "" : "test-value", profilePath);
+        }
+        await assert.rejects(lstat(path.join(home, ".nexus")), { code: "ENOENT" });
+      });
+    });
+  }
+
+  for (const state of ["backup and marker", "backup only", "marker only"]) {
+    it(`win32: restores the non-default VS Code profile with ${state} before removing Nexus state`, { skip: !hasVscodeSqlite }, async () => {
+      await withTempHome("uninstall-vscode-profiles-", async (home) => {
+        const env = isolatedProfileEnv(home);
+        const selected = detectVscodeInstall(undefined, { env, home })?.folder || "Code";
+        const other = selected === "Code" ? "Code - Insiders" : "Code";
+        const modelsPath = (folder) => path.join(appUserDataDir(home, folder, { env }), "User", "chatLanguageModels.json");
+        const selectedPath = modelsPath(selected);
+        const otherPath = modelsPath(other);
+        const dbPath = vscodeStateDbPath({ vscodePath: otherPath });
+        const original = '[{"name":"User provider"}]\n';
+        const selectedOriginal = '[{"name":"Default profile provider"}]\n';
+        const secretId = "chat.lm.secret.fw-abcdef";
+        const secretKey = `secret://${secretId}`;
+        await mkdir(path.dirname(selectedPath), { recursive: true });
+        await mkdir(path.dirname(otherPath), { recursive: true });
+        await writeFile(selectedPath, selectedOriginal);
+        const entries = JSON.parse(original);
+        if (state !== "backup only") entries.push({ apiKey: "${input:chat.lm.secret.fw-abcdef}" });
+        await writeFile(otherPath, JSON.stringify(entries));
+        const dataDir = vscodeDataDir(home);
+        if (state !== "marker only") {
+          await writeVscodeBackup(dataDir, otherPath, { fileExisted: true, fileRaw: original, secretIds: [secretId] });
+        }
+        await ensureItemTable(dbPath);
+        await writeItemTableValue(dbPath, secretKey, "test-value");
+
+        await withIsolatedProfileEnv(home, async () => {
+          for (const platform of ["linux", "darwin"]) {
+            const ids = await registry.listHarnessIdsToRestore({ platform }, home);
+            assert.ok(!ids.includes(HARNESS.VSCODE), platform);
+          }
+          await runUninstallCommand({ home, platform: "win32", force: true }, { checkProcesses: async () => {} });
+        });
+        const restored = await readFile(otherPath, "utf8");
+        if (state !== "marker only") assert.equal(restored, original);
+        assert.deepEqual(JSON.parse(restored), JSON.parse(original));
+        assert.equal(await readItemTableValue(dbPath, secretKey), "");
+        assert.equal(await readFile(selectedPath, "utf8"), selectedOriginal);
+        assert.equal(await pathExists(dataDir), false);
+      });
+    });
+  }
+
   it("restores claude, opencode, and codex then removes state", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-"));
     const settingsDir = path.join(home, ".claude");
@@ -54,7 +161,7 @@ describe("uninstall", () => {
     await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home }), await runFireconnect(["opencode", "on"], { HOME: home }));
     await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" }), await runFireconnect(["codex", "on"], { HOME: home, FIREWORKS_API_KEY: "" }));
 
-    // Regression (gh fw-ai/nexus-cli#12): a leftover ~/.nexus file
+    // Regression (gh fw-ai-external/nexus-cli#12): a leftover ~/.nexus file
     // (e.g. the update-check cache) must not survive uninstall.
     await writeFile(path.join(home, ".nexus/update-check.json"), '{"lastCheck":1}');
 
@@ -78,6 +185,37 @@ describe("uninstall", () => {
     // gh #12: nothing left in ~/.nexus, and the dir itself is gone.
     assert.equal(await pathExists(path.join(home, ".nexus/update-check.json")), false);
     assert.equal(await pathExists(path.join(home, ".nexus")), false);
+  });
+
+  it("win32: restores other harnesses before aborting uninstall for a malformed VS Code profile", { skip: process.platform !== "win32" }, async () => {
+    await withTempHome("uninstall-malformed-vscode-", async (home) => {
+      const env = isolatedProfileEnv(home);
+      const selected = detectVscodeInstall(undefined, { env, home })?.folder || "Code";
+      const other = selected === "Code" ? "Code - Insiders" : "Code";
+      const modelsPath = path.join(appUserDataDir(home, other, { env }), "User", "chatLanguageModels.json");
+      await mkdir(path.dirname(modelsPath), { recursive: true });
+      await writeFile(modelsPath, "not valid JSON");
+
+      const settingsPath = userSettingsPath(home);
+      const original = JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-original" } });
+      await mkdir(path.dirname(settingsPath), { recursive: true });
+      await writeFile(settingsPath, original);
+      const login = await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home });
+      assert.equal(login.code, 0, login.stderr);
+      const on = await runFireconnect(["claude", "on"], { HOME: home });
+      assert.equal(on.code, 0, on.stderr);
+      assert.notEqual(await readFile(settingsPath, "utf8"), original);
+      const cachePath = path.join(home, ".nexus", "update-check.json");
+      await writeFile(cachePath, "{}");
+
+      const result = await runCli(["uninstall", "--force"], { home, env });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /Stopped before removing Nexus CLI\./);
+      assert.match(result.stdout, /VS Code could not be restored:[\s\S]*chatLanguageModels\.json is not valid JSON/);
+      assert.equal(await readFile(settingsPath, "utf8"), original);
+      assert.equal(await readFile(modelsPath, "utf8"), "not valid JSON");
+      assert.equal(await readFile(cachePath, "utf8"), "{}");
+    });
   });
 
   it("restores codex from a legacy fireworks-azure routing on uninstall", async () => {
@@ -201,6 +339,68 @@ describe("uninstall", () => {
     assert.equal(after, originalSettings);
   });
 
+  it("still counts OpenCode as routed when its Nexus backup is unreadable", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-opencode-bad-backup-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      model: "fireworks-ai/accounts/fireworks/models/example-model",
+      provider: { "fireworks-ai": { options: { apiKey: "{env:FIREWORKS_API_KEY}" } } },
+    }, null, 2)}\n`);
+    const backupPath = opencodeBackupPath(opencodeDataDir(home), configPath);
+    await mkdir(path.dirname(backupPath), { recursive: true });
+    await writeFile(backupPath, "{ not json");
+
+    assert.equal((await registry.listRoutedHarnessIds({}, home)).includes(HARNESS.OPENCODE), true);
+  });
+
+  it("leaves the user's own OpenCode Fireworks provider alone when Nexus never turned it on", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-own-opencode-"));
+    const configPath = opencodeConfigPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = `${JSON.stringify({
+      model: "fireworks-ai/accounts/fireworks/models/example-model",
+      provider: { "fireworks-ai": { options: { apiKey: "{env:FIREWORKS_API_KEY}" } } },
+    }, null, 2)}\n`;
+    await writeFile(configPath, original);
+    await mkdir(path.join(home, ".nexus"), { recursive: true });
+
+    assert.equal((await registry.listRoutedHarnessIds({}, home)).includes(HARNESS.OPENCODE), false);
+    const uninstallResult = await runFireconnect(["uninstall", "--force"], { HOME: home });
+    assert.equal(uninstallResult.code, 0, uninstallResult.stderr);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  });
+
+});
+
+describe("uninstall after a Claude Desktop on that failed midway", { skip: process.platform === "win32" }, () => {
+  it("uninstall --force restores Desktop's profile library byte for byte", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-desktop-"));
+    const lib = path.join(thirdPartyDir(home), "configLibrary");
+    const deviceConfig = path.join(thirdPartyDir(home), "claude_desktop_config.json");
+    const original = JSON.stringify({ inferenceGatewayBaseUrl: "https://gateway.example.com" });
+    const meta = JSON.stringify({ appliedId: "original", entries: [{ id: "original", name: "Original" }] });
+    await mkdir(lib, { recursive: true });
+    await writeFile(path.join(lib, "original.json"), original);
+    await writeFile(path.join(lib, "_meta.json"), meta);
+    // A directory where the device config belongs makes `on` fail after
+    // Desktop already points at the Fireworks profile.
+    await mkdir(deviceConfig);
+    // Pin the child's config root so a runner's XDG_CONFIG_HOME can't move Desktop's data dir.
+    const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config") };
+
+    await runFireconnect(["login", "--api-key", "fw_test_cataloged_key_12345"], env);
+    const failed = await runFireconnect(["claude-desktop", "on"], env);
+    assert.notEqual(failed.code, 0, "on fails at the device-config step");
+    assert.notEqual(await readFile(path.join(lib, "_meta.json"), "utf8"), meta, "Desktop was left on the Fireworks profile");
+    await rm(deviceConfig, { recursive: true });
+
+    const uninstall = await runFireconnect(["uninstall", "--force"], env);
+    assert.equal(uninstall.code, 0, uninstall.stderr);
+    assert.equal(await readFile(path.join(lib, "_meta.json"), "utf8"), meta, "uninstall restored the profile library");
+    assert.equal(await readFile(path.join(lib, "original.json"), "utf8"), original);
+    assert.equal(await pathExists(path.join(home, ".nexus")), false);
+  });
 });
 
 describe("uninstall (interactive path)", () => {
@@ -219,18 +419,7 @@ describe("uninstall (interactive path)", () => {
     });
   }
 
-  /** Run `fn` with HOME pointed at `home` (runUninstallCommand reads process.env.HOME). */
-  function withHome(home, fn) {
-    const realHome = process.env.HOME;
-    process.env.HOME = home;
-    return Promise.resolve(fn()).finally(() => {
-      if (realHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = realHome;
-      }
-    });
-  }
+  const withHome = withIsolatedProfileEnv;
 
   /**
    * Present a harness as routed (or not) and optionally stub its `off`.
@@ -244,14 +433,16 @@ describe("uninstall (interactive path)", () => {
    */
   function stubHarness(id, { routed = true, off } = {}) {
     const adapter = registry.getHarness(id);
-    const orig = { off: adapter.off, providerStatus: adapter.providerStatus };
+    const orig = { off: adapter.off, providerStatus: adapter.providerStatus, ownsRouting: adapter.ownsRouting };
     adapter.providerStatus = async () => (routed ? "fireworks" : "none");
+    adapter.ownsRouting = async () => routed;
     if (off) {
       adapter.off = off;
     }
     return () => {
       adapter.off = orig.off;
       adapter.providerStatus = orig.providerStatus;
+      adapter.ownsRouting = orig.ownsRouting;
     };
   }
 
@@ -741,6 +932,19 @@ describe("legacy data directory next to an existing ~/.nexus", () => {
     assert.doesNotMatch(result.stdout, /Left ~\/\.nexus-pre:/);
   });
 
+  it("finishes when the recorded ~/.nexus-pre is missing", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-nexus-pre-missing-"));
+    await mkdir(path.join(home, ".nexus"), { recursive: true });
+    await writeFile(path.join(home, ".nexus/set-aside.json"), '[".nexus-pre", ".nexus-pre-1"]\n');
+
+    const result = await runFireconnect(["uninstall"], { HOME: home });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(await pathExists(path.join(home, ".nexus")), false);
+    assert.equal(await pathExists(path.join(home, ".nexus-pre")), false);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /Left ~\/\.nexus-pre:|Couldn't remove|could not remove/i);
+  });
+
   it("removes a kept ~/.nexus-pre, and only the link when it points into dotfiles", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-nexus-pre-"));
     await mkdir(path.join(home, "dotfiles/fireconnect"), { recursive: true });
@@ -754,5 +958,90 @@ describe("legacy data directory next to an existing ~/.nexus", () => {
     assert.equal(await pathExists(path.join(home, ".nexus-pre")), false);
     assert.equal(await pathExists(path.join(home, ".fireconnect")), false);
     assert.equal(await readFile(path.join(home, "dotfiles/fireconnect/config.json"), "utf8"), "{}");
+  });
+});
+
+describe("uninstall after an interrupted on", () => {
+  it("restores Pi when `pi on` died between its settings and auth writes", async () => {
+    // connectPi rewrites settings.json before it writes anything that marks Pi
+    // as Nexus-routed. If `on` dies in between, uninstall must still find Pi
+    // and restore settings.json before it deletes the snapshot in ~/.nexus.
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-pi-crash-"));
+    const settingsPath = piSettingsPath(home);
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    const original = '{\n  "defaultProvider": "anthropic",\n  "defaultModel": "claude-sonnet-4-5"\n}\n';
+    await writeFile(settingsPath, original);
+    assert.equal((await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home })).code, 0);
+
+    const preload = fileURLToPath(new URL("../fixtures/crash-before-write.mjs", import.meta.url));
+    const on = await runFireconnect(["pi", "on"], {
+      HOME: home,
+      NODE_OPTIONS: `--import ${preload}`,
+      NEXUS_TEST_CRASH_BEFORE_WRITE: piAuthPath(home),
+    });
+    assert.notEqual(on.code, 0, "pi on must die before writing auth.json");
+    assert.notEqual(await readFile(settingsPath, "utf8"), original, "settings.json was rewritten before the crash");
+
+    assert.equal((await runFireconnect(["uninstall", "--force"], { HOME: home })).code, 0);
+    assert.equal(await readFile(settingsPath, "utf8"), original);
+  });
+
+  it("restores Pi's models.json when `pi off` died before restoring it", async () => {
+    // disablePiFireworks restores one file at a time. If `off` dies part way,
+    // Pi must still look routed so uninstall restores the rest before it
+    // deletes their snapshots in ~/.nexus.
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-uninstall-pi-off-crash-"));
+    const settingsPath = piSettingsPath(home);
+    const modelsPath = piModelsPath(home);
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    const settings = '{\n  "defaultProvider": "anthropic",\n  "defaultModel": "claude-sonnet-4-5"\n}\n';
+    const models = '{\n  "providers": {\n    "local": { "baseUrl": "http://127.0.0.1:11434/v1" }\n  }\n}\n';
+    await writeFile(settingsPath, settings);
+    await writeFile(modelsPath, models);
+    assert.equal((await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home })).code, 0);
+    assert.equal((await runFireconnect(["pi", "on"], { HOME: home })).code, 0);
+    assert.notEqual(await readFile(modelsPath, "utf8"), models, "pi on adds its provider to models.json");
+
+    const preload = fileURLToPath(new URL("../fixtures/crash-before-write.mjs", import.meta.url));
+    const off = await runFireconnect(["pi", "off"], {
+      HOME: home,
+      NODE_OPTIONS: `--import ${preload}`,
+      NEXUS_TEST_CRASH_BEFORE_WRITE: modelsPath,
+    });
+    assert.notEqual(off.code, 0, "pi off must die before restoring models.json");
+
+    assert.equal((await runFireconnect(["uninstall", "--force"], { HOME: home })).code, 0);
+    assert.equal(await readFile(modelsPath, "utf8"), models);
+    assert.equal(await readFile(settingsPath, "utf8"), settings);
+  });
+
+  it("keeps Pi's own fireworks entries when `on` runs again after an `off` that died before settings.json", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-pi-off-crash-reon-"));
+    const settingsPath = piSettingsPath(home);
+    const authPath = piAuthPath(home);
+    const modelsPath = piModelsPath(home);
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    const settings = '{\n  "defaultProvider": "anthropic",\n  "defaultModel": "claude-sonnet-4-5"\n}\n';
+    const auth = '{\n  "fireworks": { "type": "api_key", "key": "fw_users_own_key" }\n}\n';
+    const models = '{\n  "providers": {\n    "fireworks": { "baseUrl": "https://example.test/v1" }\n  }\n}\n';
+    await writeFile(settingsPath, settings);
+    await writeFile(authPath, auth, { mode: 0o600 });
+    await writeFile(modelsPath, models);
+    assert.equal((await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home })).code, 0);
+    assert.equal((await runFireconnect(["pi", "on"], { HOME: home })).code, 0);
+
+    const preload = fileURLToPath(new URL("../fixtures/crash-before-write.mjs", import.meta.url));
+    const off = await runFireconnect(["pi", "off"], {
+      HOME: home,
+      NODE_OPTIONS: `--import ${preload}`,
+      NEXUS_TEST_CRASH_BEFORE_WRITE: settingsPath,
+    });
+    assert.notEqual(off.code, 0, "pi off must die before restoring settings.json");
+
+    assert.equal((await runFireconnect(["pi", "on"], { HOME: home })).code, 0);
+    assert.equal((await runFireconnect(["pi", "off"], { HOME: home })).code, 0);
+    assert.equal(await readFile(modelsPath, "utf8"), models);
+    assert.equal(await readFile(authPath, "utf8"), auth);
+    assert.equal(await readFile(settingsPath, "utf8"), settings);
   });
 });

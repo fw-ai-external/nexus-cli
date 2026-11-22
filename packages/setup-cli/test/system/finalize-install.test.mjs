@@ -143,6 +143,28 @@ describe("finalizeInstallOrUpgrade", () => {
     });
   });
 
+  it("prints the recovery steps when reprobe finds an undecryptable key store", async () => {
+    await withTempHome("finalize-key-store-error-", async (home) => {
+      const logged = [];
+      const keyStoreError = new Error("The encrypted key store can't be decrypted with the current master key.");
+      const result = await finalizeInstallOrUpgrade({
+        home,
+        setupDir: "/nonexistent-setup-for-test",
+        log: (line) => logged.push(line),
+        ensureDeps: () => true,
+        reprobe: async () => ({ migrated: false, backend: { backend: "plaintext" }, keyStoreError }),
+        refreshCatalog: async () => {},
+        rename: async () => [],
+        migrate: async () => [],
+        reconcile: async () => [],
+        codexSignIn: async () => [],
+        providerKeys: async () => [],
+      });
+      assert.equal(result.migrated, false);
+      assert.deepEqual(logged, [keyStoreError.message]);
+    });
+  });
+
   it("swallows reprobe and reconcile failures (best-effort)", async () => {
     await withTempHome("finalize-best-effort-", async (home) => {
       const result = await finalizeInstallOrUpgrade({

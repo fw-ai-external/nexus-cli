@@ -9,8 +9,12 @@ import {
   getSecret,
   hasSecret,
   resetSecretStoreForTests,
+  SECRET_ACCOUNT,
+  SECRET_SERVICE,
   setSecret,
 } from "../../lib/keys/secret-store.mjs";
+import { builtinDeletePassword, builtinSetPassword } from "../../lib/keys/builtin-file-secret-store.mjs";
+import { readKeyStorageCacheEntry } from "../../lib/keys/storage-cache.mjs";
 import { seedKeychainConfig, withTempHome } from "../helpers.mjs";
 
 describe("secret-store", () => {
@@ -226,6 +230,22 @@ describe("secret-store", () => {
         assert.equal(await getSecret(), "fw_cache_key_aaaa");
       }
       assert.equal(await hasSecret(), true);
+
+      await builtinSetPassword(SECRET_SERVICE, SECRET_ACCOUNT, "fw_cache_key_external");
+      assert.equal(await getSecret(), "fw_cache_key_aaaa");
+      assert.equal(await getSecret(undefined, { fresh: true }), "fw_cache_key_external");
+      await builtinDeletePassword(SECRET_SERVICE, SECRET_ACCOUNT);
+      assert.equal(await getSecret(), "fw_cache_key_external");
+      assert.equal(await getSecret(undefined, { fresh: true }), null);
+      await builtinSetPassword(SECRET_SERVICE, SECRET_ACCOUNT, "fw_cache_key_restored");
+      assert.equal(await getSecret(), null);
+      assert.equal(await getSecret(undefined, { fresh: true }), "fw_cache_key_restored");
+
+      const priorStorage = await readKeyStorageCacheEntry(home);
+      await writeFile(path.join(home, ".nexus/key-storage.json"), JSON.stringify({ storage: "file", reason: "updated" }));
+      assert.deepEqual(await readKeyStorageCacheEntry(home), priorStorage);
+      assert.equal(await getSecret(undefined, { fresh: true }), "fw_cache_key_restored");
+      assert.equal((await readKeyStorageCacheEntry(home)).reason, "updated");
 
       // A write updates the cache — the next read must not return the old value.
       await setSecret("fw_cache_key_bbbb");

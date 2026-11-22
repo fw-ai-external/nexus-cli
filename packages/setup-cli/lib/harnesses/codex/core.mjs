@@ -1,7 +1,8 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, unlink } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import {
@@ -9,6 +10,7 @@ import {
   dropRetiredModelId,
   isAutoInstantModelId,
   shortFireworksModelRef,
+  FIREWORKS_OPENAI_BASE_URL,
 } from "../../fireworks/model-id.mjs";
 import { isFirerouterModelPattern } from "../../fireworks/model-specs.mjs";
 import { readJsonIfExists, writeJson } from "../../io/json.mjs";
@@ -19,7 +21,6 @@ import {
 import { readRawIfExists } from "../opencode/core.mjs";
 import { parseToml } from "./toml.mjs";
 import {
-  patchCodexCatalogRefRaw,
   patchCodexProviderAuthRaw,
   patchFireconnectRoutingRaw,
   repairDuplicateCodexHttpHeadersRaw,
@@ -30,6 +31,8 @@ import {
   buildCodexCatalogFromSnapshot,
   codexCatalogContainsModel,
   codexModelExclusionReason,
+  codexModelRef,
+  codexModelSlug,
   isCodexStaleFirerouterRow,
   refreshCodexCatalogRows,
   withCodexAutoRows,
@@ -52,6 +55,8 @@ import {
   OPENAI_BYOK_HEADER,
   withoutHeaders,
 } from "../../firerouter/core.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
+import { canInstallCodexPet, installCodexPet, removeCodexPet, selectsCodexPet } from "./pet-patch.mjs";
 export { printCodexRestartHint } from "../../cli/messages.mjs";
 
 export const CODEX_CONFIG_RELATIVE_PATH = ".codex/config.toml";
@@ -59,7 +64,7 @@ export const CODEX_DATA_RELATIVE_DIR = ".nexus/codex";
 export const CODEX_CATALOG_RELATIVE_PATH = ".codex/fireworks-model-catalog.json";
 export const CODEX_CATALOG_TOML_REF = `~/${CODEX_CATALOG_RELATIVE_PATH}`;
 export const CODEX_FIREWORKS_PROVIDER_ID = "fireworks-ai";
-export const CODEX_FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+export const CODEX_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 export const CODEX_API_KEY_ENV_REF = "{env:FIREWORKS_API_KEY}";
 export const CODEX_PROVIDER_TABLE = `model_providers.${CODEX_FIREWORKS_PROVIDER_ID}`;
 // Foundry routing written by releases before Codex CLI 0.160 removed
@@ -209,7 +214,7 @@ export function codexChatgptLoginFireworksKey(table) {
 
 function isManagedProviderTable(table) {
   return table
-    && table.base_url === CODEX_FIREWORKS_BASE_URL
+    && isFireworksInferenceUrl(table.base_url, CODEX_FIREWORKS_BASE_URL)
     && (table.env_key === "FIREWORKS_API_KEY"
       || typeof table.experimental_bearer_token === "string"
       || Boolean(codexChatgptLoginFireworksKey(table)));
@@ -275,32 +280,8 @@ export function codexCurrentModelId(doc) {
     // Foundry deployment names are used verbatim — no accounts/ prefix.
     return model;
   }
-  return shortFireworksModelRef(model);
-}
-
-/**
- * The rows of the catalog config.toml points Codex at, or [] when it points at none.
- * @param {{ root: Record<string, unknown> }} doc
- * @param {string} catalogPath
- * @returns {Promise<Array<{ slug?: string, display_name?: string }>>}
- */
-export async function readCodexManagedCatalogRows(doc, catalogPath) {
-  if (!doc.root.model_catalog_json) {
-    return [];
-  }
-  const catalog = await readCodexCatalogIfValid(catalogPath);
-  return Array.isArray(catalog?.models) ? catalog.models : [];
-}
-
-/**
- * Whether the saved model is a stale FireRouter row of the catalog, which a
- * re-`on` moves to bare `firerouter`.
- * @param {{ root: Record<string, unknown>, tables: Record<string, Record<string, unknown>> }} doc
- * @param {Array<{ slug?: string, display_name?: string }>} rows
- */
-export function codexSavesStaleFirerouterRow(doc, rows) {
-  const current = codexCurrentModelId(doc);
-  return Boolean(current) && rows.some((row) => isCodexStaleFirerouterRow(row) && row.slug === current);
+  // Codex names the auto mix `nexus/auto`; Nexus reports it as `auto`.
+  return codexModelRef(model);
 }
 
 /**
@@ -611,13 +592,14 @@ export async function enableCodexFireworks({
   };
   const routing = {
     providerId: CODEX_FIREWORKS_PROVIDER_ID,
-    baseUrl: CODEX_FIREWORKS_BASE_URL,
-    modelId: storedModel,
+    baseUrl: fireworksInferenceUrl(CODEX_FIREWORKS_BASE_URL, activeAccountResidency("codex")),
+    modelId: codexModelSlug(storedModel),
     apiKey: resolvedEffective,
     literalAuth: true,
     chatgptLogin: true,
     httpHeaders: withChatgptLoginFireworksKey(httpHeaders, resolvedEffective),
     envHttpHeaders: withoutHeaders(providerTable.env_http_headers, CODEX_REBUILT_HEADERS),
+    pet: canInstallCodexPet(configPath),
   };
   // Refuse before the backup or catalog is touched, so a refused `on` leaves
   // nothing behind for `off` to restore.
@@ -637,14 +619,13 @@ export async function enableCodexFireworks({
     const catalogSnapshot = catalogPath
       ? await readRawIfExists(catalogPath)
       : { existed: false, raw: "" };
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+    ensurePrivateParent(backupPath);
     await writeJson(backupPath, {
       configPath: path.resolve(configPath),
       snapshot,
       catalogPath: catalogPath ? path.resolve(catalogPath) : "",
       catalogSnapshot,
-    });
-    await chmod(backupPath, 0o600);
+    }, { mode: 0o600 });
   }
 
   // FireRouter rows only survive when the selection itself is a FireRouter
@@ -664,7 +645,9 @@ export async function enableCodexFireworks({
     const managedCatalog = snapshotReferencesFireworksCatalog(snapshot.raw)
       ? existingCatalog
       : null;
-    const managedModels = withoutStaleFirerouterRows(managedCatalog?.models);
+    // Earlier releases' bare `auto` row becomes `nexus/auto` before the
+    // refresh, so it isn't kept beside the fresh `nexus/auto` row.
+    const managedModels = withCodexAutoRows(withoutStaleFirerouterRows(managedCatalog?.models));
     // Shared list policy: a managed catalog tracks the account's catalog on
     // every `on`, `--model` or not; a fresh install seeds the whole fetched
     // catalog (the file drives the ChatGPT app model dropdown, so a
@@ -691,7 +674,7 @@ export async function enableCodexFireworks({
       effectiveCatalogPath = CODEX_CATALOG_TOML_REF;
       catalogWritten = true;
     }
-    catalogModelsWritten = (catalogToWrite.models ?? []).map((entry) => entry.slug).filter(Boolean);
+    catalogModelsWritten = (catalogToWrite.models ?? []).map((entry) => entry.slug).filter(Boolean).map(codexModelRef);
   } else if (
     catalogPath
     && existsSync(catalogPath)
@@ -719,6 +702,12 @@ export async function enableCodexFireworks({
   await mkdir(path.dirname(configPath), { recursive: true });
   if (nextRaw !== original.raw) {
     await writeCodexConfig(configPath, nextRaw, { mode: 0o600 });
+  }
+  // The Fireworks terminal pet, after the config write so its folder only
+  // exists while Nexus routes Codex; only when the config selects it (not when
+  // the user chose their own pet).
+  if (selectsCodexPet(nextRaw)) {
+    await installCodexPet(configPath);
   }
 
   return {
@@ -821,6 +810,9 @@ export async function removeCodexSavedProviderKeys({ configPath, headerNames }) 
 }
 
 export async function disableCodexFireworks({ configPath, dataDir, catalogPath = "", wasEnabled = false }) {
+  // Pet first: a disable that stops after restoring the config would leave
+  // Codex unrouted, and `off` / `uninstall` would never come back for it.
+  await removeCodexPet(configPath);
   const backupPath = codexBackupPath(dataDir, configPath);
   const backup = await readJsonIfExists(backupPath);
   const snapshot = await readRawIfExists(configPath);

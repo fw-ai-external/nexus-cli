@@ -9,6 +9,7 @@ import {
   printNote,
 } from "../../cli/messages.mjs";
 import {
+  printModelAccessNote,
   printStructuredHarnessStatus,
 } from "../../harness/status-display.mjs";
 import {
@@ -29,6 +30,13 @@ import {
 } from "../../fireworks/model-id.mjs";
 import { assertRequestedModelsServable } from "../../fireworks/model-servability.mjs";
 import {
+  MODEL_ACCESS_POLICY_HINT,
+  blockedConfiguredModels,
+  isModelInCatalog,
+  offerModelAccessSwitch,
+  pickReplacementModel,
+} from "../../fireworks/model-access.mjs";
+import {
   isAnthropicModelId,
   isClaudeModelAlias,
   isClaudeNativeModel,
@@ -38,7 +46,6 @@ import {
 import { readJsonIfExists, writeJson } from "../../io/json.mjs";
 import {
   isFireworksKey,
-  MISSING_FIREWORKS_API_KEY_MESSAGE,
 } from "../../keys/key-type.mjs";
 import { withoutDesktopGuardHook } from "./desktop-guard.mjs";
 import {
@@ -66,12 +73,15 @@ import {
   attachPricing,
   CLAUDE_CODE_PRICING_DISCLAIMER,
 } from "../../fireworks/pricing.mjs";
-import { loadRegisterableModels, warmServerlessPricingCache } from "../../fireworks/models.mjs";
+import {
+  loadRegisterableModels,
+  warmServerlessPricingCache,
+} from "../../fireworks/models.mjs";
 import {
   formatNonVisionModelsWarning,
   uniqueNonVisionModelShortIds,
 } from "../../fireworks/vision.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess, servedCatalogForOn } from "../../harness/engine.mjs";
 import {
   claudePathsFor,
   ensureHomeForHarness,
@@ -95,7 +105,7 @@ import {
   persistApiKeyFromFlag,
   resolveFireworksApiKeyValue,
 } from "../../keys/api-key.mjs";
-import { harnessFullKey } from "../../keys/harness-api-key.mjs";
+import { harnessFullKey, missingHarnessKeyError } from "../../keys/harness-api-key.mjs";
 import { LIVE_KEY } from "../../keys/key-current.mjs";
 import { detectSecretBackend } from "../../keys/secret-store.mjs";
 import { assertBackendCanStore } from "../../keys/storage-report.mjs";
@@ -109,6 +119,7 @@ import {
   resolveClaudeActivationPlan,
 } from "./activation.mjs";
 import {
+  CLAUDE_TIER_SLOTS,
   claudeBareFirerouterRequested,
   claudeExtraPickerModelFromCtx,
   claudeSlotOverridesFromCtx,
@@ -129,6 +140,7 @@ import {
   claudeCodeShowsModelPicker,
   installedClaudeCodeVersion,
 } from "./claude-code-version.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, resolveHarnessResidency } from "../../fireworks/residency.mjs";
 
 const CLAUDE_FIREROUTER = Object.freeze({
   byok: "none",
@@ -200,7 +212,7 @@ async function claudeApiKeyForOn(ctx, snapshot) {
     async () => resolveClaudeAuthState(snapshot.settings, snapshot.state).token,
   );
   if (!token) {
-    throw new Error(MISSING_FIREWORKS_API_KEY_MESSAGE);
+    throw missingHarnessKeyError();
   }
   // `--api-key` was already verified by runHarnessCommand.
   if (!ctx.apiKeyFromFlag) {
@@ -365,10 +377,114 @@ async function prepareClaudeV09Baseline({ settingsPath, dataDir, intent }) {
   await writeJson(settingsPath, baseline, { mode: 0o600 });
 }
 
+/**
+ * The Fireworks models Claude Code's settings select while routed: the
+ * /model default (`main`), each pinned tier slot, and the /model picker rows
+ * Nexus registered (`picker`). Native slots and Anthropic ids are not
+ * Fireworks selections and are left out.
+ * @param {import("../../harness/types.mjs").HarnessContext} ctx
+ */
+async function claudeConfiguredModels(ctx) {
+  const { settingsPath } = claudePathsFor(ctx);
+  const settings = await readJsonIfExists(settingsPath);
+  const env = settings.env ?? {};
+  if (providerStatusFromEnv(env) !== "fireworks") {
+    return [];
+  }
+  const mapping = mappingFromSettings(settings);
+  const slots = ["main", ...CLAUDE_TIER_SLOTS]
+    .filter((slot) => typeof mapping[slot] === "string" && !isClaudeNativeModel(mapping[slot]))
+    .map((slot) => ({ slot, model: mapping[slot] }));
+  return [...slots, ...claudeRegisteredPickerModels(settings).map((model) => ({ slot: "picker", model }))];
+}
+
+/**
+ * The /model picker rows Nexus registered: Fireworks rows only, never Claude's own.
+ * @param {Record<string, any>} settings
+ */
+function claudeRegisteredPickerModels(settings) {
+  // Claude Code strips the managed marker when it persists a /model pick,
+  // so a Fireworks-routed picker is Nexus territory with or without it.
+  const pickerIsNexusTerritory = isFireconnectModelPicker(settings.modelPicker)
+    || providerStatusFromEnv(settings.env ?? {}) === "fireworks";
+  if (!pickerIsNexusTerritory) {
+    return [];
+  }
+  return (settings.modelPicker?.options ?? [])
+    .map((option) => option?.model)
+    .filter((id) => typeof id === "string" && id.trim())
+    .filter((id) => {
+      const normalized = shortFireworksModelRef(normalizeModelId(id));
+      return !isAnthropicModelId(normalized) && !isClaudeModelAlias(normalized);
+    });
+}
+
+/**
+ * On a re-`on`, tier slots pinned (by an earlier `on` or the saved profile)
+ * to a model the account's served catalog no longer lists: say so and, at a
+ * terminal, ask whether to switch them to an allowed model. Slots set by
+ * this run's flags were already checked. Returns the mapping to write, with
+ * the switched slots replaced only on a yes. Never throws.
+ * @param {{ ctx: object, mapping: Record<string, string>, slotOverrides: Record<string, string>, catalog: Array<object>, entries: Array<object> }} args
+ */
+async function offerAllowedClaudeSlots({ ctx, mapping, slotOverrides, catalog, entries }) {
+  const configured = CLAUDE_TIER_SLOTS
+    .filter((slot) => !slotOverrides[slot] && mapping[slot] && !isClaudeNativeModel(mapping[slot]))
+    .map((slot) => ({ slot, model: mapping[slot] }));
+  const blocked = blockedConfiguredModels(configured, catalog);
+  if (!blocked.length) {
+    return mapping;
+  }
+  // The rows the API returned, not `catalog` (which always gains `auto`).
+  const replacement = pickReplacementModel(entries, {
+    exclude: blocked.map(({ model }) => model),
+  });
+  const flags = blocked.map(({ slot }) => `--${slot} ${replacement}`).join(" ");
+  const agreed = await offerModelAccessSwitch({
+    ctx,
+    harnessCommand: HARNESS.CLAUDE,
+    blocked,
+    replacement,
+    switchCommand: `nexus claude on ${flags}`,
+  });
+  if (!agreed) {
+    return mapping;
+  }
+  const next = { ...mapping };
+  for (const { slot } of blocked) {
+    next[slot] = replacement;
+  }
+  return next;
+}
+
+/**
+ * `on` keeps a saved /model default only when the picker serves it, so a
+ * default the account can no longer use moves to the one `on` writes. Say so
+ * when that happened because the served catalog doesn't list it.
+ * @param {Record<string, any>} before settings before `on`
+ * @param {Record<string, any> | undefined} after settings `on` wrote
+ * @param {Array<object>} catalog
+ * @returns {string}
+ */
+function blockedDefaultReplacedNote(before, after, catalog) {
+  const previous = typeof before?.model === "string" ? before.model.trim() : "";
+  const next = typeof after?.model === "string" ? after.model : "";
+  if (!previous || !next || shortFireworksModelRef(previous) === shortFireworksModelRef(next)) {
+    return "";
+  }
+  const [blocked] = blockedConfiguredModels([{ slot: "main", model: previous }], catalog);
+  if (!blocked) {
+    return "";
+  }
+  return `Your /model default ${blocked.model} isn't available to this account. ${MODEL_ACCESS_POLICY_HINT} `
+    + `Claude Code now starts on ${shortFireworksModelRef(next)}; pick another model with /model.`;
+}
+
 export default defineHarnessProfile({
   id: HARNESS.CLAUDE,
   label: "Claude Code",
   resolveKey: claudeResolveKey,
+  configuredModels: claudeConfiguredModels,
   firerouter: CLAUDE_FIREROUTER,
   // Claude's `on` is bespoke (slot mapping and raw-snapshot backup).
   async on(ctx) {
@@ -388,6 +504,10 @@ export default defineHarnessProfile({
       snapshot.backup,
     );
     const fireworksKey = await claudeApiKeyForOn(ctx, snapshot);
+    // Claude Code's base URL follows the account's data residency.
+    const residencyState = await resolveHarnessResidency(fireworksKey, HARNESS.CLAUDE, ctx.home, {
+      onNote: (line) => { if (!ctx.quiet) printNote(line); },
+    });
     const activeToken = resolveClaudeAuthState(snapshot.settings, snapshot.state).token;
     validateClaudeModelPicker(snapshot.settings);
     // Normalize first so friendly aliases like `native` are seen as the native
@@ -422,12 +542,21 @@ export default defineHarnessProfile({
       profiles: snapshot.profiles,
       activeMapping: snapshot.intent.mapping,
     });
+    const { catalog: servedCatalog, entries: servedEntries } = await servedCatalogForOn(fireworksKey);
     const plan = resolveClaudeActivationPlan({
       ctx,
       snapshot,
       activeMappingIsCurrent,
+      // Without this account's catalog the migration runs as before.
+      isServed: (modelId) => !servedCatalog.length || isModelInCatalog(modelId, servedCatalog),
     });
-    const mapping = plan.mapping;
+    const mapping = await offerAllowedClaudeSlots({
+      ctx,
+      mapping: plan.mapping,
+      slotOverrides,
+      catalog: servedCatalog,
+      entries: servedEntries,
+    });
     const { ids, served: catalogServed } = await loadRegisterableModels({ apiKey: fireworksKey });
     const registerablePickerIds = ids
       .map((id) => shortFireworksModelRef(id))
@@ -477,7 +606,7 @@ export default defineHarnessProfile({
       settingsPath,
       dataDir,
       effectiveApiKey: fireworksKey,
-      baseUrl: ctx.baseUrl || FIREWORKS_BASE_URL,
+      baseUrl: fireworksInferenceUrl(ctx.baseUrl || FIREWORKS_BASE_URL, activeAccountResidency("claude")),
       mapping,
       anthropicKey: anthropicKeyForSettings,
       anthropicAuthToken: nativeAuth.anthropicAuthToken,
@@ -494,6 +623,7 @@ export default defineHarnessProfile({
       enabled: true,
       provider: "fireworks",
       profiles: withSavedClaudeModelMapping(snapshot.profiles, mapping),
+      ...residencyState,
     });
     // Drop a legacy SessionStart desktop-guard hook if present (retired; CLI-only).
     await removeDesktopGuardHook(settingsPath);
@@ -511,7 +641,11 @@ export default defineHarnessProfile({
     if (removedAnthropicKey) {
       footnotes.push(() => printNote(CLAUDE_ANTHROPIC_KEY_REMOVED_NOTE));
     }
-    const claudeCodeVersion = installedClaudeCodeVersion();
+    const replacedDefault = blockedDefaultReplacedNote(snapshot.settings, enabledSettings, servedCatalog);
+    if (replacedDefault) {
+      footnotes.push(() => printNote(replacedDefault));
+    }
+    const claudeCodeVersion = installedClaudeCodeVersion({ home: ctx.home });
     const pickerVersionNote = claudeCodeModelPickerNote(claudeCodeVersion);
     if (pickerVersionNote) {
       footnotes.push(() => printNote(pickerVersionNote));
@@ -610,20 +744,8 @@ export default defineHarnessProfile({
       await warmServerlessPricingCache(token, { reuseFreshCache: true });
     }
     const currentMapping = mappingFromSettings(settings);
-    // Claude Code strips the managed marker when it persists a /model pick,
-    // so a Fireworks-routed picker is Nexus territory with or without it.
     // Claude's own rows are not Nexus registrations and are not reported.
-    const pickerIsNexusTerritory = isFireconnectModelPicker(settings.modelPicker)
-      || providerStatusFromEnv(env) === "fireworks";
-    const registeredModels = pickerIsNexusTerritory
-      ? (settings.modelPicker?.options ?? [])
-        .map((option) => option?.model)
-        .filter((id) => typeof id === "string" && id.trim())
-        .filter((id) => {
-          const normalized = shortFireworksModelRef(normalizeModelId(id));
-          return !isAnthropicModelId(normalized) && !isClaudeModelAlias(normalized);
-        })
-      : [];
+    const registeredModels = claudeRegisteredPickerModels(settings);
     const payload = {
       harness: HARNESS.CLAUDE,
       provider: providerStatusFromEnv(env),
@@ -639,6 +761,7 @@ export default defineHarnessProfile({
       ),
       pricingNote: CLAUDE_CODE_PRICING_DISCLAIMER,
       registeredModels,
+      modelAccess: await harnessModelAccess(HARNESS.CLAUDE, ctx),
     };
     payload.keyType = "fireworks";
 
@@ -664,6 +787,7 @@ export default defineHarnessProfile({
         authMode: auth.authMode,
       }),
     });
+    printModelAccessNote(HARNESS.CLAUDE, payload.modelAccess);
     if (routed && hasLegacyAnthropicMainEnv(settings)) {
       printNote(CLAUDE_LEGACY_ANTHROPIC_MODEL_WARNING);
     }

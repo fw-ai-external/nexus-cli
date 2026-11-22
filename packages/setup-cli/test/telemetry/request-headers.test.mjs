@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   buildFireconnectTelemetryHeaders,
+  hasFireconnectAttributionHeader,
   mergeFireconnectTelemetryHeaderLines,
   retargetLegacyReferer,
   telemetryReferer,
@@ -108,5 +109,19 @@ describe("FireConnect request telemetry", () => {
     for (const url of ["https://example.com/fireconnect/v1.2.3/docs", "https://github.com/fw-ai/fireconnect/unknown"]) {
       assert.equal(retargetLegacyReferer(url), url);
     }
+  });
+
+  it("recognizes this CLI's attribution by value, not by header name", () => {
+    assert.equal(hasFireconnectAttributionHeader(buildFireconnectTelemetryHeaders("opencode")), true);
+    assert.equal(hasFireconnectAttributionHeader({ "http-referer": "nexus/unknown" }), true);
+    assert.equal(hasFireconnectAttributionHeader({ "HTTP-Referer": "fireconnect/v0.7.0" }), true);
+    assert.equal(hasFireconnectAttributionHeader({ "User-Agent": "fireconnect/0.7.0" }), true);
+
+    assert.equal(hasFireconnectAttributionHeader({ "X-Title": "OpenCode" }), false);
+    assert.equal(hasFireconnectAttributionHeader({ "HTTP-Referer": "https://app.example.com" }), false);
+    assert.equal(hasFireconnectAttributionHeader({ "HTTP-Referer": "example-nexus/v1.0.0" }), false);
+    assert.equal(hasFireconnectAttributionHeader({ "User-Agent": "custom-client/1.0" }), false);
+    assert.equal(hasFireconnectAttributionHeader(undefined), false);
+    assert.equal(hasFireconnectAttributionHeader(["HTTP-Referer", "nexus/v1.0.0"]), false);
   });
 });

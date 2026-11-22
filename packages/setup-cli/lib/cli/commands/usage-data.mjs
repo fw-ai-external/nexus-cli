@@ -4,15 +4,11 @@ import { readMintedKeyState } from "../../keys/mint-api-key.mjs";
 import { getShareNexusAnalytics, lookupUserNameForKey } from "../../fireworks/user-settings.mjs";
 
 /**
- * `nexus usage-data`: hidden plumbing for the Nexus desktop app, which never
- * holds the Fireworks key and reads the signed-in user's "share anonymous
- * usage data" answer through this CLI. The answer is set on the web only, so
- * this is read-only.
- *
- * Nexus Desktop parses the --json output, so its shape is a contract:
- *   {"ok":true,"shareNexusAnalytics":true|false|null}   (null = never answered)
- *   {"ok":false,"code":"not-signed-in"|"network"|"unsupported"|"forbidden"|"other","message":"..."}
- * Failures exit 1. Messages never include the key, email or account ID.
+ * `nexus usage-data`: a read-only command for the Nexus desktop app, which
+ * never holds the Fireworks key. Its --json output is read by the app, so
+ * keep its fields stable: test/cli/usage-data-command.test.mjs pins them, and
+ * a change there needs a matching change in the app. Failures exit 1, and
+ * messages never include the key, email or account ID.
  *
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
  */
@@ -25,8 +21,7 @@ export async function runUsageDataCommand(ctx) {
   if (ctx.json) {
     console.log(JSON.stringify(result));
   } else if (result.ok) {
-    const label = result.shareNexusAnalytics === null ? "not set" : result.shareNexusAnalytics ? "on" : "off";
-    console.log(`Sharing anonymous usage data: ${label}`);
+    console.log(`Analytics ID: ${result.nexusAnalyticsId ? "available" : "not available yet"}`);
   } else {
     console.error(result.message);
   }
@@ -37,7 +32,7 @@ export async function runUsageDataCommand(ctx) {
 
 /**
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
- * @returns {Promise<{ ok: true, shareNexusAnalytics: boolean|null } | { ok: false, code: string, message: string }>}
+ * @returns {Promise<import("../../fireworks/user-settings.mjs").ShareNexusAnalyticsResult | { ok: false, code: string, message: string }>}
  */
 async function usageDataResult(ctx) {
   const home = ctx.home || (process.env.HOME ?? "");

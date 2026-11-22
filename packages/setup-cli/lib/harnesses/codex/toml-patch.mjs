@@ -1,3 +1,6 @@
+import { patchCodexImageGenerationRaw, stripCodexImageGenerationRaw } from "./feature-patch.mjs";
+import { patchCodexPetRaw, stripCodexPetRaw } from "./pet-patch.mjs";
+
 /**
  * Surgical edits to Codex config.toml — only touches Nexus-owned keys/tables
  * so array-of-tables and other non-flat TOML is preserved.
@@ -242,7 +245,7 @@ export function stripFireconnectRoutingRaw(raw, { stripRootRouting = false } = {
     out.push(line);
   }
 
-  return ensureTrailingNewline(out.join("\n").replace(/\n+$/, "\n"));
+  return ensureTrailingNewline(stripCodexPetRaw(stripCodexImageGenerationRaw(out.join("\n"))).replace(/\n+$/, "\n"));
 }
 
 /**
@@ -260,7 +263,9 @@ export function stripFireconnectRoutingRaw(raw, { stripRootRouting = false } = {
  *   httpHeaders?: Record<string, string>,
  *   envHttpHeaders?: Record<string, string>,
  *   chatgptLogin?: boolean,
- * }} routing
+ *   pet?: boolean,
+ * }} routing `pet` selects the Fireworks terminal pet (pet-patch.mjs)
+ *   unless the user already chose one.
  */
 export function patchFireconnectRoutingRaw(raw, {
   providerId,
@@ -275,10 +280,14 @@ export function patchFireconnectRoutingRaw(raw, {
   httpHeaders = {},
   envHttpHeaders = {},
   chatgptLogin = false,
+  pet = false,
 }) {
   // Leading blank lines are the separator a previous patch wrote after the
   // routing block; keeping them would add one more on every re-`on`.
-  const base = stripFireconnectRoutingRaw(raw, { stripRootRouting: true }).replace(/^(?:[ \t]*\r?\n)+/, "");
+  const withFeatures = patchCodexImageGenerationRaw(
+    stripFireconnectRoutingRaw(raw, { stripRootRouting: true }).replace(/^(?:[ \t]*\r?\n)+/, ""),
+  );
+  const base = pet ? patchCodexPetRaw(withFeatures) : withFeatures;
   const routingBlock = [
     `model_provider = ${tomlString(providerId)}`,
     ...(catalogPath ? [`model_catalog_json = ${tomlString(catalogPath)}`] : []),

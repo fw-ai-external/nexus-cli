@@ -20,4 +20,5 @@ fireconnect-demo/
 fc-measure-run.sh
 
 # Lean verification build outputs
-packages/setup-cli/lean/.lake/
+ci/lean/cli/.lake/
+ci/lean/.lake/

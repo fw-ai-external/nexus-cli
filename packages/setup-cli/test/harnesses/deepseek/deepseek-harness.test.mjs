@@ -1,7 +1,6 @@
 import { mkdtemp, readFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { createServer } from "node:http";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -466,6 +465,103 @@ describe("deepseek profile patch (dsh 0.1.7+)", () => {
   });
 });
 
+describe("deepseek picker catalog", () => {
+  const ids = (doc) => doc["llm-pi-ai"].providers.fireworks.models.map((row) => row.id);
+  const enable = (home, extra) => enableDeepseekFireworks({
+    settingsPath: deepseekSettingsPath(home),
+    credentialsPath: deepseekCredentialsPath(home),
+    dataDir: deepseekDataDir(home),
+    effectiveApiKey: "fw_test_key_12345",
+    ...extra,
+  });
+  const readPatchIds = async (home) => {
+    const { parse } = await import("yaml");
+    const entries = parse(await readFile(path.join(home, ".dsh", "cordis.patch.yml"), "utf8"));
+    return entries.find((entry) => entry.id === "llm-pi-ai").config.providers.fireworks.models.map((row) => row.id);
+  };
+
+  it("registers the account's catalog in settings and the patch layers, selection first", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-catalog-"));
+    const result = await enable(home, {
+      modelId: "auto",
+      catalogModelIds: ["auto", "accounts/fireworks/routers/example-latest", "accounts/fireworks/models/example-model"],
+    });
+    const { settings } = await readDeepseekSettingsIfExists(deepseekSettingsPath(home));
+    assert.deepEqual(ids(settings), ["auto", "example-latest", "example-model"]);
+    assert.deepEqual(await readPatchIds(home), ["auto", "example-latest", "example-model"]);
+    assert.equal(settings["agent-default-model"].model, "auto", "the catalog never moves the selection");
+    assert.deepEqual(result.modelsAdded, ["auto", "example-latest", "example-model"]);
+  });
+
+  it("a re-on fills an auto-only list from the catalog and prunes delisted rows", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-catalog-reon-"));
+    await enable(home, { modelId: "auto" });
+    let { settings } = await readDeepseekSettingsIfExists(deepseekSettingsPath(home));
+    assert.deepEqual(ids(settings), ["auto"], "an earlier auto-only setup");
+
+    await enable(home, { catalogModelIds: ["auto", "example-latest", "example-model"] });
+    ({ settings } = await readDeepseekSettingsIfExists(deepseekSettingsPath(home)));
+    assert.deepEqual(ids(settings), ["auto", "example-latest", "example-model"]);
+
+    await enable(home, { catalogModelIds: ["auto", "example-latest"] });
+    ({ settings } = await readDeepseekSettingsIfExists(deepseekSettingsPath(home)));
+    assert.deepEqual(ids(settings), ["auto", "example-latest"], "example-model is no longer served");
+  });
+
+  it("an unavailable catalog keeps the registered list as it is", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-catalog-offline-"));
+    await enable(home, { modelId: "auto", catalogModelIds: ["auto", "example-latest", "example-model"] });
+    await enable(home, { modelId: "example-latest", catalogModelIds: [], catalogAvailable: false });
+    const { settings } = await readDeepseekSettingsIfExists(deepseekSettingsPath(home));
+    assert.deepEqual(ids(settings), ["auto", "example-latest", "example-model"]);
+    assert.equal(settings["agent-default-model"].model, "example-latest");
+  });
+
+  it("an unavailable catalog keeps each kept row's recorded capabilities and limits", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-catalog-rows-"));
+    await enable(home, { modelId: "auto", catalogModelIds: ["auto", "example-vision"] });
+    // What an earlier catalog recorded for the row; no static spec knows it.
+    const recorded = {
+      id: "example-vision",
+      name: "Example Vision",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 128_000,
+      maxTokens: 16_384,
+    };
+    const settingsPath = deepseekSettingsPath(home);
+    const { settings } = await readDeepseekSettingsIfExists(settingsPath);
+    settings["llm-pi-ai"].providers.fireworks.models[1] = recorded;
+    await writeFile(settingsPath, JSON.stringify(settings));
+
+    // Another account's catalog can't be fetched: the list is kept as written.
+    await enable(home, { catalogModelIds: [], catalogAvailable: false });
+    const rows = (await readDeepseekSettingsIfExists(settingsPath)).settings["llm-pi-ai"].providers.fireworks.models;
+    assert.deepEqual(rows.map((row) => row.id), ["auto", "example-vision"]);
+    assert.deepEqual(rows[1], recorded);
+    const { parse } = await import("yaml");
+    const patch = parse(await readFile(path.join(home, ".dsh", "cordis.patch.yml"), "utf8"));
+    assert.deepEqual(
+      patch.find((entry) => entry.id === "llm-pi-ai").config.providers.fireworks.models[1],
+      recorded,
+      "the patch layer carries the same row",
+    );
+
+    // A served catalog re-renders the row from the catalog again.
+    await enable(home, { catalogModelIds: ["auto", "example-vision"] });
+    const refreshed = (await readDeepseekSettingsIfExists(settingsPath)).settings["llm-pi-ai"].providers.fireworks.models[1];
+    assert.notDeepEqual(refreshed, recorded);
+  });
+
+  it("reads the registered list from the patch once dsh migrated settings.yaml away", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-catalog-migrated-"));
+    await enable(home, { modelId: "auto", catalogModelIds: ["auto", "example-latest", "example-model"] });
+    await unlink(deepseekSettingsPath(home));
+    await enable(home, { catalogModelIds: [], catalogAvailable: false });
+    assert.deepEqual(await readPatchIds(home), ["auto", "example-latest", "example-model"]);
+  });
+});
+
 describe("migrateDeepseekFirerouterModel", () => {
   it("moves settings and every patch layer to auto, leaving credentials and backups untouched", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-firerouter-migrate-"));
@@ -538,6 +634,25 @@ describe("migrateDeepseekFirerouterModel", () => {
       "deepseek-v4-flash",
       "current settings layer untouched",
     );
+  });
+
+  it("keeps the rest of the picker when it moves the selection to auto", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-deepseek-firerouter-keep-"));
+    const settingsPath = deepseekSettingsPath(home);
+    await enableDeepseekFireworks({
+      settingsPath,
+      credentialsPath: deepseekCredentialsPath(home),
+      dataDir: deepseekDataDir(home),
+      effectiveApiKey: "fw_test_key_12345",
+      modelId: "firerouter",
+      catalogModelIds: ["example-latest", "example-model"],
+    });
+    const before = (await readDeepseekSettingsIfExists(settingsPath)).settings["llm-pi-ai"].providers.fireworks.models;
+    assert.equal(await migrateDeepseekFirerouterModel({ settingsPath }), true);
+    const { settings } = await readDeepseekSettingsIfExists(settingsPath);
+    const after = settings["llm-pi-ai"].providers.fireworks.models;
+    assert.deepEqual(after.map((row) => row.id), ["auto", "example-latest", "example-model"]);
+    assert.deepEqual(after.slice(1), before.filter((row) => row.id !== "firerouter"), "kept rows are written back as they were");
   });
 
   it("no-ops when DeepSeek is not on a FireRouter selection", async () => {

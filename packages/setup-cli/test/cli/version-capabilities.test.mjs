@@ -42,7 +42,7 @@ it("capability discovery works in a dependency-free checkout without installing 
       env: { HOME: home, USERPROFILE: home, PATH: "" }, encoding: "utf8", timeout: 5000,
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), { version: "0.0.0", capabilities: ["login-account-type-v1"] });
+    assert.deepEqual(JSON.parse(result.stdout), { version: "0.0.0", capabilities: ["login-account-type-v1", "login-json", "logout-json", "login-json-key-expiry", "login-json-previous-key", "key-actions-v1", "paste-code"] });
     assert.equal(result.stderr, "");
     assert.deepEqual(readdirSync(home), []);
     assert.deepEqual(readdirSync(checkout).sort(), ["bin", "lib", "package.json"]);

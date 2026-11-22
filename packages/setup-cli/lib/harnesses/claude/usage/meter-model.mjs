@@ -74,8 +74,13 @@ export function labelFor(model, priced) {
  * reads as one token per model ("GLM5.2+Opus5").
  */
 export function badgeName(label) {
-  return label.replace(/\s+/g, "").slice(0, 8);
+  // A trailing qualifier such as "(Latest)" or "(US)" stays in the footer's
+  // full name; the badge keeps the model and version.
+  return label.replace(/\s*\([^)]*\)\s*$/, "").replace(/\s+/g, "").slice(0, BADGE_MAX);
 }
+
+/** Longest badge; equals `MODEL_COL` in meter-layout.mjs (modules.test.mjs checks). */
+export const BADGE_MAX = 12;
 
 function anthropicLabel(model, fallback) {
   const bare = model.replace(/\[.*?\]$/, "").replace(/-\d{8}$/, "");

@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import process from "node:process";
+import { harnessCommandEnv, resolveHarnessCommand } from "../../harness/detect.mjs";
 
 import { ensureIdeStopped, isIdeRunning, quitInstruction } from "../../io/ide-running.mjs";
 
@@ -169,9 +170,9 @@ export const CODEX_SESSION_RUNNING_MESSAGE =
  * daemon is left alone whenever a session is still open (`force`, or
  * continue-anyway after the wait). nexus never ends a session — the
  * user does.
- * @param {{ force?: boolean }} [opts]
+ * @param {{ force?: boolean, home?: string }} [opts]
  */
-export async function ensureCodexSessionsClosed({ force = false } = {}) {
+export async function ensureCodexSessionsClosed({ force = false, home = os.homedir() } = {}) {
   await ensureIdeStopped(null, CODEX_SESSION_RUNNING_MESSAGE, {
     force,
     label: "Codex",
@@ -184,7 +185,7 @@ export async function ensureCodexSessionsClosed({ force = false } = {}) {
   if (isCodexSessionRunning()) {
     return;
   }
-  stopCodexDaemons();
+  stopCodexDaemons(home);
 }
 
 const CODEX_DAEMON_STOP_TIMEOUT_MS = 10_000;
@@ -194,12 +195,14 @@ const CODEX_DAEMON_STOP_TIMEOUT_MS = 10_000;
  * @returns {boolean} true when Codex reports the daemon stopped or not running;
  *   false when the subcommand is missing (older Codex), fails, or times out.
  */
-function stopDaemonViaCodex() {
+function stopDaemonViaCodex(home) {
   if (process.env.NEXUS_TEST === "1") {
     return false;
   }
   try {
-    const r = spawnSync("codex", ["app-server", "daemon", "stop"], {
+    const bin = resolveHarnessCommand("codex", home) || "codex";
+    const r = spawnSync(bin, ["app-server", "daemon", "stop"], {
+      env: harnessCommandEnv(bin),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: CODEX_DAEMON_STOP_TIMEOUT_MS,
@@ -221,9 +224,9 @@ function stopDaemonViaCodex() {
  * to stop it first, and SIGTERMs the listed daemon processes only when that
  * does not work.
  */
-function stopCodexDaemons() {
+function stopCodexDaemons(home) {
   const { daemons } = listCodexProcesses();
-  if (daemons.length === 0 || stopDaemonViaCodex()) {
+  if (daemons.length === 0 || stopDaemonViaCodex(home)) {
     return;
   }
   for (const pid of daemons) {
@@ -234,4 +237,3 @@ function stopCodexDaemons() {
     }
   }
 }
-

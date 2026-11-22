@@ -220,7 +220,7 @@ describe("harness option validation", () => {
         assert.match(live.stderr, /`nexus claude live` was removed: Claude Code's status line shows the routed model/);
         assert.match(live.stderr, /nexus claude usage/);
       }
-      await rejects(home, ["codex", "usage", "--session", "abc"], /--session applies only to `nexus claude usage`\./);
+      await rejects(home, ["opencode", "usage", "--session", "abc"], /--session applies only to `nexus claude usage` and `nexus codex usage`\./);
     });
   });
 });

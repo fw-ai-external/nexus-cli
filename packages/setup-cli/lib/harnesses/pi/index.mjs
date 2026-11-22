@@ -1,10 +1,10 @@
 import {
   printStructuredHarnessStatus,
+  printModelAccessNote,
 } from "../../harness/status-display.mjs";
 import {
   printPiRestartHint,
 } from "../../cli/messages.mjs";
-import process from "node:process";
 import { defaultMainModel, shortFireworksModelRef } from "../../fireworks/model-id.mjs";
 import {
   PI_API_KEY_ENV_REF,
@@ -30,7 +30,7 @@ import {
 } from "../../fireworks/models.mjs";
 import { isFireworksKey } from "../../keys/key-type.mjs";
 import { DEFAULT_AZURE_MODEL } from "../../fireworks/azure-core.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import {
   ensureHomeForHarness,
   piPathsFor,
@@ -63,9 +63,22 @@ async function piResolveKey(ctx) {
   return isFireworksKey(key) ? key.trim() : "";
 }
 
+/** The Fireworks models Pi selects while routed (see HarnessAdapter.configuredModels). */
+async function piConfiguredModels(ctx) {
+  const { settingsPath, authPath } = piPathsFor(ctx);
+  const provider = await piNexusProviderStatus({ settingsPath, authPath, home: ctx.home });
+  if (provider !== "fireworks") {
+    return [];
+  }
+  const settings = await readJsonFile(settingsPath);
+  const model = typeof settings.defaultModel === "string" ? shortFireworksModelRef(settings.defaultModel) : "";
+  return model ? [{ slot: "main", model }] : [];
+}
+
 export default defineHarnessProfile({
   id: HARNESS.PI,
   label: "Pi",
+  configuredModels: piConfiguredModels,
   resolveKey: piResolveKey,
   paths: (ctx) => piPathsFor(ctx),
   keyEnvRef: PI_API_KEY_ENV_REF,
@@ -208,6 +221,8 @@ export default defineHarnessProfile({
       model,
     };
 
+    payload.modelAccess = await harnessModelAccess(HARNESS.PI, ctx);
+
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
       return;
@@ -220,6 +235,7 @@ export default defineHarnessProfile({
       model: payload.current.main,
       keySource: harnessStatusKeySource(HARNESS.PI, provider),
     });
+    printModelAccessNote(HARNESS.PI, payload.modelAccess);
   },
 
 });

@@ -1,8 +1,10 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, rename, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { ensurePrivateParent } from "../io/private-files.mjs";
 
 /**
  * Minimal encrypted-file secret store compatible with cross-keychain's `file`
@@ -56,40 +58,178 @@ export function secretsFilePath() {
 }
 
 /**
- * @returns {string | null}
+ * @returns {string}
  */
-function keyFilePath() {
+export function keyFilePath() {
   return path.join(configRoot(), "file.key");
+}
+
+/** `code` of {@link KeyStoreUndecryptableError}, for callers that match on codes. */
+export const KEY_STORE_UNDECRYPTABLE = "NEXUS_KEY_STORE_UNDECRYPTABLE";
+
+/**
+ * The encrypted key store exists but the current master key cannot decrypt it
+ * (AES-GCM authentication failed): `KEYRING_FILE_MASTER_KEY` changed, was set
+ * or unset, or the generated key file was replaced. Storage must stop here
+ * rather than fall back to plaintext or overwrite a store that still holds
+ * secrets under the previous key. Build it while HOME/XDG point at the store
+ * in question (inside withHomeScopedEnv) so the paths in the message are right.
+ */
+export class KeyStoreUndecryptableError extends Error {
+  /**
+   * @param {{ storePath?: string | null, keyFile?: string, masterKeyFromEnv?: boolean, cause?: unknown }} [details]
+   */
+  constructor({
+    storePath = secretsFilePath(),
+    keyFile = keyFilePath(),
+    masterKeyFromEnv = Boolean(process.env.KEYRING_FILE_MASTER_KEY?.trim()),
+    cause,
+  } = {}) {
+    const store = storePath ?? "~/.local/share/keyring/secrets.json";
+    const current = masterKeyFromEnv ? "from KEYRING_FILE_MASTER_KEY" : `from the key file ${keyFile}`;
+    super(
+      `The encrypted key store at ${store} can't be decrypted with the current master key (${current}). `
+        + "It was encrypted under a different one: KEYRING_FILE_MASTER_KEY changed, was set or unset, "
+        + `or the key file ${keyFile} was replaced. Nexus did not modify the store or fall back to a plaintext copy.\n\n`
+        + "To keep the stored key: restore the previous KEYRING_FILE_MASTER_KEY or key file, then re-run.\n"
+        + `To discard it: delete ${store} (this removes every secret in it), then run \`nexus login\`.`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "KeyStoreUndecryptableError";
+    this.code = KEY_STORE_UNDECRYPTABLE;
+    this.storePath = store;
+    this.keyFile = keyFile;
+  }
+}
+
+/**
+ * @param {unknown} error
+ * @returns {error is KeyStoreUndecryptableError}
+ */
+export function isKeyStoreUndecryptableError(error) {
+  return /** @type {{ code?: unknown } | null} */ (error)?.code === KEY_STORE_UNDECRYPTABLE;
+}
+
+/**
+ * Node's AES-GCM authentication failure, as thrown by `decipher.final()` here
+ * and in cross-keychain's file backend when the key does not match the data.
+ * @param {unknown} error
+ */
+function isDecryptAuthFailure(error) {
+  const message = /** @type {{ message?: unknown } | null} */ (error)?.message;
+  return typeof message === "string" && /unable to authenticate data/i.test(message);
+}
+
+/**
+ * Map a file-store decrypt failure to {@link KeyStoreUndecryptableError};
+ * any other error is returned unchanged.
+ * @param {unknown} error
+ * @returns {unknown}
+ */
+export function asKeyStoreUndecryptableError(error) {
+  if (isKeyStoreUndecryptableError(error) || !isDecryptAuthFailure(error)) {
+    return error;
+  }
+  return new KeyStoreUndecryptableError({ cause: error });
+}
+
+function environmentKey() {
+  const value = process.env.KEYRING_FILE_MASTER_KEY;
+  if (!value?.trim()) return null;
+  if (value.length !== 64 || !/^[a-fA-F0-9]+$/.test(value)) {
+    throw new Error("KEYRING_FILE_MASTER_KEY must be 64 hex characters (32 bytes)");
+  }
+  return Buffer.from(value, "hex");
+}
+
+async function openPrivate(file, flags, directory = false) {
+  let handle;
+  try {
+    const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW | constants.O_NONBLOCK;
+    handle = await open(file, flags | noFollow, 0o600);
+    if (process.platform !== "win32") {
+      const info = await handle.stat();
+      if (info.uid !== process.getuid() || !(directory ? info.isDirectory() : info.isFile())) {
+        throw new Error("Unsafe file store entry");
+      }
+      await handle.chmod(directory ? 0o700 : 0o600);
+    }
+    return handle;
+  } catch (error) {
+    await handle?.close();
+    if (error.code === "ENOENT" || error.code === "EEXIST") throw error;
+    throw new Error("Cannot secure file key store. Check ownership, permissions, and symlinks.");
+  }
+}
+
+async function secureDirectory(dir, create = false) {
+  try {
+    ensurePrivateParent(path.join(dir, ".entry"), { create });
+  } catch (error) {
+    if (error.code === "ENOENT") throw error;
+    throw new Error("Cannot secure file key store. Check ownership, permissions, and symlinks.");
+  }
+  if (process.platform === "win32") {
+    if (create) await mkdir(dir, { recursive: true, mode: 0o700 });
+    return;
+  }
+  let handle;
+  try {
+    handle = await openPrivate(dir, constants.O_RDONLY, true);
+  } catch (error) {
+    if (!create || error.code !== "ENOENT") throw error;
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    handle = await openPrivate(dir, constants.O_RDONLY, true);
+  }
+  await handle.close();
+}
+
+async function readPrivate(file) {
+  await secureDirectory(path.dirname(file));
+  const handle = await openPrivate(file, constants.O_RDONLY);
+  try {
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function createPrivate(file, data) {
+  await secureDirectory(path.dirname(file), true);
+  const handle = await openPrivate(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+  try {
+    await handle.writeFile(data);
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
  * @returns {Promise<Buffer>}
  */
 async function getKeyMaterial() {
-  const envKey = process.env.KEYRING_FILE_MASTER_KEY;
-  if (envKey) {
-    if (envKey.length !== 64) {
-      throw new Error("KEYRING_FILE_MASTER_KEY must be 64 hex characters (32 bytes)");
-    }
-    return Buffer.from(envKey, "hex");
-  }
+  const envKey = environmentKey();
+  if (envKey) return envKey;
 
   const keyFile = keyFilePath();
+  let key;
   try {
-    const key = await readFile(keyFile);
-    if (key.length !== 32) {
-      throw new Error("Key file must contain exactly 32 bytes");
-    }
-    return key;
+    key = await readPrivate(keyFile);
   } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") {
       throw error;
     }
-    const key = randomBytes(32);
-    await mkdir(path.dirname(keyFile), { recursive: true, mode: 0o700 });
-    await writeFile(keyFile, key, { mode: 0o600 });
-    return key;
+    try {
+      await createPrivate(keyFile, randomBytes(32));
+    } catch (createError) {
+      if (createError.code !== "EEXIST") throw createError;
+    }
+    key = await readPrivate(keyFile);
   }
+  if (key.length !== 32) {
+    throw new Error("Key file must contain exactly 32 bytes");
+  }
+  return key;
 }
 
 /**
@@ -122,7 +262,12 @@ async function decryptStore(data) {
   const key = await getKeyMaterial();
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(authTag);
-  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  let decrypted;
+  try {
+    decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  } catch (error) {
+    throw asKeyStoreUndecryptableError(error);
+  }
   return JSON.parse(decrypted.toString("utf8"));
 }
 
@@ -132,26 +277,41 @@ async function decryptStore(data) {
  */
 async function atomicWrite(file, buf) {
   const dir = path.dirname(file);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const tmp = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  await writeFile(tmp, buf, { mode: 0o600 });
-  await rename(tmp, file);
+  const tmp = path.join(dir, `.tmp-${process.pid}-${randomBytes(12).toString("hex")}`);
+  let created = false;
+  try {
+    await createPrivate(tmp, buf);
+    created = true;
+    const target = await openPrivate(file, constants.O_RDONLY);
+    await target.close();
+    await rename(tmp, file);
+  } finally {
+    if (created) await unlink(tmp).catch(() => {});
+  }
 }
 
 /**
  * @returns {Promise<Record<string, Record<string, string>>>}
  */
-async function readStore() {
+async function readStore(initialize = false) {
+  environmentKey();
   const file = secretsFilePath();
   if (!file) {
     throw new Error("HOME is not set and XDG_DATA_HOME is unset");
   }
   try {
-    const data = await readFile(file);
+    const data = await readPrivate(file);
     return decryptStore(data);
   } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") {
-      return {};
+      if (!initialize) return {};
+      const encrypted = await encryptStore({});
+      try {
+        await createPrivate(file, encrypted);
+      } catch (createError) {
+        if (createError.code !== "EEXIST") throw createError;
+      }
+      return readStore();
     }
     throw error;
   }
@@ -186,17 +346,27 @@ export async function builtinGetPassword(service, account) {
   return store[service]?.[account] ?? null;
 }
 
+let storeUpdates = Promise.resolve();
+
+function serializeUpdate(update) {
+  const pending = storeUpdates.then(update);
+  storeUpdates = pending.catch(() => {});
+  return pending;
+}
+
 /**
  * @param {string} service
  * @param {string} account
  * @param {string} password
  */
 export async function builtinSetPassword(service, account, password) {
-  const store = await readStore();
-  const serviceEntry = store[service] ?? {};
-  serviceEntry[account] = password;
-  store[service] = serviceEntry;
-  await writeStore(store);
+  return serializeUpdate(async () => {
+    const store = await readStore(true);
+    const serviceEntry = store[service] ?? {};
+    serviceEntry[account] = password;
+    store[service] = serviceEntry;
+    await writeStore(store);
+  });
 }
 
 /**
@@ -221,18 +391,20 @@ export async function storeBuiltinFileSecretVerified(service, account, password)
  * @param {string} account
  */
 export async function builtinDeletePassword(service, account) {
-  const store = await readStore();
-  const serviceEntry = store[service];
-  if (!serviceEntry || !(account in serviceEntry)) {
-    return;
-  }
-  delete serviceEntry[account];
-  if (Object.keys(serviceEntry).length === 0) {
-    delete store[service];
-  } else {
-    store[service] = serviceEntry;
-  }
-  await writeStore(store);
+  return serializeUpdate(async () => {
+    const store = await readStore();
+    const serviceEntry = store[service];
+    if (!serviceEntry || !(account in serviceEntry)) {
+      return;
+    }
+    delete serviceEntry[account];
+    if (Object.keys(serviceEntry).length === 0) {
+      delete store[service];
+    } else {
+      store[service] = serviceEntry;
+    }
+    await writeStore(store);
+  });
 }
 
 /**

@@ -46,8 +46,6 @@ function seedCatalogFor(home) {
   }
 }
 const ANTHROPIC_KEY = "sk-ant-claude-matrix-byok";
-const KIMI_FABLE_MODEL = "glm-flash-latest[1m]";
-const GLM_SONNET_MODEL = "glm-latest[1m]";
 const FIREROUTER_MODEL = "firerouter[1m]";
 const SUBSCRIPTION_SETTINGS = `${JSON.stringify({
   model: "sonnet",

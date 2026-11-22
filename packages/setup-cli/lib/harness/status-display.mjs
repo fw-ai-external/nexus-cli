@@ -1,4 +1,9 @@
-import { bold, dim, muted, yesNo } from "../ui.mjs";
+import { bold, dim, muted, warn, yesNo } from "../ui.mjs";
+import {
+  formatBlockedModelsStatusNote,
+  formatModelAccessUncheckedNote,
+  staleCatalogDate,
+} from "../fireworks/model-access.mjs";
 import { AZURE_PROVIDER_LABEL } from "../fireworks/azure-core.mjs";
 import { isFirerouterModel, isFirerouterModelPattern } from "../fireworks/model-id.mjs";
 
@@ -12,6 +17,7 @@ const HARNESS_LABELS = {
   "copilot-app": "Copilot app",
   "copilot-cli": "Copilot CLI",
   deepseek: "DeepSeek Harness",
+  hermes: "Hermes Agent",
 };
 
 const AUTH_MODE_LABELS = {
@@ -217,4 +223,31 @@ export function printHarnessStatus(title, fields, sections = []) {
       console.log(`  ${line}`);
     }
   }
+}
+
+/**
+ * Warn, under a harness's status, about configured models the account's
+ * served catalog doesn't list (see `modelAccessReport`), with the catalog's
+ * date when it is past its refresh interval. When the models couldn't be
+ * checked (no catalog, or another key's), a muted line says so. Prints
+ * nothing when every model is allowed or nothing is configured.
+ * @param {string} harnessCommand the `nexus <command>` that switches models
+ * @param {import("../fireworks/model-access.mjs").ModelAccessReport | undefined} report
+ * @param {{ advice?: string }} [options] what to do about it, when `on` isn't the fix
+ */
+export function printModelAccessNote(harnessCommand, report, { advice } = {}) {
+  if (!report?.blocked?.length) {
+    // "Not checked" must not read like "all allowed".
+    const unchecked = formatModelAccessUncheckedNote(report);
+    if (unchecked) {
+      console.log("");
+      console.log(muted(unchecked));
+    }
+    return;
+  }
+  console.log("");
+  console.log(warn(formatBlockedModelsStatusNote(harnessCommand, report.blocked, {
+    ...(advice ? { advice } : {}),
+    asOf: staleCatalogDate(report),
+  })));
 }

@@ -11,6 +11,7 @@ import path from "node:path";
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 
 export const SHIM_HEALTH_PATH = "/__nexus_health";
 const SECRET_FILE = "shim-secret";
@@ -35,6 +36,7 @@ export async function readShimSecret(dataDir) {
  * the CLI and the shim racing to create it both end up with the same value.
  */
 export async function ensureShimSecret(dataDir) {
+  ensurePrivateParent(shimSecretPath(dataDir));
   const existing = await readShimSecret(dataDir);
   if (existing) {
     // Owner-only even when the file came from elsewhere (a restore, a copy).

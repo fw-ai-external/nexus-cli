@@ -2,18 +2,26 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import {
-  FIREWORKS_API_KEY_ENV_REF,
   FIREWORKS_API_KEY_KEYCHAIN_REF,
   readGlobalConfig,
   writeGlobalConfig,
 } from "../config/global-config.mjs";
-import { detectSecretBackend, getSecret, hasSecret, setSecret } from "./secret-store.mjs";
+import {
+  deleteSecret,
+  detectSecretBackend,
+  getLastKeyStoreUndecryptableError,
+  getLastSecretReadError,
+  getSecret,
+  hasSecret,
+  setSecret,
+} from "./secret-store.mjs";
+import { MAC_SECRET_UNREAD, MacKeychainAccessError } from "./macos-security.mjs";
 import { plaintextSecretStoreAvailable } from "./plaintext-secret-store.mjs";
 import { isKeyStorageForcedNull } from "./storage-env.mjs";
 import { cannotStoreKeyMessage, keyStorageSummaryLine } from "./storage-report.mjs";
-import { syncBakedKeysAfterStore } from "./sync.mjs";
+import { syncBakedKeys } from "./sync.mjs";
 import { FIREPASS_KEY_UNSUPPORTED_MESSAGE, isFirePassKey, isFireworksShapedKey } from "./key-type.mjs";
-import { clearMintedKeyState } from "./mint-api-key.mjs";
+import { apiKeyFingerprint, clearMintedKeyState, readMintedKeyState, writeMintedKeyState } from "./mint-api-key.mjs";
 import { expireCatalogCache } from "../fireworks/serverless-catalog-cache.mjs";
 import { refreshServerlessCatalogCache } from "../fireworks/models.mjs";
 import { readSecret } from "../ui/read-secret.mjs";
@@ -34,30 +42,65 @@ export {
   isLegacyLiteralConfigRef,
 } from "./config-ref.mjs";
 
-/** Where Fireworks Platform users create API keys, and the default when the account kind isn't known. */
-export const FIREWORKS_KEYS_URL = "https://app.fireworks.ai/settings/users/api-keys";
-/** The same page on the Nexus site, for Nexus accounts. */
+/** Where Nexus users create API keys, and the default when the account kind isn't known. */
 export const NEXUS_KEYS_URL = "https://nexus.fireworks.ai/settings/api-keys";
+/** The same page on the Fireworks Platform, for known Platform accounts. */
+export const FIREWORKS_KEYS_URL = "https://app.fireworks.ai/settings/users/api-keys";
 
-/**
- * The API-keys page for an account: Nexus accounts manage keys on the Nexus
- * site, everyone else (and an unknown account) on the Platform.
- * @param {boolean} nexusAccount
- */
-export function keysUrlFor(nexusAccount) {
-  return nexusAccount === true ? NEXUS_KEYS_URL : FIREWORKS_KEYS_URL;
+/** An https URL from the environment, or null when unset or not https. */
+function httpsUrlFromEnv(value) {
+  try {
+    const url = new URL(String(value ?? "").trim());
+    return url.protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * The API-keys page for whoever last signed in on this machine. Reads the
- * account kind browser sign-in saved; never throws (Platform on any error).
+ * The API-keys page for an account: known Platform accounts manage keys on
+ * the Platform, everyone else (and an unknown account) on the Nexus site.
+ * Platform accounts use the page of an https NEXUS_WEB_APP_URL when it is
+ * set. Nexus and unknown accounts use an https NEXUS_KEYS_URL when it is set,
+ * whatever the web app. Anything else keeps the production pages.
+ * @param {"nexus"|"platform"|"unknown"|undefined} accountType
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function keysUrlFor(accountType, env = process.env) {
+  if (accountType === "platform") {
+    const webApp = httpsUrlFromEnv(env.NEXUS_WEB_APP_URL);
+    return webApp ? `${webApp.origin}/settings/users/api-keys` : FIREWORKS_KEYS_URL;
+  }
+  return httpsUrlFromEnv(env.NEXUS_KEYS_URL)?.href ?? NEXUS_KEYS_URL;
+}
+
+/**
+ * A note for a sign-in against a non-production web app (an https
+ * `webAppUrl` other than production) when `keysUrl` (NEXUS_KEYS_URL) isn't
+ * an https URL: Nexus key links would otherwise point at production without saying so.
+ * "" when there is nothing to say.
+ * @param {string | undefined} webAppUrl
+ * @param {string | undefined} keysUrl
+ */
+export function keysUrlOverrideNote(webAppUrl, keysUrl) {
+  const webApp = httpsUrlFromEnv(webAppUrl);
+  if (!webApp || webApp.origin === new URL(FIREWORKS_KEYS_URL).origin || httpsUrlFromEnv(keysUrl)) {
+    return "";
+  }
+  return "Note: NEXUS_WEB_APP_URL points at a non-production web app, but NEXUS_KEYS_URL isn't set to an https URL, "
+    + "so Nexus API-key links point at production. Set NEXUS_KEYS_URL to that environment's API-keys page.";
+}
+
+/**
+ * The API-keys page for the key stored on this machine. Reads the saved
+ * account kind; never throws (Nexus on any error).
  * @param {string} home
  */
 export async function keysUrlForHome(home) {
   try {
-    return keysUrlFor((await readGlobalConfig(home)).nexusAccount);
+    return keysUrlFor((await readGlobalConfig(home)).accountType);
   } catch {
-    return FIREWORKS_KEYS_URL;
+    return keysUrlFor("nexus");
   }
 }
 
@@ -68,7 +111,7 @@ export async function keysUrlForHome(home) {
  * @param {import("./verify-api-key.mjs").VerifyResult} result
  * @param {{ interactive?: boolean, keysUrl?: string }} [options]
  */
-export function verifyFailureLine(result, { interactive = false, keysUrl = FIREWORKS_KEYS_URL } = {}) {
+export function verifyFailureLine(result, { interactive = false, keysUrl = NEXUS_KEYS_URL } = {}) {
   if (result.reason === "rejected") {
     return interactive
       ? `That key didn't work. Check it at ${link(keysUrl)} or paste another.`
@@ -87,7 +130,7 @@ export function assertFireworksKeyShape(key) {
   }
   if (!isFireworksShapedKey(trimmed)) {
     throw new Error(
-      `That doesn't look like a Fireworks key (expected it to start with fw_). Get one at ${FIREWORKS_KEYS_URL}`,
+      `That doesn't look like a Fireworks key (expected it to start with fw_). Get one at ${NEXUS_KEYS_URL}`,
     );
   }
   return trimmed;
@@ -116,7 +159,7 @@ const ON_KEY_VERIFY_TIMEOUT_MS = 5000;
 
 /**
  * Stop `<harness> on` before it bakes an env or saved key that the gateway
- * rejects (deleted or revoked) into a harness config, where it would only
+ * rejects (deleted, revoked or expired) into a harness config, where it would only
  * surface later as a 401 inside the tool. Only a definitive 401/403 stops the
  * command; offline or an unexpected status keeps `on` working without network.
  * @param {string} key
@@ -129,7 +172,7 @@ export async function assertResolvedKeyNotRejected(key, { harnessId = "" } = {})
   }
   const rerun = harnessId ? `nexus ${harnessId} on` : "nexus login";
   throw new Error(
-    "The Fireworks API rejected your saved Fireworks key (it may have been deleted or revoked). "
+    "The Fireworks API rejected your saved Fireworks key (it may have been deleted, revoked or expired). "
       + `Run \`nexus login\` to sign in with a new key, then run: ${rerun}`,
   );
 }
@@ -160,6 +203,9 @@ const HARNESS_KEY_SOURCE = {
   },
   deepseek: {
     readsFrom: "FIREWORKS_API_KEY in ~/.dsh/.credentials.yaml",
+  },
+  hermes: {
+    readsFrom: "FIREWORKS_API_KEY in ~/.hermes/.env",
   },
   vscode: {
     readsFrom: "VS Code safeStorage (state.vscdb)",
@@ -246,41 +292,90 @@ export async function persistApiKeyToKeychain(home, apiKey, options = {}) {
   const trimmed = apiKey?.trim() ?? "";
   // Idempotent: if the store already holds this key (e.g. login just stored
   // it), skip the write+readback to avoid a duplicate keychain round-trip.
-  const existing = await getSecret(home);
-  const keyChanged = !existing || existing.trim() !== trimmed;
-  if (keyChanged) {
+  // An unmarked macOS item will be replaced, so do not unlock it to compare.
+  const existing = await getSecret(home, { migrateMacItems: false });
+  // A read error means a key may exist that rollback cannot put back, so it must not delete.
+  const previousUnreadable = existing === MAC_SECRET_UNREAD || (!existing && getLastSecretReadError() !== null);
+  const keyChanged = existing === MAC_SECRET_UNREAD
+    ? (await readMintedKeyState(home).catch(() => null))?.keyFingerprint !== apiKeyFingerprint(trimmed)
+    : !existing || existing.trim() !== trimmed;
+  const secretReplaced = keyChanged || existing === MAC_SECRET_UNREAD;
+  if (secretReplaced) {
     await setSecret(trimmed, home);
+  }
+  // Reference the stored key before the slow catalog refresh below.
+  let config = null;
+  try {
+    config = await readGlobalConfig(home);
+    await writeGlobalConfig(home, {
+      apiKey: FIREWORKS_API_KEY_KEYCHAIN_REF,
+      // Keep the reference and its account metadata in the same config write.
+      // Unknown replacements cannot inherit the previous credential's kind;
+      // ordinary idempotent config repair preserves known metadata.
+      ...(options.accountType !== undefined || keyChanged
+        ? { accountType: options.accountType ?? "unknown" } : {}),
+      harnesses: config.harnesses,
+    });
+    // The minted-key record describes the credential the browser flow stored.
+    // Record a new mint right after the store, before the slow catalog refresh,
+    // so an interrupted save still leaves `logout` able to revoke it. Once a
+    // path stores a DIFFERENT key, `logout` must not offer to revoke the old one
+    // on its behalf. Only clear on a real change — an idempotent re-store of the
+    // same key (config repair, repeated `login --api-key`) must keep the record
+    // so a still-held minted key stays revocable.
+    if (options.mintedKey) {
+      await writeMintedKeyState(home, { ...options.mintedKey, apiKey: trimmed });
+    } else if (keyChanged || await mintedRecordIsForAnotherKey(home, trimmed)) {
+      await clearMintedKeyState(home);
+    }
+  } catch (error) {
+    // A key that isn't both referenced and recorded is undone locally, so the
+    // previous key and its minted record keep working. Only the minted
+    // caller revokes its new key; pasted keys belong to the user.
+    if (secretReplaced) await restorePreviousKey(home, previousUnreadable ? MAC_SECRET_UNREAD : existing, config);
+    throw error;
+  }
+  if (keyChanged) {
     // The model catalog belongs to the account the old key signed in to:
     // refetch it for the new one, so the next harness `on` lists its models.
     expireCatalogCache(home);
     await refreshCatalogCacheForHome(home, trimmed);
-    // The minted-key record describes the credential the browser flow stored;
-    // once a path stores a DIFFERENT key, `logout` must not offer to revoke
-    // the old one on its behalf. Only clear on a real change — an idempotent
-    // re-store of the same key (config repair, repeated `login --api-key`) must keep
-    // the record so a still-held minted key stays revocable. The browser flow
-    // re-records its mint right after this call.
-    await clearMintedKeyState(home);
   }
-  const config = await readGlobalConfig(home);
-  await writeGlobalConfig(home, {
-    apiKey: FIREWORKS_API_KEY_KEYCHAIN_REF,
-    // Keep the reference and its account metadata in the same config write.
-    // Unknown replacements cannot inherit the previous credential's kind;
-    // ordinary idempotent config repair preserves known metadata.
-    ...(options.accountType !== undefined || keyChanged
-      ? { nexusAccount: options.accountType === "nexus" } : {}),
-    harnesses: config.harnesses,
-  });
   // Re-point router configs that bake the key as a literal — AFTER the store
   // succeeds, so no config ever points at a key that failed to persist. Runs
   // even when the stored key didn't change: the baked copies can be stale
   // independently of the keychain (that staleness is the 401 this exists to
   // fix), and the sync is a cheap no-op when everything already matches.
   const onNote = options.onNote ?? ((line) => console.log(line));
-  for (const note of await syncBakedKeysAfterStore(home, trimmed)) {
+  const { notes, unconfirmed } = await syncBakedKeys(home, trimmed);
+  for (const note of notes) {
     onNote(note);
   }
+  options.onKeySync?.(unconfirmed);
+}
+
+// Best effort. An unread macOS item can't be put back, so it stays replaced.
+async function restorePreviousKey(home, previous, config) {
+  if (previous === MAC_SECRET_UNREAD) return;
+  await (previous ? setSecret(previous, home) : deleteSecret(home)).catch(() => {});
+  if (!config) return;
+  await writeGlobalConfig(home, {
+    apiKey: config.apiKey,
+    accountType: config.accountType,
+    harnesses: config.harnesses,
+  }).catch(() => {});
+}
+
+/**
+ * A rerun after a sign-in that stored its key but failed later finds that key
+ * already stored, so "changed" alone would keep the replaced key's record.
+ * Records without a fingerprint predate it and are left alone.
+ * @param {string} home
+ * @param {string} apiKey
+ */
+async function mintedRecordIsForAnotherKey(home, apiKey) {
+  const record = await readMintedKeyState(home).catch(() => null);
+  return Boolean(record?.keyFingerprint) && record.keyFingerprint !== apiKeyFingerprint(apiKey);
 }
 
 /**
@@ -320,7 +415,7 @@ export async function resolveStoredApiKeyValue(stored, home) {
 }
 
 /**
- * @typedef {"flag" | "env" | "stored" | "none"} FireworksKeySource
+ * @typedef {"flag" | "stored" | "none"} FireworksKeySource
  * @typedef {{ key: string, source: FireworksKeySource }} FireworksKeyResolution
  */
 
@@ -459,6 +554,8 @@ export async function promptForFireworksApiKey(home, options = {}) {
  */
 export async function tryReadKeychainSecret(home) {
   const secret = (await getSecret(home))?.trim() ?? "";
+  const error = getLastSecretReadError();
+  if (!secret && error instanceof MacKeychainAccessError) throw error;
   return isFirePassKey(secret) ? "" : secret;
 }
 
@@ -480,7 +577,38 @@ export async function exportFireworksApiKey(home = process.env.HOME ?? "", { sto
     }
   }
 
-  throw new Error("No Fireworks API key found. Run `nexus login` to sign in.");
+  throw keyStoreUnreadableError() ?? new Error("No Fireworks API key found. Run `nexus login` to sign in.");
+}
+
+/**
+ * The stored key is unreachable because the encrypted key store can't be
+ * decrypted with the current master key: that error (with its recovery
+ * steps), or null. Reads themselves stay non-throwing; commands that need
+ * the key call this after resolving nothing, to explain the miss instead of
+ * reporting that no key exists. The record survives unrelated successful
+ * reads in the same command (plaintext, cache, macOS probe) and is cleared
+ * only by decrypting or writing the encrypted store, so a command can't be
+ * misled either way: see `getLastKeyStoreUndecryptableError`.
+ * @returns {import("./secret-store.mjs").KeyStoreUndecryptableError | null}
+ */
+export function keyStoreUnreadableError() {
+  return getLastKeyStoreUndecryptableError();
+}
+
+/**
+ * Stop a sign-in before it creates a key that could not be stored: refuses
+ * with {@link keyStoreUnreadableError} when the encrypted key store can't be
+ * decrypted. Any other probe failure is left for the store step to report.
+ * @param {string} home
+ */
+export async function assertKeyStoreReadable(home) {
+  try {
+    await hasSecret(home);
+  } catch {
+    return;
+  }
+  const unreadable = keyStoreUnreadableError();
+  if (unreadable) throw unreadable;
 }
 
 /**

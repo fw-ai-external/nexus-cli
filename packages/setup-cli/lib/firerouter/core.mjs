@@ -16,6 +16,8 @@ import {
 } from "../telemetry/request-headers.mjs";
 
 export const FIREROUTER_FIREWORKS_HEADER = "X-Fireworks-Api-Key";
+/** Fireworks key header FireConnect before 0.9 wrote in router mode. */
+export const LEGACY_FIREROUTER_FIREWORKS_HEADER = "x-firerouter-fireworks-key";
 export const AUTO_TAGLINE =
   "Smart routing: automatically picks the best model for the task.";
 export const AUTO_INSTANT_TAGLINE =
@@ -287,6 +289,7 @@ export const ANTHROPIC_BYOK_BODY_FIELD = "anthropic_api_key";
 /** Every ANTHROPIC_CUSTOM_HEADERS line Nexus writes or has written. */
 const MANAGED_CUSTOM_HEADER_NAMES = [
   FIREROUTER_FIREWORKS_HEADER,
+  LEGACY_FIREROUTER_FIREWORKS_HEADER,
   ANTHROPIC_BYOK_HEADER,
   OPENAI_BYOK_HEADER,
   NEXUS_PROVIDERS_HEADER,

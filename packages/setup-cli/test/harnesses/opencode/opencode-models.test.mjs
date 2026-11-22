@@ -8,14 +8,14 @@ import {
 import { lookupFireworksModelLimits } from "../../../lib/fireworks/model-specs.mjs";
 import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
-import { mockServerlessModel } from "../../helpers.mjs";
+import { mockServerlessModel, mockServerlessModelRows } from "../../helpers.mjs";
 
 describe("opencode model entries", () => {
   it("adds image modalities for kimi latest router aliases", () => {
     // Alias routers resolve only from API-reported `aliases`; seed the base row
     // the way the flat catalog reports it (vision-capable Kimi K3).
     setServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([
-      mockServerlessModel({
+      ...mockServerlessModelRows({
         id: "accounts/fireworks/models/kimi-k3",
         display_name: "Kimi K3",
         aliases: [

@@ -19,7 +19,6 @@ import { performance } from "node:perf_hooks";
 import {
   ACCENT, BOLD, DIM, PRIMARY, RED, YELLOW, RESET, HIDE_CURSOR, SHOW_CURSOR,
   HOME_CURSOR, moveTo, CLEAR_LINE, truncateVisible, padRight, progressBar,
-  stripAnsi, visibleWidth,
 } from "./ansi.mjs";
 import { formatSeconds, formatUsd, formatTokens } from "./measurement.mjs";
 

@@ -348,6 +348,11 @@ describe("parseCli", () => {
     assert.equal(parsed.helpTopic, "opencode");
   });
 
+  it("routes claude-desktop restart", () => {
+    const parsed = parseCli(["claude-desktop", "restart"]);
+    assert.equal(parsed.route.verb, "restart");
+  });
+
   it("rejects unknown top-level command", () => {
     assert.throws(() => parseCli(["on"]), /Unknown command: on/);
   });

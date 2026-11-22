@@ -59,7 +59,14 @@ export async function assertBackendCanStore(backend, home = process.env.HOME ?? 
  */
 export function storedKeyMessage(backend) {
   if (backend.backend === "keychain") {
-    return `Stored Fireworks API key in the OS keychain (${backend.label}); config files only ever hold a reference to it.`;
+    // Nexus's own config holds only a reference, but harnesses that cannot
+    // read the keychain (Claude Code's header, Codex, OpenCode, ...) keep a
+    // literal copy in their own config, so don't imply the keychain is the
+    // only place the key lives.
+    return (
+      `Stored Fireworks API key in the OS keychain (${backend.label}). `
+      + "Connected harnesses may also save it in their owner-only config files."
+    );
   }
   if (backend.backend === "file") {
     const where = backend.location ?? "an encrypted file";

@@ -5,7 +5,6 @@ import {
   chmod,
   mkdir,
   mkdtemp,
-  readdir,
   readFile,
   readlink,
   rm,
@@ -16,6 +15,74 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+
+describe("installer commit pin", () => {
+  for (const downloader of ["curl", "wget"]) {
+    for (const scenario of ["pinned", "malformed", "newline", "failed", "norelease", "override"]) {
+      it(`${downloader}: ${scenario}`, async () => {
+        const root = await mkdtemp(path.join(os.tmpdir(), "installer-pin-"));
+        const sha = "a".repeat(40);
+        try {
+          const bin = path.join(root, "bin");
+          const source = path.join(root, "source");
+          const staging = path.join(root, "staging");
+          await mkdir(bin);
+          await mkdir(path.join(source, "example"), { recursive: true });
+          await mkdir(staging);
+          await writeFile(path.join(source, "example", "fixture"), "downloaded");
+          const archive = path.join(root, "archive.tar.gz");
+          assert.equal(spawnSync("tar", ["-czf", archive, "-C", source, "example"]).status, 0);
+          for (const command of ["tar", "gzip", "dirname", "grep", "cat"]) {
+            const resolved = spawnSync("/bin/bash", ["-c", `command -v ${command}`], { encoding: "utf8" }).stdout.trim();
+            await symlink(resolved, path.join(bin, command));
+          }
+          const mock = path.join(bin, downloader);
+          await writeFile(mock, `#!/bin/bash
+printf '%s\\n' "$*" >> "$FETCH_LOG"
+url="\${!#}"
+if [[ "$url" == */releases/latest ]]; then
+  location="https://github.com/fw-ai-external/nexus-cli/releases/tag/v1.2.3"
+  [[ "$RESOLVE_MODE" != norelease ]] || location="https://github.com/fw-ai-external/nexus-cli/releases"
+  if [[ "${downloader}" == curl ]]; then printf '%s' "$location"; else printf '  Location: %s\r\n' "$location" >&2; exit 8; fi
+elif [[ "$url" == */commits/v1.2.3 ]]; then
+  [[ "$RESOLVE_MODE" != failed ]] || exit 7
+  if [[ "$RESOLVE_MODE" == malformed ]]; then printf invalid; else printf '%s' "$FIXTURE_SHA"; fi
+else
+  cat "$FIXTURE_ARCHIVE"
+fi
+`);
+          await chmod(mock, 0o755);
+          const runner = path.join(root, "runner.sh");
+          const script = await readFile(INSTALL_PATH, "utf8");
+          await writeFile(runner, script.replace(/\nmain "\$@"\s*$/, '\ndownload_cli_tarball "$FIXTURE_STAGE"\n'));
+          const env = {
+            ...process.env, HOME: root, PATH: bin, FETCH_LOG: path.join(root, "requests"),
+            FIXTURE_SHA: scenario === "newline" ? `${sha}\n` : sha, FIXTURE_STAGE: staging, FIXTURE_ARCHIVE: archive, RESOLVE_MODE: scenario,
+          };
+          for (const name of Object.keys(env)) {
+            if (name === "NEXUS_TARBALL_URL" || name === "FIRECONNECT_TARBALL_URL") delete env[name];
+          }
+          if (scenario === "override") env.NEXUS_TARBALL_URL = "http://127.0.0.1:12345/example.tar.gz";
+          const result = spawnSync("/bin/bash", [runner], { env, encoding: "utf8", timeout: 5000 });
+          const requests = await readFile(env.FETCH_LOG, "utf8");
+          assert.equal(result.status, ["malformed", "newline", "failed", "norelease"].includes(scenario) ? 1 : 0, result.stderr);
+          if (scenario === "pinned") {
+            assert.match(requests, /\/releases\/latest/);
+            assert.match(requests, /Accept: application\/vnd.github.sha .*\/commits\/v1\.2\.3/);
+            assert.match(requests, new RegExp(`/tarball/${sha}`));
+            assert.equal(requests.trim().split("\n").length, 3);
+          } else if (scenario === "override") {
+            assert.doesNotMatch(requests, /releases\/latest|commits\//);
+            assert.match(requests, /127\.0\.0\.1:12345\/example.tar.gz/);
+          } else {
+            assert.doesNotMatch(requests, /\/tarball\//);
+          }
+          assert.equal(existsSync(path.join(staging, "fixture")), scenario === "pinned" || scenario === "override");
+        } finally { await rm(root, { recursive: true, force: true }); }
+      });
+    }
+  }
+});
 
 const REPO_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -480,22 +547,31 @@ echo notes-ok
 });
 
 describe("install.sh download", () => {
-  async function runDownload(root, home, source, extraEnv = {}, { ensureDependencies = false } = {}) {
+  async function runDownload(
+    root,
+    home,
+    source,
+    extraEnv = {},
+    { ensureDependencies = false, viaNexusSource = false } = {},
+  ) {
     const installSource = await readFile(INSTALL_PATH, "utf8");
     const runner = path.join(root, "download-runner.sh");
     const ensureDependenciesCall = ensureDependencies ? "\nensure_dependencies" : "";
+    // viaNexusSource keeps install.sh's own NEXUS_SOURCE handling instead of overriding SOURCE.
+    const setSource = viaNexusSource ? "" : '\nSOURCE="$NEXUS_TEST_SOURCE"';
     await writeFile(
       runner,
       installSource.replace(
         /\nmain "\$@"\s*$/,
-        '\nCLI=""\nSOURCE="$NEXUS_TEST_SOURCE"\nensure_durable_source'
+        '\nCLI=""' + setSource + '\nensure_durable_source'
           + ensureDependenciesCall
           + '\necho "cli=${CLI}"\n',
       ),
     );
+    const sourceEnv = viaNexusSource ? { NEXUS_SOURCE: source } : { NEXUS_TEST_SOURCE: source };
     return spawnSync("bash", [runner], {
       encoding: "utf8",
-      env: { ...process.env, HOME: home, NEXUS_TEST_SOURCE: source, ...extraEnv },
+      env: { ...process.env, HOME: home, ...sourceEnv, ...extraEnv },
     });
   }
 
@@ -578,7 +654,7 @@ describe("install.sh download", () => {
     return archive;
   }
 
-  const DEFAULT_SOURCE_URL = "https://github.com/fw-ai/nexus-cli.git";
+  const DEFAULT_SOURCE_URL = "https://github.com/fw-ai-external/nexus-cli.git";
 
   it("downloads the default source as an HTTPS tarball, ignoring a broken git/SSH setup", async () => {
     // Regression: a global `url.<ssh>.insteadOf` rewrite plus a bad SSH key made
@@ -603,6 +679,28 @@ describe("install.sh download", () => {
       assert.equal(existsSync(path.join(home, ".nexus/cli.download")), false);
     });
   });
+
+  for (const former of ["https://github.com/fw-ai/nexus-cli.git", "https://github.com/fw-ai/nexus-cli", "https://github.com/fw-ai/nexus-cli/"]) {
+    it(`treats NEXUS_SOURCE set to the repo's former URL ${former} as the default tarball source`, async () => {
+      await withInstalledCli(async ({ root, home, installed }) => {
+        const archive = await makeTarball(root, {
+          "packages/setup-cli/bin/nexus.mjs": "// former url\n",
+        });
+        await writeFile(path.join(home, ".gitconfig"), "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n");
+
+        const result = await runDownload(
+          root,
+          home,
+          former,
+          { NEXUS_TARBALL_URL: `file://${archive}`, GIT_SSH_COMMAND: "/bin/false" },
+          { viaNexusSource: true },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(await readFile(installed, "utf8"), "// former url\n");
+      });
+    });
+  }
 
   it("installs the default source on a machine without git", async () => {
     await withInstalledCli(async ({ root, home, installed }) => {
@@ -772,6 +870,38 @@ describe("install.sh data directory move", () => {
 });
 
 describe("install.sh shared finalize", () => {
+  for (const terminal of [false, true]) {
+    for (const status of [0, 9]) {
+      it(`finalizes a piped install with terminal=${terminal}, preserving exit ${status}`, { skip: process.platform === "win32" || (terminal && !HAS_UTIL_LINUX_SCRIPT) }, async () => {
+        const root = await mkdtemp(path.join(os.tmpdir(), "installer-finalize-"));
+        try {
+          const source = await readFile(INSTALL_PATH, "utf8");
+          const runner = path.join(root, "runner.sh");
+          await writeFile(runner, source.replace(/\nmain "\$@"\s*$/, `
+node() {
+  [[ "$2" == finalize-install ]] || return 20
+  if [[ -t 0 ]]; then printf 'finalize-tty=yes\\n'; else printf 'finalize-tty=no\\n'; fi
+  return ${status}
+}
+if finalize_install; then
+  printf 'finalize-status=0\\n'
+else
+  printf 'finalize-status=%s\\n' "$?"
+fi
+`));
+          const env = { ...process.env, HOME: root, NEXUS_TEST_RUNNER: runner };
+          const command = 'cat "$NEXUS_TEST_RUNNER" | /bin/bash';
+          const result = terminal
+            ? spawnSync("script", ["-qfec", command, "/dev/null"], { env, encoding: "utf8", timeout: 10000 })
+            : spawnSync("/bin/bash", ["-c", command], { env, detached: true, encoding: "utf8", timeout: 10000 });
+          assert.equal(result.status, 0, result.stderr);
+          assert.match(result.stdout, new RegExp(`finalize-tty=${terminal ? "yes" : "no"}`));
+          assert.match(result.stdout, new RegExp(`finalize-status=${status}`));
+          assert.doesNotMatch(result.stderr, /\/dev\/tty/);
+        } finally { await rm(root, { recursive: true, force: true }); }
+      });
+    }
+  }
   it("invokes fireconnect finalize-install after installing the launcher", async () => {
     const source = await readFile(INSTALL_PATH, "utf8");
     assert.match(source, /node "\$\{CLI\}" finalize-install/);

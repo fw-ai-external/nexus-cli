@@ -1,5 +1,7 @@
-import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
+import { writeFileAtomic } from "../io/atomic-write.mjs";
+import { ensurePrivateParent } from "../io/private-files.mjs";
 
 /** @typedef {"keychain" | "file" | "plaintext"} CachedKeyStorage */
 
@@ -67,15 +69,17 @@ async function readCacheFileContents(home) {
 
 /**
  * @param {string} home
+ * @param {{ fresh?: boolean }} [options]
  * @returns {Promise<KeyStorageCacheEntry | null>}
  */
-export async function readKeyStorageCacheEntry(home) {
+export async function readKeyStorageCacheEntry(home, { fresh = false } = {}) {
   if (!home) {
     return null;
   }
   if (reprobeKeyStorageEnvSet()) {
     return null;
   }
+  if (fresh) processCache.delete(home);
   if (processCache.has(home)) {
     return processCache.get(home) ?? null;
   }
@@ -119,8 +123,8 @@ export async function writeKeyStorageCache(home, storage, reason = "") {
     return;
   }
   processCache.set(home, { storage, reason: reason.trim() });
-  await mkdir(path.dirname(cachePath(home)), { recursive: true, mode: 0o700 });
-  await writeFile(
+  ensurePrivateParent(cachePath(home));
+  await writeFileAtomic(
     cachePath(home),
     `${JSON.stringify({
       storage,

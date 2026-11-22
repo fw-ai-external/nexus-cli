@@ -19,6 +19,14 @@ import {
   SERVERLESS_CODING_USE_CASE,
   warmServerlessPricingCache,
 } from "../../lib/fireworks/models.mjs";
+import { lookupFireworksPricing } from "../../lib/fireworks/pricing.mjs";
+import {
+  FIREWORKS_MODEL_SPECS,
+  isRouterShortId,
+  lookupFireworksModelCost,
+  resolveFireworksCatalog,
+  resolveFireworksModelLabel,
+} from "../../lib/fireworks/model-specs.mjs";
 import {
   catalogWithAutoEntry,
   formatCatalogSections,
@@ -924,6 +932,165 @@ describe("fireworks-models serverless catalog", () => {  test("fetchServerlessCa
     );
   });
 
+  // Under US residency the API lists a model the account can call only
+  // in-region with its -us router as the usage identifier. The server sends no
+  // prices for it; usRow can still give it some, to check none are used.
+  const usRow = (model, displayName, overrides = {}) => mockServerlessModel({
+    id: `accounts/fireworks/models/${model}`,
+    display_name: displayName,
+    usage_identifier: `accounts/fireworks/routers/${model}-us`,
+    pricing: [],
+    ...overrides,
+  });
+  const sectionShortIds = (catalog, title) => organizeCatalogForDisplay(catalog)
+    .find((section) => section.title === title)?.entries.map((entry) => entry.shortId);
+
+  test("a US-residency catalog lists models through their -us routers, not by bare id", () => {
+    try {
+      const catalog = buildPickerCatalogFromApiModels([
+        usRow("glm-5p3", "GLM 5.3"),
+        // A row with global prices still neither lists nor prices the bare id.
+        usRow("kimi-k3", "Kimi K3", { pricing: mockServerlessModel().pricing }),
+        usRow("deepseek-v4p1-flash", "DeepSeek V4.1 Flash"),
+        usRow("deepseek-v4p1-flash-1017", "DeepSeek V4.1 Flash 1017"),
+        mockServerlessModel({ id: "accounts/fireworks/models/muse-spark-open", display_name: "Muse Spark Open" }),
+      ]);
+
+      // US routers have no -latest alias, so every version is listed.
+      assert.deepEqual(sectionShortIds(catalog, "US-ONLY ROUTERS"), [
+        "deepseek-v4p1-flash-1017-us", "deepseek-v4p1-flash-us", "glm-5p3-us", "kimi-k3-us",
+      ]);
+      assert.deepEqual(sectionShortIds(catalog, "INDIVIDUAL MODELS"), ["muse-spark-open"]);
+      const byShortId = new Map(catalog.map((entry) => [entry.shortId, entry]));
+      assert.equal(byShortId.get("glm-5p3-us")?.displayName, "GLM 5.3 (US)");
+      assert.equal(byShortId.get("deepseek-v4p1-flash-us")?.displayName, "DeepSeek V4.1 Flash (US)");
+
+      const { pricingById } = getServerlessCatalogSnapshot();
+      assert.equal(pricingById.has("accounts/fireworks/models/glm-5p3"), false);
+      assert.equal(pricingById.has("accounts/fireworks/models/kimi-k3"), false);
+      // US prices come from the static US specs.
+      assert.deepEqual(
+        ["glm-5p3-us", "deepseek-v4p1-flash-1017-us"].map((id) => [id, lookupFireworksPricing(id)?.input]),
+        [["glm-5p3-us", 2.10], ["deepseek-v4p1-flash-1017-us", 0.45]],
+      );
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
+  test("a model listed both globally and through its -us router keeps its bare id and price", () => {
+    try {
+      const catalog = buildPickerCatalogFromApiModels([
+        mockServerlessModel({ id: "accounts/fireworks/models/glm-5p3", display_name: "GLM 5.3" }),
+        usRow("glm-5p3", "GLM 5.3"),
+      ]);
+
+      assert.deepEqual(sectionShortIds(catalog, "US-ONLY ROUTERS"), ["glm-5p3-us"]);
+      assert.deepEqual(sectionShortIds(catalog, "INDIVIDUAL MODELS"), ["glm-5p3"]);
+      assert.equal(lookupFireworksPricing("accounts/fireworks/models/glm-5p3")?.input, 1.4);
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
+  test("a US router with no static spec is labeled US and has no price", () => {
+    try {
+      buildPickerCatalogFromApiModels([
+        usRow("example-coder", "Example Coder", { pricing: mockServerlessModel().pricing }),
+      ]);
+
+      // US rates are set per model, so the global rate is never borrowed.
+      assert.equal(lookupFireworksPricing("example-coder-us"), null);
+      assert.equal(resolveFireworksModelLabel("example-coder-us"), "Example Coder (US)");
+      // Its short name expands to the router, not a models/ path.
+      assert.equal(isRouterShortId("example-coder-us"), true);
+      // It keeps the capabilities its row reports, with no cost.
+      const resolved = resolveFireworksCatalog("example-coder-us");
+      assert.equal(resolved.cost, null);
+      assert.equal(resolved.limits.contextWindow, 1_048_576);
+      assert.equal(lookupFireworksModelCost("example-coder-us"), null);
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+    assert.equal(isRouterShortId("example-coder-us"), false);
+  });
+
+  test("a US router never takes its base model's static global rate", () => {
+    // A base model with a static global spec and no spec for its US router.
+    FIREWORKS_MODEL_SPECS["example-priced"] = {
+      label: "Example Priced",
+      pricing: { input: 1.32, cachedInput: 0.13, output: 3.96 },
+      capabilities: { contextWindow: 262_144, maxOutputTokens: 65_536, vision: false, toolCalling: true },
+    };
+    try {
+      buildPickerCatalogFromApiModels([usRow("example-priced", "Example Priced")]);
+
+      assert.equal(lookupFireworksPricing("example-priced-us"), null);
+      assert.equal(lookupFireworksModelCost("example-priced-us"), null);
+      const resolved = resolveFireworksCatalog("example-priced-us");
+      assert.equal(resolved.cost, null);
+      // Its base model's capabilities still apply.
+      assert.equal(resolved.toolCalling, true);
+    } finally {
+      delete FIREWORKS_MODEL_SPECS["example-priced"];
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
+  test("a -us router alias on a global row never takes the global price", () => {
+    try {
+      buildPickerCatalogFromApiModels([
+        mockServerlessModel({
+          id: "accounts/fireworks/models/kimi-k3",
+          display_name: "Kimi K3",
+          aliases: ["accounts/fireworks/routers/kimi-k3-us"],
+        }),
+      ]);
+
+      assert.equal(lookupFireworksPricing("kimi-k3-us")?.input, 4.50);
+      assert.equal(lookupFireworksPricing("kimi-k3-us")?.output, 22.50);
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
+  test("a US router never takes a cached price, even one an older catalog wrote", () => {
+    try {
+      // An older catalog copied the global row's rate onto the US alias.
+      const snapshot = buildServerlessCatalogSnapshot([
+        mockServerlessModel({ id: "accounts/fireworks/models/kimi-k3", display_name: "Kimi K3" }),
+      ]);
+      snapshot.pricingById.set("accounts/fireworks/routers/kimi-k3-us", {
+        ...snapshot.pricingById.get("accounts/fireworks/models/kimi-k3"),
+        slug: "kimi-k3-us",
+      });
+      setServerlessCatalogSnapshot(snapshot);
+
+      assert.equal(lookupFireworksPricing("kimi-k3-us")?.input, 4.50);
+      assert.equal(lookupFireworksPricing("accounts/fireworks/routers/kimi-k3-us")?.output, 22.50);
+      // Even spelled as a model path, a US router is priced from its US spec.
+      snapshot.pricingById.set("accounts/fireworks/models/kimi-k3-us", snapshot.pricingById.get("accounts/fireworks/models/kimi-k3"));
+      assert.equal(lookupFireworksPricing("accounts/fireworks/models/kimi-k3-us")?.input, 4.50);
+      // A dotted spelling of a US router resolves to the same US spec.
+      assert.equal(lookupFireworksPricing("glm-5.3-flash-us")?.input, 0.225);
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
+  test("a model whose own id ends in -us keeps its API price", () => {
+    try {
+      buildPickerCatalogFromApiModels([
+        mockServerlessModel({ id: "accounts/fireworks/models/example-flash-us", display_name: "Example Flash (US)" }),
+      ]);
+
+      assert.equal(lookupFireworksPricing("accounts/fireworks/models/example-flash-us")?.input, 1.4);
+      assert.equal(lookupFireworksPricing("example-flash-us")?.input, 1.4);
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+  });
+
   test("buildServerlessCatalogSnapshot captures API pricing and modalities", () => {
     const snapshot = buildServerlessCatalogSnapshot([
       mockServerlessModel({
@@ -976,6 +1143,36 @@ describe("fireworks-models serverless catalog", () => {  test("fetchServerlessCa
   });
 
   test("adds alias routers from the API aliases field", () => {
+    const snapshot = buildServerlessCatalogSnapshot(mockServerlessModelRows({
+      id: "accounts/fireworks/models/kimi-k3",
+      display_name: "Kimi K3",
+      aliases: [
+        "accounts/fireworks/routers/kimi-latest",
+        "accounts/fireworks/routers/kimi-fast-latest",
+      ],
+    }));
+    const ids = snapshot.entries.map((entry) => entry.id);
+    assert.ok(ids.includes("accounts/fireworks/routers/kimi-latest"));
+    assert.ok(ids.includes("accounts/fireworks/routers/kimi-fast-latest"));
+    assert.equal(
+      snapshot.routerBaseModelById.get("accounts/fireworks/routers/kimi-latest"),
+      "accounts/fireworks/models/kimi-k3",
+    );
+    assert.equal(
+      snapshot.routerBaseModelById.get("accounts/fireworks/routers/kimi-fast-latest"),
+      "accounts/fireworks/models/kimi-k3",
+    );
+    // The standard-tier alias inherits the standard row's pricing; the
+    // fast-latest alias takes the fast row's rates.
+    assert.equal(snapshot.pricingById.get("accounts/fireworks/routers/kimi-latest")?.tier, "standard");
+    assert.equal(snapshot.pricingById.get("accounts/fireworks/routers/kimi-fast-latest")?.tier, "fast");
+    const kimiLatest = snapshot.entries.find((entry) => entry.shortId === "kimi-latest");
+    assert.equal(kimiLatest?.displayName, "Kimi K3 (Latest)");
+  });
+
+  test("a -fast-latest alias is not offered when the fast mode isn't listed", () => {
+    // The listing leaves out modes the account can't use; an alias another
+    // mode's row still reports must not point at the missing one.
     const snapshot = buildServerlessCatalogSnapshot([
       mockServerlessModel({
         id: "accounts/fireworks/models/kimi-k3",
@@ -988,21 +1185,45 @@ describe("fireworks-models serverless catalog", () => {  test("fetchServerlessCa
     ]);
     const ids = snapshot.entries.map((entry) => entry.id);
     assert.ok(ids.includes("accounts/fireworks/routers/kimi-latest"));
-    assert.ok(ids.includes("accounts/fireworks/routers/kimi-fast-latest"));
-    assert.equal(
-      snapshot.routerBaseModelById.get("accounts/fireworks/routers/kimi-latest"),
-      "accounts/fireworks/models/kimi-k3",
-    );
-    assert.equal(
-      snapshot.routerBaseModelById.get("accounts/fireworks/routers/kimi-fast-latest"),
-      "accounts/fireworks/models/kimi-k3",
-    );
-    // The standard-tier alias inherits this row's standard pricing; the
-    // fast-latest alias must not (it expects fast-tier rates).
-    assert.equal(snapshot.pricingById.get("accounts/fireworks/routers/kimi-latest")?.tier, "standard");
+    assert.ok(!ids.includes("accounts/fireworks/routers/kimi-fast-latest"));
+    assert.equal(snapshot.routerBaseModelById.get("accounts/fireworks/routers/kimi-fast-latest"), undefined);
     assert.equal(snapshot.pricingById.get("accounts/fireworks/routers/kimi-fast-latest"), undefined);
-    const kimiLatest = snapshot.entries.find((entry) => entry.shortId === "kimi-latest");
-    assert.equal(kimiLatest?.displayName, "Kimi K3 (Latest)");
+  });
+
+  test("a bare model id is not offered when only its fast mode is listed", () => {
+    // A policy that allows fast and blocks standard leaves only the fast row;
+    // the bare id is a standard-tier request the gateway would refuse.
+    const snapshot = buildServerlessCatalogSnapshot([
+      mockServerlessModel({
+        id: "accounts/fireworks/models/kimi-k3",
+        display_name: "Kimi K3",
+        serverless_mode: "fast",
+        usage_identifier: "accounts/fireworks/routers/kimi-k3-fast",
+      }),
+    ]);
+    const shortIds = snapshot.entries.map((entry) => entry.shortId);
+    assert.deepEqual(shortIds, ["kimi-k3-fast"]);
+    // With the standard row listed too, both are offered.
+    const both = buildServerlessCatalogSnapshot(mockServerlessModelRows({ id: "accounts/fireworks/models/kimi-k3" }));
+    assert.deepEqual(both.entries.map((entry) => entry.shortId), ["kimi-k3", "kimi-k3-fast"]);
+  });
+
+  test("a plain -latest alias is not offered when only the fast mode is listed", () => {
+    const snapshot = buildServerlessCatalogSnapshot([
+      mockServerlessModel({
+        id: "accounts/fireworks/models/kimi-k3",
+        display_name: "Kimi K3",
+        serverless_mode: "fast",
+        usage_identifier: "accounts/fireworks/routers/kimi-k3-fast",
+        aliases: [
+          "accounts/fireworks/routers/kimi-latest",
+          "accounts/fireworks/routers/kimi-fast-latest",
+        ],
+      }),
+    ]);
+    const ids = snapshot.entries.map((entry) => entry.id);
+    assert.ok(ids.includes("accounts/fireworks/routers/kimi-fast-latest"));
+    assert.ok(!ids.includes("accounts/fireworks/routers/kimi-latest"));
   });
 
   test("does not synthesize alias routers the API does not report", () => {
@@ -1259,6 +1480,43 @@ describe("fireworks-models serverless catalog", () => {  test("fetchServerlessCa
       // Every version, newest first — no family collapsing.
       "INDIVIDUAL MODELS": ["minimax-m3", "kimi-k3", "kimi-k2p7-code", "glm-5p2", "kimi-k2p6", "minimax-m2p7", "glm-5p1"],
     });
+  });
+
+  test("model list shows ultra-fast routers with the fast routers", () => {
+    const entry = (shortId, kind, baseModelId = undefined) => ({
+      id: `accounts/fireworks/${kind}/${shortId}`,
+      shortId,
+      displayName: shortId,
+      kind: "serverless",
+      ...(baseModelId ? { baseModelId } : {}),
+    });
+    const sections = organizeCatalogForDisplay([
+      entry("example-v2-flash", "models"),
+      entry("example-flash-latest", "routers", "accounts/fireworks/models/example-v2-flash"),
+      entry("example-v2-flash-ultrafast", "routers", "accounts/fireworks/models/example-v2-flash"),
+    ]);
+    const idsBySection = Object.fromEntries(sections.map((section) => [
+      section.title,
+      section.entries.map(({ shortId }) => shortId),
+    ]));
+
+    assert.deepEqual(idsBySection, {
+      "LATEST ROUTERS": ["example-flash-latest"],
+      "FAST ROUTERS": ["example-v2-flash-ultrafast"],
+      "INDIVIDUAL MODELS": ["example-v2-flash"],
+    });
+
+    // The catalog's serving mode decides, not the slug: a renamed Ultra-fast router still lists.
+    const renamed = { ...entry("example-v2-flash-speedy", "routers", "accounts/fireworks/models/example-v2-flash"), serverlessMode: "ultrafast" };
+    const withRenamed = organizeCatalogForDisplay([
+      entry("example-v2-flash", "models"),
+      entry("example-flash-latest", "routers", "accounts/fireworks/models/example-v2-flash"),
+      renamed,
+    ]);
+    assert.deepEqual(
+      withRenamed.find((section) => section.title === "FAST ROUTERS")?.entries.map(({ shortId }) => shortId),
+      ["example-v2-flash-speedy"],
+    );
   });
 
   test("model list synthesizes the auto rows", () => {

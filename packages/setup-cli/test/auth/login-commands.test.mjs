@@ -9,8 +9,9 @@ import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
 import { runCli, seedKeychainConfig, withTempHome } from "../helpers.mjs";
 import { readGlobalConfig, writeGlobalConfig } from "../../lib/config/global-config.mjs";
+import { writeMintedKeyState } from "../../lib/keys/mint-api-key.mjs";
 import { pbDecode, pbStringAt } from "../../lib/auth/grpc-web.mjs";
-import { runInteractiveSignIn, signedInIdentityLine } from "../../lib/auth/login/flows.mjs";
+import { accountsForKind, runInteractiveSignIn, signedInIdentityLine } from "../../lib/auth/login/flows.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(__dirname, "../../bin/nexus.mjs");
@@ -47,7 +48,7 @@ function startMockGateway() {
 }
 
 /**
- * Mock of the control plane's gRPC-web surface, for logout's DeleteApiKey.
+ * Mock of the Fireworks gRPC-web API, for logout's DeleteApiKey.
  * Captures auth header + decoded request fields; answers with the given
  * grpc-status in the trailers frame.
  */
@@ -159,6 +160,7 @@ describe("fireconnect login / logout", () => {
       });
       assert.equal(result.code, 1);
       assert.match(result.stderr, /doesn't look like a Fireworks key/);
+      assert.match(result.stderr, /nexus\.fireworks\.ai\/settings\/api-keys/);
       assert.doesNotMatch(result.stderr, /Error:/);
 
       const exported = await runCli(["key", "export"], { home });
@@ -331,6 +333,36 @@ describe("fireconnect login / logout", () => {
       assert.equal(result.code, 0, `stderr: ${result.stderr}`);
       assert.match(result.stdout, new RegExp(`Already signed in as ${EMAIL}`));
       assert.match(result.stdout, /--api-key/);
+      assert.doesNotMatch(result.stdout, /key expires/);
+    });
+  });
+
+  it("login when already signed in shows when a browser sign-in key expires", async () => {
+    await withTempHome("login-already-expiry-", async (home) => {
+      await mkdir(path.join(home, ".nexus"), { recursive: true });
+      await seedKeychainConfig(home, VALID_KEY);
+      const record = (expiresAt, apiKey = VALID_KEY) => writeMintedKeyState(home, {
+        keyId: "key-1", userName: "accounts/acct-test/users/dev", displayName: "nexus-test", apiKey, expiresAt,
+      });
+
+      const later = new Date(Date.now() + 5 * 86_400_000).toISOString();
+      await record(later);
+      let result = await runCli(["login"], { home, env: gatewayEnv });
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, new RegExp(`Already signed in as ${EMAIL} \\(key expires on ${later.slice(0, 10)}\\)\\.`));
+      assert.doesNotMatch(result.stdout, /sign in again to replace it/);
+
+      // In the last day the date moves to the warning instead.
+      const soon = new Date(Date.now() + 3_600_000).toISOString();
+      await record(soon);
+      result = await runCli(["login"], { home, env: gatewayEnv });
+      assert.match(result.stdout, new RegExp(`Already signed in as ${EMAIL}\\.`));
+      assert.match(result.stdout, new RegExp(`This machine's API key expires on ${soon.slice(0, 10)}: sign in again to replace it\\.`));
+
+      // A record for another key says nothing about this one.
+      await record(later, "fw_some_other_key_000000000000000");
+      result = await runCli(["login"], { home, env: gatewayEnv });
+      assert.doesNotMatch(result.stdout, /key expires/);
     });
   });
 
@@ -377,6 +409,31 @@ describe("fireconnect login / logout", () => {
 
       const check = await runCli(["status"], { home, env: gatewayEnv });
       assert.equal(check.code, 1);
+    });
+  });
+
+  it("logout of a key this machine has no record of creating says it stays active on Fireworks, at a terminal and in --json", async () => {
+    const line = /This API key was only removed from this machine \(this machine has no record of creating it\), so it stays active on Fireworks\. Revoke it at https:\/\/\S+api-keys if you no longer need it\./;
+    await withTempHome("logout-local-only-", async (home) => {
+      const stored = await runCliWithStdin(["login", "--with-token"], { home, env: gatewayEnv, input: VALID_KEY });
+      assert.equal(stored.code, 0, stored.stderr);
+      const result = await runCli(["logout"], { home });
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      // Said before the removal, so it doesn't claim the key was removed yet.
+      assert.match(result.stdout, /This machine has no record of creating this API key, so logging out only removes it from this machine and it stays active on Fireworks\. Revoke it at https:\/\/\S+api-keys if you no longer need it\./);
+      assert.doesNotMatch(result.stdout, /was only removed/);
+      assert.match(result.stdout, /Logged out/);
+    });
+    await withTempHome("logout-local-only-json-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      const result = await runCli(["logout", "--json"], { home });
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const parsed = JSON.parse(result.stdout);
+      assert.deepEqual({ ...parsed, warnings: parsed.warnings.length }, { type: "result", ok: true, keyDeleted: false, warnings: 1 });
+      assert.match(parsed.warnings[0], line);
+      assert.doesNotMatch(parsed.warnings[0], /\u001b/, "a plain URL, no terminal escapes");
+      // Nothing stored any more: nothing to warn about.
+      assert.deepEqual(JSON.parse((await runCli(["logout", "--json"], { home })).stdout).warnings, []);
     });
   });
 
@@ -476,7 +533,7 @@ describe("fireconnect login / logout", () => {
     });
   });
 
-  it("logout --revoke deletes the key this machine minted, then clears local state", async () => {
+  it("logout --revoke without a TTY never deletes the key with itself: a Platform key needs a terminal sign-in, so everything is kept", async () => {
     const grpc = await startMockGrpcGateway();
     try {
       await withTempHome("logout-revoke-", async (home) => {
@@ -487,46 +544,72 @@ describe("fireconnect login / logout", () => {
 
         const result = await runCli(["logout", "--revoke"], {
           home,
-          env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url },
+          env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url, FIREWORKS_API_KEY: REJECTED_KEY },
         });
-        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-        assert.match(result.stdout, /Logged out/);
-        assert.match(result.stdout, /Revoked .*fireconnect-testhost.* server-side/);
+        assert.notEqual(result.code, 0);
+        assert.doesNotMatch(result.stdout, /Logged out/);
+        assert.match(result.stderr, /browser sign-in needs a terminal.*Your stored key and revoke record were kept.*revoke it at .*api-keys/i);
+        assert.equal(grpc.calls.length, 0, "no API key ever deletes a key");
+        await assert.doesNotReject(access(path.join(home, ".nexus", "minted-key.json")));
 
-        assert.equal(grpc.calls.length, 1);
-        assert.equal(grpc.calls[0].method, "DeleteApiKey");
-        assert.equal(grpc.calls[0].apiKey, VALID_KEY, "auth must be x-api-key with the stored key");
-        assert.equal(grpc.calls[0].parent, MINTED_STATE.userName);
-        assert.equal(grpc.calls[0].keyId, MINTED_STATE.keyId);
-
-        await assert.rejects(access(path.join(home, ".nexus", "minted-key.json")));
+        const check = await runCli(["status"], { home, env: gatewayEnv });
+        assert.equal(check.code, 0); // local credentials remain for retry
       });
     } finally {
       grpc.server.close();
     }
   });
 
-  it("logout --revoke authenticates with the stored minted key, not a stray env key", async () => {
+  it("logout --json without a terminal can't sign in for a Platform key: logged out, keyDeleted false, a warning, one result line", async () => {
     const grpc = await startMockGrpcGateway();
     try {
-      await withTempHome("logout-revoke-env-", async (home) => {
+      await withTempHome("logout-json-", async (home) => {
         await seedKeychainConfig(home, VALID_KEY);
         await seedMintedState(home);
-
-        // A different key exported in the shell must not authenticate the
-        // deletion of the minted key — that would target the wrong principal.
-        const result = await runCli(["logout", "--revoke"], {
-          home,
-          env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url, FIREWORKS_API_KEY: REJECTED_KEY },
-        });
+        const result = await runCli(["logout", "--json"], { home, env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url } });
         assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-        assert.equal(grpc.calls.length, 1);
-        assert.equal(grpc.calls[0].apiKey, VALID_KEY, "must authenticate with the stored minted key, not FIREWORKS_API_KEY");
-        assert.equal(grpc.calls[0].keyId, MINTED_STATE.keyId);
+        const line = JSON.parse(result.stdout);
+        assert.deepEqual({ ...line, warnings: line.warnings.length }, { type: "result", ok: true, keyDeleted: false, warnings: 1 });
+        // Says the key stays active, and why: not a generic "couldn't delete".
+        assert.match(line.warnings[0], /stays active until you revoke it \(revoking a Fireworks Platform or company SSO key needs a browser sign-in from a terminal: run nexus logout --revoke in a terminal\) at \S+api-keys/);
+        assert.match(result.stderr, /Logged out/);
+        assert.equal(grpc.calls.length, 0, "no API key ever deletes a key");
+        await assert.rejects(access(path.join(home, ".nexus", "minted-key.json")));
+
+        const again = await runCli(["logout", "--json"], { home });
+        assert.equal(again.code, 0);
+        assert.deepEqual(JSON.parse(again.stdout), { type: "result", ok: true, keyDeleted: false, warnings: [] });
       });
     } finally {
       grpc.server.close();
     }
+  });
+
+  it("a Platform key's revoke uses the sign-in token at a terminal, never the key; a Nexus key's goes to the web app", async () => {
+    const { revokeThisMachinesKey } = await import("../../lib/cli/commands/login.mjs");
+    const minted = { keyId: MINTED_STATE.keyId, userName: MINTED_STATE.userName };
+    const deletes = [];
+    const platform = await revokeThisMachinesKey({ minted, config: { accountType: "platform", ssoAccountId: "" }, ctx: {}, tty: true }, {
+      signIn: async () => ({ ok: true, idToken: "example-sign-in-token" }),
+      revoke: async (args) => { deletes.push(args); return { ok: true, failure: "" }; },
+      webRevoke: async () => assert.fail("a Platform key isn't revoked through the web app"),
+    });
+    assert.equal(platform.ok, true);
+    assert.deepEqual(deletes, [{ idToken: "example-sign-in-token", keyId: "key-123", userName: MINTED_STATE.userName }]);
+
+    const web = [];
+    const nexus = await revokeThisMachinesKey({ minted, config: { accountType: "nexus" }, ctx: { pasteCode: "" }, tty: false }, {
+      version: async () => 3,
+      signIn: async () => assert.fail("no Cognito sign-in for a Nexus key"),
+      webRevoke: async (args) => { web.push(args); return { ok: true, failure: "", error: "", fatal: false }; },
+    });
+    assert.equal(nexus.ok, true);
+    assert.deepEqual(web.map(({ keyId, accountHint, interactive }) => ({ keyId, accountHint, interactive })), [{ keyId: "key-123", accountHint: "acct-test", interactive: false }]);
+
+    const old = await revokeThisMachinesKey({ minted, config: { accountType: "nexus" }, ctx: {}, tty: true }, {
+      version: async () => 2, webRevoke: async () => assert.fail("version 2 has no revoke"),
+    });
+    assert.deepEqual(old, { ok: false, failure: "the web app can't revoke keys for Nexus yet (run nexus update later)" });
   });
 
   it("logout without a TTY or --revoke leaves the minted key alone and says so", async () => {
@@ -591,14 +674,13 @@ describe("fireconnect login / logout", () => {
         await seedKeychainConfig(home, VALID_KEY);
         await assert.doesNotReject(access(path.join(home, ".nexus", "minted-key.json")));
 
-        const result = await runCli(["logout", "--revoke"], {
+        const result = await runCli(["logout"], {
           home,
           env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url },
         });
         assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-        assert.match(result.stdout, /Revoked .*fireconnect-testhost.* server-side/);
-        assert.equal(grpc.calls.length, 1);
-        assert.equal(grpc.calls[0].keyId, MINTED_STATE.keyId);
+        assert.match(result.stdout, /Left .*fireconnect-testhost.* active/, "the record survived, so logout still knows the key");
+        assert.equal(grpc.calls.length, 0);
       });
     } finally {
       grpc.server.close();
@@ -623,31 +705,6 @@ describe("fireconnect login / logout", () => {
         assert.match(result.stdout, /nexus\.fireworks\.ai\/settings\/api-keys/);
         assert.doesNotMatch(result.stdout, /app\.fireworks\.ai/);
         assert.equal(JSON.parse(await readFile(configPath, "utf8")).nexusAccount, false);
-      });
-    } finally {
-      grpc.server.close();
-    }
-  });
-
-  it("logout still completes when revocation is refused, and says so", async () => {
-    const grpc = await startMockGrpcGateway({ status: 7, detail: "permission denied" });
-    try {
-      await withTempHome("logout-revoke-denied-", async (home) => {
-        await seedKeychainConfig(home, VALID_KEY);
-        await seedMintedState(home);
-
-        const result = await runCli(["logout", "--revoke"], {
-          home,
-          env: { NEXUS_GATEWAY_GRPC_WEB_URL: grpc.url },
-        });
-        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-        assert.match(result.stdout, /Logged out/);
-        assert.match(result.stdout, /Couldn't revoke/);
-        assert.match(result.stdout, /permission denied/);
-        assert.match(result.stdout, /api-keys/); // points at the console to finish the job
-
-        const check = await runCli(["status"], { home, env: gatewayEnv });
-        assert.equal(check.code, 1); // local credentials are gone regardless
       });
     } finally {
       grpc.server.close();
@@ -684,75 +741,87 @@ describe("fireconnect login / logout", () => {
     });
   });
 
-  // promptSignInMethod is TTY-only in real use; drive it through a subprocess
-  // with piped stdin (same pattern as read-secret.test.mjs).
-  function runMethodPrompt(input) {
-    const loginPath = path.join(__dirname, "../../lib/cli/commands/login.mjs");
-    const script = `
-      import { promptSignInMethod } from ${JSON.stringify(loginPath)};
-      const method = await promptSignInMethod();
-      process.stdout.write("RESULT:" + JSON.stringify(method));
-    `;
-    return new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => { stdout += chunk; });
-      child.stderr.on("data", (chunk) => { stderr += chunk; });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code, stdout, stderr }));
-      child.stdin.end(input);
-    });
-  }
-
   function parseMethod(stdout) {
     const marker = stdout.lastIndexOf("RESULT:");
     assert.notEqual(marker, -1, stdout);
     return JSON.parse(stdout.slice(marker + "RESULT:".length));
   }
 
-  describe("promptSignInMethod", () => {
-    it("offers create-a-key and paste, defaulting to create (browser) on Enter", async () => {
-      const result = await runMethodPrompt("\n");
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /needs a Fireworks API key for this machine/);
-      assert.match(result.stdout, /nexus logout/);
-      assert.match(result.stdout, /Create one for me/);
-      assert.match(result.stdout, /already have a key/);
-      assert.equal(parseMethod(result.stdout), "browser");
+  describe("remembered SSO account", () => {
+    function runSignIn(home, input, env = {}) {
+      const flowsPath = path.join(__dirname, "../../lib/auth/login/flows.mjs");
+      const script = `
+        import { runInteractiveSignIn } from ${JSON.stringify(flowsPath)};
+        const ok = await runInteractiveSignIn(${JSON.stringify(home)});
+        process.stdout.write("RESULT:" + JSON.stringify(ok));
+      `;
+      return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, HOME: home, NEXUS_TEST: "1", ...env },
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+        child.stdin.end(input);
+      });
+    }
+
+    it("asks the account kind right away when no SSO account is remembered", async () => {
+      await withTempHome("sso-remembered-none-", async (home) => {
+        const result = await runSignIn(home, "q\n");
+        assert.doesNotMatch(result.stdout, /company SSO\. Use it again\?/);
+        assert.match(result.stdout, /Which account do you use\?/);
+        assert.equal(parseMethod(result.stdout), false);
+      });
     });
 
-    it("returns paste for choice 2", async () => {
-      const result = await runMethodPrompt("2\n");
-      assert.equal(result.code, 0, result.stderr);
-      assert.equal(parseMethod(result.stdout), "paste");
+    it("offers the remembered SSO account first and falls back to the account kind on n", async () => {
+      await withTempHome("sso-remembered-decline-", async (home) => {
+        await writeGlobalConfig(home, { ssoAccountId: "example-account" });
+        const result = await runSignIn(home, "n\nq\n");
+        const sso = result.stdout.indexOf("example-account's company SSO. Use it again?");
+        const kind = result.stdout.indexOf("Which account do you use?");
+        assert.notEqual(sso, -1, result.stdout);
+        assert.notEqual(kind, -1, result.stdout);
+        assert.ok(sso < kind, "SSO offer comes before the account kind prompt");
+        assert.equal(parseMethod(result.stdout), false);
+      });
     });
 
-    it("returns sso for choice 3", async () => {
-      const result = await runMethodPrompt("3\n");
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /custom SSO/);
-      assert.equal(parseMethod(result.stdout), "sso");
+    it("cancels when input closes at the SSO offer instead of asking the account kind", async () => {
+      await withTempHome("sso-remembered-eof-", async (home) => {
+        await writeGlobalConfig(home, { ssoAccountId: "example-account" });
+        const result = await runSignIn(home, "");
+        assert.match(result.stdout, /example-account's company SSO\. Use it again\?/);
+        assert.doesNotMatch(result.stdout, /Which account do you use\?/);
+        assert.match(result.stderr, /Sign-in cancelled/);
+        assert.equal(parseMethod(result.stdout), false);
+      });
     });
 
-    it("re-asks on invalid input, and q cancels", async () => {
-      const result = await runMethodPrompt("banana\nq\n");
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /Enter 1, 2 or 3/);
-      assert.equal(parseMethod(result.stdout), null);
+    it("goes straight to the remembered account's SSO sign-in on Enter", async () => {
+      await withTempHome("sso-remembered-accept-", async (home) => {
+        await writeGlobalConfig(home, { ssoAccountId: "example-account" });
+        const result = await runSignIn(home, "\n", { NEXUS_GATEWAY_GRPC_WEB_URL: "http://127.0.0.1:9" });
+        assert.match(result.stdout, /example-account's company SSO\. Use it again\?/);
+        assert.doesNotMatch(result.stdout, /Which account do you use\?/);
+        assert.match(result.stdout + result.stderr, /Fireworks API|Couldn't/i);
+        assert.equal(parseMethod(result.stdout), false);
+      });
     });
   });
 
-  describe("promptAccountId", () => {
-    // Same TTY-only subprocess pattern as the other prompts.
-    function runAccountIdPrompt(remembered, input) {
-      const loginPath = path.join(__dirname, "../../lib/cli/commands/login.mjs");
+  describe("promptAccountKind", () => {
+    function runKindPrompt(input) {
+      const promptsPath = path.join(__dirname, "../../lib/auth/login/prompts.mjs");
       const script = `
-        import { promptAccountId } from ${JSON.stringify(loginPath)};
-        const id = await promptAccountId(${JSON.stringify(remembered)});
-        process.stdout.write("RESULT:" + JSON.stringify(id));
+        import { promptAccountKind } from ${JSON.stringify(promptsPath)};
+        const kind = await promptAccountKind();
+        process.stdout.write("RESULT:" + JSON.stringify(kind));
       `;
       return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
@@ -768,33 +837,72 @@ describe("fireconnect login / logout", () => {
       });
     }
 
-    it("returns the typed account id", async () => {
-      const result = await runAccountIdPrompt("", "my-company\n");
+    it("offers Nexus and Platform accounts, defaulting to Nexus on Enter", async () => {
+      const result = await runKindPrompt("\n");
       assert.equal(result.code, 0, result.stderr);
-      assert.equal(parseMethod(result.stdout), "my-company");
+      assert.match(result.stdout, /Nexus account: Pro, Team, or Enterprise plan at nexus\.fireworks\.ai/);
+      assert.match(result.stdout, /Fireworks Platform account: app\.fireworks\.ai/);
+      assert.doesNotMatch(result.stdout, /pay-as-you-go|subscription/);
+      assert.match(result.stdout, /nexus logout/);
+      assert.match(result.stdout, /Company SSO\? Press q, then run nexus login --account <account-id>\./);
+      assert.equal(parseMethod(result.stdout), "nexus");
     });
 
-    it("Enter takes the remembered id; without one it re-asks", async () => {
-      const remembered = await runAccountIdPrompt("example-account", "\n");
-      assert.equal(parseMethod(remembered.stdout), "example-account");
-
-      const reasked = await runAccountIdPrompt("", "\nacme\n");
-      assert.match(reasked.stdout, /Enter your account ID/);
-      assert.equal(parseMethod(reasked.stdout), "acme");
+    it("returns platform for choice 2", async () => {
+      const result = await runKindPrompt("2\n");
+      assert.equal(parseMethod(result.stdout), "platform");
     });
 
-    it("q and EOF cancel", async () => {
-      const cancelled = await runAccountIdPrompt("example-account", "q\n");
-      assert.equal(parseMethod(cancelled.stdout), null);
-      const eof = await runAccountIdPrompt("", "");
-      assert.equal(parseMethod(eof.stdout), null);
+    it("re-asks on invalid input; q and EOF cancel", async () => {
+      const reasked = await runKindPrompt("3\nq\n");
+      assert.match(reasked.stdout, /Please enter 1 or 2/);
+      assert.equal(parseMethod(reasked.stdout), null);
+      assert.equal(parseMethod((await runKindPrompt("")).stdout), null);
+    });
+  });
+
+  describe("accountsForKind", () => {
+    const listed = {
+      accountNames: ["accounts/example-nexus", "accounts/example-platform", "accounts/example-other"],
+      nexusAccountNames: ["accounts/example-nexus"],
+    };
+
+    it("narrows the sign-in's accounts to the kind picked", () => {
+      assert.deepEqual(accountsForKind(listed, "nexus"), { accountNames: ["accounts/example-nexus"], failure: "" });
+      assert.deepEqual(accountsForKind(listed, "platform"), {
+        accountNames: ["accounts/example-platform", "accounts/example-other"],
+        failure: "",
+      });
+    });
+
+    it("keeps every account without a kind", () => {
+      assert.deepEqual(accountsForKind(listed, undefined), { accountNames: listed.accountNames, failure: "" });
+    });
+
+    it("stops, and says where to go, when no account is of the kind picked", () => {
+      const platformOnly = { accountNames: ["accounts/example-platform"], nexusAccountNames: [] };
+      const nexus = accountsForKind(platformOnly, "nexus");
+      assert.deepEqual(nexus.accountNames, []);
+      assert.match(nexus.failure, /No Nexus account is linked to this sign-in/);
+      assert.match(nexus.failure, /nexus\.fireworks\.ai\/signup/);
+      assert.match(nexus.failure, /pick 2/);
+
+      const nexusOnly = { accountNames: ["accounts/example-nexus"], nexusAccountNames: ["accounts/example-nexus"] };
+      const platform = accountsForKind(nexusOnly, "platform");
+      assert.deepEqual(platform.accountNames, []);
+      assert.match(platform.failure, /No Fireworks Platform account is linked/);
+      assert.match(platform.failure, /pick 1/);
+    });
+
+    it("has no failure when the sign-in has no accounts at all", () => {
+      assert.deepEqual(accountsForKind({ accountNames: [], nexusAccountNames: [] }, "nexus"), { accountNames: [], failure: "" });
     });
   });
 
   describe("promptAccountChoice", () => {
     // When browser sign-in resolves to several accounts, the user must pick
     // which one the key belongs to — same TTY-only subprocess pattern as
-    // promptSignInMethod.
+    // promptAccountKind.
     function runAccountPrompt(accountNames, input) {
       const loginPath = path.join(__dirname, "../../lib/cli/commands/login.mjs");
       const script = `
@@ -866,12 +974,12 @@ describe("fireconnect login / logout", () => {
       assert.equal(parseMethod(result.stdout), true);
     });
 
-    it("n means no; invalid input re-asks; EOF means no", async () => {
+    it("n means no; invalid input re-asks; EOF is null so callers can tell it from n", async () => {
       assert.equal(parseMethod((await runYesNo("n\n")).stdout), false);
       const reasked = await runYesNo("maybe\nyes\n");
       assert.match(reasked.stdout, /Enter y or n/);
       assert.equal(parseMethod(reasked.stdout), true);
-      assert.equal(parseMethod((await runYesNo("")).stdout), false);
+      assert.equal(parseMethod((await runYesNo("")).stdout), null);
     });
 
     it("defaultYes:false flips the prompt and the Enter default (rotation prompt)", async () => {
@@ -879,6 +987,18 @@ describe("fireconnect login / logout", () => {
       assert.match(entered.stdout, /\[y\/N\]/);
       assert.equal(parseMethod(entered.stdout), false);
       assert.equal(parseMethod((await runYesNo("y\n", '{ "defaultYes": false }')).stdout), true);
+    });
+  });
+
+  it("login refuses --paste, and --with-token / --api-key at a terminal (headless only)", async () => {
+    const { loginFlagConflict } = await import("../../lib/cli/commands/login.mjs");
+    assert.match(loginFlagConflict({ paste: true }, { tty: true }), /--paste/);
+    assert.match(loginFlagConflict({ withToken: true }, { tty: true }), /at a terminal, sign in through your browser/);
+    // Without a terminal (this test's child processes) --with-token still signs in: see above.
+    await withTempHome("login-paste-refused-", async (home) => {
+      const result = await runCli(["login", "--paste"], { home, env: gatewayEnv });
+      assert.equal(result.code, 2, result.stderr);
+      assert.match(result.stderr, /--paste: pasting an API key at a terminal isn't supported/);
     });
   });
 
@@ -892,7 +1012,12 @@ describe("fireconnect login / logout", () => {
       assert.match(topic.stdout, /--with-token/);
       assert.match(topic.stdout, /--account/);
       assert.match(topic.stdout, /--force/);
-      assert.match(topic.stdout, /--paste/);
+      assert.doesNotMatch(topic.stdout, /--paste(?![-\w])/, "pasting a key at a terminal is gone");
+      assert.match(topic.stdout, /Without a terminal only/);
+
+      const logoutTopic = await runCli(["help", "logout"], { home });
+      assert.match(logoutTopic.stdout, /--revoke\s+Revoke this machine's key without prompting/);
+      assert.match(logoutTopic.stdout, /--json/);
     });
   });
 });
@@ -901,7 +1026,7 @@ describe("signedInIdentityLine", () => {
   it("names the returned email and account before a key is created", () => {
     assert.equal(
       signedInIdentityLine("user@example.com", "accounts/example-account"),
-      "Signed in as user@example.com — creating a key in account example-account.",
+      "Signed in as user@example.com. Creating an API key in account example-account.",
     );
     assert.match(signedInIdentityLine("", "accounts/example-account"), /no email/);
     assert.doesNotMatch(signedInIdentityLine("a\u001b[2Jb@example.com", "accounts/x"), /\u001b/);
@@ -924,6 +1049,7 @@ describe("desktop plaintext-token account metadata", () => {
         assert.equal(result.code, 0, result.stderr);
         const config = await readGlobalConfig(home);
         assert.equal(config.nexusAccount, kind === "nexus");
+        assert.equal(config.accountType, kind ?? "unknown");
         assert.equal(config.ssoAccountId, "keep-me");
         assert.ok(!(result.stdout + result.stderr).includes(VALID_KEY));
       }
@@ -932,7 +1058,7 @@ describe("desktop plaintext-token account metadata", () => {
 
   it("does not reclassify the previous credential after verification rejects a replacement", async () => {
     await withTempHome("login-account-kind-rejected-", async (home) => {
-      await writeGlobalConfig(home, { nexusAccount: true });
+      await writeGlobalConfig(home, { accountType: "nexus" });
       const result = await runCliWithStdin(["login", "--with-token", "--account-type", "platform"], {
         home, env: { NEXUS_GATEWAY_URL: gateway.url }, input: REJECTED_KEY,
       });
@@ -943,10 +1069,11 @@ describe("desktop plaintext-token account metadata", () => {
 
   it("logout clears stale account metadata even without a stored credential", async () => {
     await withTempHome("logout-stale-kind-", async (home) => {
-      await writeGlobalConfig(home, { nexusAccount: true });
+      await writeGlobalConfig(home, { accountType: "nexus" });
       const result = await runCli(["logout"], { home });
       assert.equal(result.code, 0, result.stderr);
       assert.equal((await readGlobalConfig(home)).nexusAccount, false);
+      assert.equal((await readGlobalConfig(home)).accountType, "unknown");
     });
   });
 });

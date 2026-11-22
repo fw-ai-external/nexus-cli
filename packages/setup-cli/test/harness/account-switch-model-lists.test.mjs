@@ -4,9 +4,11 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { userSettingsPath } from "../../lib/harnesses/claude/core.mjs";
 import { codexCatalogPath } from "../../lib/harnesses/codex/core.mjs";
-import { isCodexOpenaiModelSlug } from "../../lib/harnesses/codex/catalog.mjs";
+import { codexModelRef, isCodexOpenaiModelSlug } from "../../lib/harnesses/codex/catalog.mjs";
 import { OPENCODE_FIREWORKS_PROVIDER_ID, opencodeConfigPath } from "../../lib/harnesses/opencode/core.mjs";
 import { copilotProvidersPath } from "../../lib/harnesses/copilot-cli/config.mjs";
+import { deepseekSettingsPath, readDeepseekSettingsIfExists } from "../../lib/harnesses/deepseek/core.mjs";
+import { hermesConfigPath, readHermesConfigIfExists } from "../../lib/harnesses/hermes/core.mjs";
 import { runFireconnect, withTempHome } from "../helpers.mjs";
 
 // Two accounts the mock gateway serves different catalogs to: the "Pro" key
@@ -27,7 +29,8 @@ const LISTS = {
   codex: {
     dir: ".codex",
     read: async (home) => JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models
-      .map((row) => row.slug)
+      // Codex names the auto mix `nexus/auto`; compare in Nexus IDs.
+      .map((row) => codexModelRef(row.slug))
       .filter((slug) => !isCodexOpenaiModelSlug(slug)),
   },
   opencode: {
@@ -40,6 +43,17 @@ const LISTS = {
     dir: ".copilot",
     read: async (home) => JSON.parse(await readFile(copilotProvidersPath({ home }), "utf8")).models
       .map((row) => row.id),
+  },
+  deepseek: {
+    dir: ".dsh",
+    read: async (home) => (await readDeepseekSettingsIfExists(deepseekSettingsPath(home)))
+      .settings["llm-pi-ai"].providers.fireworks.models.map((row) => row.id),
+  },
+  hermes: {
+    dir: ".hermes",
+    // Hermes lists the auto mix as `nexus-auto`.
+    read: async (home) => Object.keys((await readHermesConfigIfExists(hermesConfigPath(home)))
+      .config.providers.fireworks.models).map((id) => (id === "nexus-auto" ? "auto" : id)),
   },
 };
 const HARNESS_IDS = Object.keys(LISTS);

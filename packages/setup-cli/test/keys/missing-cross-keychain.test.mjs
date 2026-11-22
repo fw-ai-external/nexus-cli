@@ -10,7 +10,6 @@ import { itIfNpm, seedOnCommandCatalog } from "../helpers.mjs";
 
 import {
   cliDependenciesMissingMessage,
-  crossKeychainInstalled,
   dependencyInstalled,
   ensureCliDependencies,
   resolveSetupCliDir,
@@ -121,7 +120,7 @@ describe("dep-less checkout configure", () => {
   itIfNpm("ensureCliDependencies installs runtime deps from a dep-less checkout copy", () => {
     assert.equal(runtimeDepsInstalled(setupDir), false);
     assert.equal(ensureCliDependencies(setupDir), true);
-    assert.equal(crossKeychainInstalled(setupDir), true);
+    assert.equal(dependencyInstalled("cross-keychain", setupDir), true);
     assert.equal(dependencyInstalled("ansis", setupDir), true);
   });
 
@@ -129,7 +128,7 @@ describe("dep-less checkout configure", () => {
     assert.equal(ensureCliDependencies(setupDir), true);
     await rm(path.join(setupDir, "node_modules", "ansis"), { recursive: true, force: true });
     assert.equal(dependencyInstalled("ansis", setupDir), false);
-    assert.equal(crossKeychainInstalled(setupDir), true);
+    assert.equal(dependencyInstalled("cross-keychain", setupDir), true);
     assert.equal(ensureCliDependencies(setupDir), true);
     assert.equal(dependencyInstalled("ansis", setupDir), true);
   });

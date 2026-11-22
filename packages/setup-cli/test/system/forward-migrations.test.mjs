@@ -176,7 +176,7 @@ describe("runHarnessForwardMigrations", () => {
       assert.ok(noted.includes("Added the auto model to Codex — restart it to pick it up."), noted.join("\n"));
       assert.deepEqual(
         (await readJsonIfExists(catalogPath)).models.map((row) => row.slug),
-        ["auto", "glm-5p1"],
+        ["nexus/auto", "glm-5p1"],
       );
 
       // No catalog file at all: nothing created, config untouched.

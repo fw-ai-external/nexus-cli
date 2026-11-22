@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   FIREWORKS_MODEL_SPECS,
+  isModeRouterOf,
   isUsableCachedServerlessPricing,
   lookupFireworksModelCost,
   lookupFireworksModelLimits,
@@ -65,6 +66,72 @@ describe("fireworks-model-specs", () => {
         "Kimi K3 Fast",
       ),
       "Kimi K3 Fast (Latest)",
+    );
+  });
+
+  it("labels ultra-fast routers Ultra-fast, never Fast", () => {
+    assert.equal(
+      resolveRouterEntryDisplayName(
+        "accounts/fireworks/routers/example-model-ultrafast",
+        "Example Model",
+      ),
+      "Example Model Ultra-fast",
+    );
+    assert.equal(
+      resolveRouterEntryDisplayName(
+        "accounts/fireworks/routers/example-model-ultrafast",
+        "Example Model Ultra-fast",
+        { pricingTier: "ultrafast" },
+      ),
+      "Example Model Ultra-fast",
+    );
+  });
+
+  it("treats a router as a serving mode of a model from the catalog, then the slug", () => {
+    setServerlessCatalogSnapshot({
+      entries: [],
+      pricingById: new Map([
+        ["accounts/fireworks/routers/example-fast-latest", { input: 2, cachedInput: 0.2, output: 8, tier: "fast" }],
+        ["accounts/fireworks/routers/example-latest", { input: 1, cachedInput: 0.1, output: 4, tier: "standard" }],
+      ]),
+      inputModalitiesById: new Map(),
+      routerBaseModelById: new Map([
+        ["accounts/fireworks/routers/example-fast-latest", "accounts/fireworks/models/example-model"],
+        ["accounts/fireworks/routers/example-latest", "accounts/fireworks/models/example-model"],
+        // Cached without usable SKUs: no tier, so the static spec names the mode.
+        ["accounts/fireworks/routers/kimi-k3-fast", "accounts/fireworks/models/kimi-k3"],
+      ]),
+      contextLengthById: new Map(),
+      supportsToolsById: new Map(),
+    });
+    try {
+      // A `-latest` alias carries no mode in its name; the catalog supplies it.
+      assert.equal(isModeRouterOf("example-fast-latest", "accounts/fireworks/models/example-model"), true);
+      assert.equal(isModeRouterOf("example-latest", "accounts/fireworks/models/example-model"), false, "standard tier");
+      assert.equal(isModeRouterOf("example-fast-latest", "accounts/fireworks/models/other-model"), false, "other base");
+      assert.equal(isModeRouterOf("kimi-k3-fast", "accounts/fireworks/models/kimi-k3"), true, "unpriced router row");
+    } finally {
+      setServerlessCatalogSnapshot(null);
+    }
+    // Cold cache: the slug names the mode and the model.
+    assert.equal(isModeRouterOf("example-model-ultrafast", "accounts/fireworks/models/example-model"), true);
+    assert.equal(isModeRouterOf("example-model-fast", "example-model"), true);
+    assert.equal(isModeRouterOf("kimi-k2p6-turbo", "accounts/fireworks/models/kimi-k2p6"), true);
+    assert.equal(isModeRouterOf("sonnet", "claude-sonnet-4-6"), false);
+  });
+
+  it("prices DeepSeek V4.1 Flash 1017 and its Ultra-fast router before the catalog loads", () => {
+    setServerlessCatalogSnapshot(null);
+    const standard = lookupFireworksPricing("accounts/fireworks/models/deepseek-v4p1-flash-1017");
+    assert.deepEqual([standard?.input, standard?.cachedInput, standard?.output], [0.30, 0.006, 1.20]);
+    const ultrafast = lookupFireworksPricing("accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast");
+    assert.deepEqual(
+      [ultrafast?.input, ultrafast?.cachedInput, ultrafast?.output, ultrafast?.tier],
+      [1.20, 0.024, 4.80, "ultrafast"],
+    );
+    assert.equal(
+      resolveFireworksModelLabel("deepseek-v4p1-flash-1017-ultrafast"),
+      "DeepSeek V4.1 Flash 1017 Ultra-fast",
     );
   });
 

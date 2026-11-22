@@ -3,6 +3,7 @@ import {
   fullFireworksResourceId,
   normalizeModelId,
   shortFireworksModelRef,
+  FIREWORKS_OPENAI_BASE_URL,
 } from "../fireworks/model-id.mjs";
 import { ALL_REASONING_EFFORTS } from "../fireworks/reasoning.mjs";
 import { autoDisplayName, prettyModelName } from "../fireworks/models.mjs";
@@ -18,7 +19,7 @@ import { isAutoModelId, resolveFireworksCatalog } from "../fireworks/model-specs
  * duplicated or cross-imported between the two.
  */
 
-export const COPILOT_FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+export const COPILOT_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 
 /**
  * Reasoning-effort levels published for every registered model.
@@ -60,8 +61,7 @@ export function resolveCopilotModelId(modelId) {
 /**
  * Describe each model once, from the serverless catalog, for whichever
  * harness is writing. Each consumer takes the fields its format supports:
- * the desktop schema has no vision column, the CLI has no per-level effort
- * list.
+ * the desktop schema has no vision column.
  *
  * @param {string[]} modelIds  short Fireworks refs
  * @returns {Array<{ id: string, displayName: string, maxPromptTokens: number|null, maxOutputTokens: number|null, vision: boolean }>}

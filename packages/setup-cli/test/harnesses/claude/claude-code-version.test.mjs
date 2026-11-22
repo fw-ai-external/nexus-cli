@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -11,7 +11,7 @@ import {
   parseClaudeCodeVersion,
 } from "../../../lib/harnesses/claude/claude-code-version.mjs";
 import { printClaudePickerSummary } from "../../../lib/harnesses/claude/onboarding.mjs";
-import { mockServerlessModel, runFireconnect, seedServerlessCatalogCache } from "../../helpers.mjs";
+import { mockServerlessModel, runFireconnect, seedServerlessCatalogCache, withTempHome } from "../../helpers.mjs";
 
 const POSIX_ONLY = { skip: process.platform === "win32" };
 
@@ -43,14 +43,25 @@ describe("Claude Code version check", () => {
 
   it("reads the version from the claude on PATH", POSIX_ONLY, async () => {
     const dir = await fakeClaudeOnPath("2.1.227 (Claude Code)");
-    assert.equal(installedClaudeCodeVersion({ env: { PATH: dir, NEXUS_TEST: "" } }), "2.1.227");
+    assert.equal(installedClaudeCodeVersion({ env: { PATH: dir, HOME: dir, NEXUS_TEST: "" }, root: dir }), "2.1.227");
   });
 
   it("returns empty when claude is missing or fails", POSIX_ONLY, async () => {
     const empty = await mkdtemp(path.join(os.tmpdir(), "nx-no-claude-"));
-    assert.equal(installedClaudeCodeVersion({ env: { PATH: empty, NEXUS_TEST: "" } }), "");
+    assert.equal(installedClaudeCodeVersion({ env: { PATH: empty, HOME: empty, NEXUS_TEST: "" }, root: empty }), "");
     const failing = await fakeClaudeOnPath("2.1.227 (Claude Code)", 1);
-    assert.equal(installedClaudeCodeVersion({ env: { PATH: failing, NEXUS_TEST: "" } }), "");
+    assert.equal(installedClaudeCodeVersion({ env: { PATH: failing, HOME: failing, NEXUS_TEST: "" }, root: failing }), "");
+  });
+
+  it("uses the caller home instead of the environment home for fallback lookup", POSIX_ONLY, async () => {
+    await withTempHome("claude-probe-home-", async (home) => {
+      const bin = path.join(home, ".npm-global", "bin", "claude");
+      await mkdir(path.dirname(bin), { recursive: true });
+      await writeFile(bin, "#!/bin/sh\nprintf '1.2.3\\n'\n", { mode: 0o755 });
+      const env = { PATH: "", HOME: path.join(home, "other-home"), NEXUS_TEST: "" };
+      assert.equal(installedClaudeCodeVersion({ env, root: home }), "");
+      assert.equal(installedClaudeCodeVersion({ env, root: home, home }), "1.2.3");
+    });
   });
 
   it("the picker summary says when the catalog can't show", () => {

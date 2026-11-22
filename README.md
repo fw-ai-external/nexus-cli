@@ -1,6 +1,6 @@
 # Nexus CLI
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/fw-ai/nexus-cli/blob/main/LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/fw-ai-external/nexus-cli/blob/main/LICENSE)
 
 > **One key. Ten harnesses.** Use [Fireworks AI](https://fireworks.ai) models inside the coding tools you already love: Claude Code, Claude Desktop, OpenCode, Codex, Pi, Cursor, VS Code, GitHub Copilot (app and CLI), and DeepSeek Harness.
 
@@ -15,7 +15,7 @@ Nexus CLI points each harness at Fireworks by editing that harness's own setting
 **Contents:** [Quick start](#quick-start) · [Supported harnesses](#supported-harnesses) ·
 [Default models](#default-models) · [Claude Code](#claude-code) · [Codex](#codex) ·
 [OpenCode](#opencode) · [Pi](#pi) · [Cursor](#cursor) · [VS Code Chat](#vs-code-chat) ·
-[GitHub Copilot app](#github-copilot-app) · [GitHub Copilot CLI](#github-copilot-cli) · [DeepSeek Harness](#deepseek-harness) ·
+[GitHub Copilot app](#github-copilot-app) · [GitHub Copilot CLI](#github-copilot-cli) · [DeepSeek Harness](#deepseek-harness) · [Hermes Agent](#hermes-agent) ·
 [Claude Desktop](#claude-desktop) · [Nexus Auto](#firerouter-is-now-nexus-auto) · [Models](#models) ·
 [Azure / Foundry](#azure-microsoft-foundry-endpoints) · [CLI reference](#cli-reference) ·
 [Keys and storage](#keys-and-storage) · [Troubleshooting](#troubleshooting) ·
@@ -32,13 +32,14 @@ curl -fsSL https://nexus.fireworks.ai/install.sh | bash
 Or install direct from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fw-ai/nexus-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/fw-ai-external/nexus-cli/main/install.sh | bash
 ```
 
 **2. Sign in**
 
 ```bash
-nexus login        # browser sign-in, or paste a fw_… key
+nexus login        # browser sign-in
+# no terminal (CI, scripts): nexus login --with-token < key.txt
 ```
 
 **3. Connect a harness**
@@ -93,7 +94,7 @@ nexus claude off                 # back to exactly how things were
 ```
 
 Use any harness name in place of `claude`: `claude-desktop`, `opencode`, `codex` (or `chatgpt`),
-`pi`, `cursor`, `vscode`, `copilot-app`, `copilot-cli`, `deepseek`. Start with `nexus help`, then use `nexus <harness> help` or `nexus <command> --help` for options.
+`pi`, `cursor`, `vscode`, `copilot-app`, `copilot-cli`, `deepseek`, `hermes`. Start with `nexus help`, then use `nexus <harness> help` or `nexus <command> --help` for options.
 
 ### Install notes
 
@@ -104,8 +105,8 @@ Use any harness name in place of `claude`: `claude-desktop`, `opencode`, `codex`
 **From an SSH checkout:**
 
 ```bash
-tmp="$(mktemp -d)" && git clone --depth 1 git@github.com:fw-ai/nexus-cli.git "$tmp" \
-  && NEXUS_SOURCE=git@github.com:fw-ai/nexus-cli.git bash < "$tmp/install.sh"
+tmp="$(mktemp -d)" && git clone --depth 1 git@github.com:fw-ai-external/nexus-cli.git "$tmp" \
+  && NEXUS_SOURCE=git@github.com:fw-ai-external/nexus-cli.git bash < "$tmp/install.sh"
 ```
 
 ## Supported harnesses
@@ -117,18 +118,21 @@ Every harness supports `on`, `off`, `status`, and `help`, and every model change
 | Harness | Command | Settings it edits | Quit / restart |
 |---------|---------|-------------------|---------------------|
 | [Claude Code](#claude-code) | `nexus claude` | `~/.claude/settings.json` | Restart after |
-| [Codex](#codex) | `nexus codex` / `nexus chatgpt` | `~/.codex/config.toml` | Restart after |
-| [OpenCode](#opencode) | `nexus opencode` | `~/.config/opencode/opencode.json` | Restart after |
+| [Codex](#codex) | `nexus codex` / `nexus chatgpt` | `~/.codex/config.toml` + `~/.codex/pets/fireworks-nexus/` (when selecting the Nexus pet) | Restart after |
+| [OpenCode](#opencode) | `nexus opencode` | `~/.config/opencode/opencode.json` + `~/.config/opencode/plugins/fireworks-nexus/` | Restart after |
 | [Pi](#pi) | `nexus pi` | `~/.pi/agent/{settings,models,auth}.json` | Restart after |
 | [Cursor](#cursor) | `nexus cursor` | `state.vscdb` (SQLite) | **Quit Cursor first** |
 | [VS Code Chat](#vs-code-chat) | `nexus vscode` | `chatLanguageModels.json` + `state.vscdb` | **Quit VS Code first** |
 | [GitHub Copilot app](#github-copilot-app) | `nexus copilot-app` | `~/.copilot/data.db` (SQLite) | **Quit Copilot first** |
 | [GitHub Copilot CLI](#github-copilot-cli) | `nexus copilot-cli` | `~/.copilot/providers.json` + `settings.json` | Restart `copilot` after |
 | [DeepSeek Harness](#deepseek-harness) | `nexus deepseek` | `~/.dsh/settings.yaml` + patch layers | Restart `dsh` after |
+| [Hermes Agent](#hermes-agent) | `nexus hermes` | `~/.hermes/config.yaml` + `.env` | Restart `hermes` after |
 | [Claude Desktop](#claude-desktop) (Limited) | `nexus claude-desktop` | Claude-3p provider profile + loopback shim | **Quit and reopen Desktop after** |
 
 `off` restores from a snapshot kept under `~/.nexus/` (files) or removes exactly what Nexus CLI
 added (IDEs and databases). Your own providers, models, and settings are never touched.
+`off` also removes the Nexus-owned Codex pet and OpenCode sidebar plugin folders, never a
+same-named folder of yours. Switching OpenCode to Azure also removes the Nexus-owned plugin.
 `on` refuses a harness that isn't installed. Any sign of the tool counts: its command, its app, its editor
 extension, or data only the tool writes (like Claude Code's `~/.claude/projects`). If the tool is installed
 somewhere Nexus CLI doesn't look, pass `--skip-install-check`. `nexus status` shows which harnesses are installed
@@ -194,18 +198,48 @@ quietly break routing. An exact backup is kept for `off`.
   feature flags, which hides tools such as Artifact. If you set one yourself in `settings.json`
   while connected, Nexus CLI leaves it alone.
 
+### Auto mode safety checks
+
+Through Fireworks, Claude Code auto mode's safety checks run server-side at Fireworks,
+separately from the main model. This gives an independent check even on smaller open
+models. Claude Code no longer shows the "this session isn't eligible" classifier billing
+notice. In Claude Code, `/status` shows "Auto mode server: Enabled". If the server check
+runs but returns no verdict, Claude Code blocks the action with "no safety verdict". If the
+server check isn't available, Claude Code falls back to its own classifier and shows the
+billing notice again.
+
+Checks are billed to your Fireworks account at Fireworks rates. A turn with tool calls can
+add a check request. `nexus claude usage` and the status line read Claude Code's local
+transcripts, so they may not include these checks.
+
+To opt out, run `export CLAUDE_CODE_AUTO_MODE_SERVER=0` in your shell before starting
+Claude Code. In `~/.claude/settings.json`, `nexus claude` keeps a value you set before
+connecting but removes one added later.
+Claude Code then uses its own classifier on its Sonnet slot, billed to Anthropic unless
+you pin Sonnet with `nexus claude --sonnet <id>`. Nexus no longer writes the server opt-out
+setting itself.
+
+See Claude Code's [classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing)
+and [server-side classifier review](https://code.claude.com/docs/en/permission-modes#server-side-classifier-review) docs.
+
 ### Status line
 
 `on` adds a `statusLine` (only if you don't already have one) showing which model served
 each call and what it cost at Fireworks rates:
 
 ```text
-━━━━━━━━━━━━ ━ ━ · $70.39 · routed model: Claude Opus 5
-━ Claude Opus 5 $62.91 98% cache · ━ GLM 5.2 $7.35 96% cache · ━ DeepSeek V4 Flash $0.13 87% cache
+⠀⣄⡘⣧⣼⢃⣠⠀ ━━━━━━━━━━━━ ━ ━ · $70.39 · ████░ 1.2k TPS · ⇉ Claude Opus 5
+⠴⠬⠿⠎⠱⠯⠥⠦ ━ Claude Opus 5 $62.91 98% cache · ━ GLM 5.2 $7.35 96% cache · ━ DeepSeek V4 Flash $0.13 87% cache
 ```
 
 It reads the session transcript, so mid-session model switches are priced by the model that
-actually served each call. `off` removes it; `NO_COLOR` gives plain text.
+actually served each call. When the transcript's `requestedModel` names a serving-mode
+router of that model (such as Fast or Ultra-fast), the status line and `nexus claude usage`
+snapshots label and price the call as the requested router, even if the response names the
+base model. With no cached catalog, only router IDs ending in a serving-mode suffix
+(such as `-fast` or `-ultrafast`) are recognized; aliases such as `-fast-latest` are then priced as the base model. `auto`
+calls still use the model that served each call. `off` removes the
+status line; the Fireworks symbol appears only with color. `NO_COLOR` gives plain text without the symbol.
 
 ## Codex
 
@@ -216,8 +250,12 @@ which shares `~/.codex`) through Fireworks via the Responses API.
 nexus codex                       # writes ~/.codex/config.toml (auto, ChatGPT sign-in)
 nexus codex status
 nexus codex --model glm-latest    # switch model
+nexus codex usage                 # live session meter with estimated cost (--json / --last-n for snapshots)
 nexus codex off
 ```
+
+`on` selects and installs the Fireworks pet unless you've chosen your own `tui.pet`, use an
+inline `tui = { ... }` table, or have a non-empty folder of your own at `pets/fireworks-nexus/`.
 
 ### Signing in with ChatGPT
 
@@ -237,6 +275,10 @@ Codex offers them), then the Fireworks catalog. A re-run keeps the model you're 
 
 **Notes that matter:**
 
+- **Image generation is off by default.** Nexus sets `features.image_generation = false`
+  in `~/.codex/config.toml` unless you've already set a preference. Your explicit setting
+  is kept; `nexus codex off` restores your saved config or removes Nexus's added setting
+  if no usable backup is available.
 - **Threads keep the provider they started on.** ChatGPT app threads started on OpenAI stay
   on OpenAI; start a new thread for Fireworks. Resuming a CLI session needs the provider on:
   `codex resume <id> -c model_provider="fireworks-ai"`.
@@ -252,6 +294,7 @@ model, and registers the preferred catalog for `/model` (skipping models OpenCod
 lists from models.dev, so nothing shows twice). Your key is saved in the file (owner-only).
 OpenCode v2's `providers` map is written too when present. Offline, it falls back to the
 active model. `--config-path <path>` for a config elsewhere.
+The sidebar plugin goes in `plugins/fireworks-nexus/` next to that config (including with `--config-path`); only OpenCode 2.x loads it.
 
 ```bash
 nexus opencode
@@ -326,8 +369,8 @@ Routes the `copilot` command through Fireworks with plain JSON: a `fireworks` pr
 one row per model in `~/.copilot/providers.json`, and the selected model in `settings.json`
 (a BYOK provider has no default, and the CLI won't start without one). **Pick models with
 the provider attached** — `copilot --model fireworks/glm-latest` or `/model`; a bare name is
-rejected and quietly falls back. Per-model image input is supported; context/reasoning/pricing
-aren't shown for BYOK models. `off` restores `providers.json` from its snapshot and keeps
+rejected and quietly falls back. Per-model image input is supported; pricing isn't shown
+for BYOK models. `off` restores `providers.json` from its snapshot and keeps
 anything you added yourself. The desktop app and the CLI share a folder but no settings —
 turn on either, both, or neither.
 
@@ -349,6 +392,28 @@ plus the `cordis.patch.yml` layers dsh composes over it, and saves your key as
 nexus deepseek
 nexus deepseek --model glm-latest
 nexus deepseek off
+```
+
+## Hermes Agent
+
+Sends [Hermes Agent](https://github.com/NousResearch/hermes-agent) through Fireworks: selects
+Hermes's built-in Fireworks provider in `~/.hermes/config.yaml` with **Nexus Auto** as the
+default model (unless you pass `--model`), and saves your key as `FIREWORKS_API_KEY` in
+`~/.hermes/.env` (owner-only). Hermes's `/model` picker lists it first under Fireworks AI as
+`nexus-auto`, and the status bar names it Nexus Auto. Nexus Auto's provider keys and request
+attribution ride the `providers.fireworks` entry's `extra_headers`.
+To list and route Nexus Auto, `on` also writes a small Hermes provider plugin to
+`plugins/model-providers/fireworks/` beside `config.yaml`. Hermes loads it in place of its bundled
+Fireworks provider; it reuses that provider unchanged apart from the Nexus Auto row and sends
+`nexus-auto` requests as `auto`.
+Honors `HERMES_HOME`; `--config-path <path>` for a `config.yaml` elsewhere (`.env` and the plugin
+stay next to that file). `off` restores both files and the plugin directory from the snapshot, or,
+if Hermes rewrote the config in the meantime, takes back only what Nexus set.
+
+```bash
+nexus hermes
+nexus hermes --model glm-latest
+nexus hermes off
 ```
 
 ## Claude Desktop
@@ -374,7 +439,7 @@ the same way.
 **How it works.** `on` writes a third-party inference provider profile (Desktop's own
 mechanism) pointing at a small loopback shim service (launchd on macOS, systemd user unit
 on Linux) that maps model names and mirrors the model catalog. The shim auto-starts at
-login; if it's ever down, `nexus claude-desktop status` says so and `on` brings it back. On
+login; if it's ever down, `nexus claude-desktop status` says so and `nexus claude-desktop restart` brings it back. On
 Linux, `on` needs a systemd user session (the normal case when logged in).
 
 **Connectors are managed through Nexus CLI** — Desktop's in-app connector browser is suppressed
@@ -486,16 +551,26 @@ versions — they follow new releases on their own. Results are cached for **1 h
 offline, the last cached list is shown instead of an error. Retired routers never appear
 (see [Nexus Auto](#firerouter-is-now-nexus-auto)).
 
+**Ultra-fast serving mode.** Ultra-fast routers, such as
+`deepseek-v4p1-flash-1017-ultrafast`, appear under **FAST ROUTERS** alongside the
+`-fast-latest` aliases. They remain separate from standard `-latest` aliases; there is
+no `-ultrafast-latest` alias. Claude Code's picker labels their rates **Ultra-fast tier**.
+Select one by its router ID to use that serving mode and its rates:
+
+```bash
+nexus claude --model deepseek-v4p1-flash-1017-ultrafast
+```
+
 **Short names everywhere.** `glm-latest` and full `accounts/fireworks/...` IDs both work;
 harnesses store the form they use themselves (Pi stores full IDs, most others short names).
 US-only routers take short names too, when a US router appears in your account's catalog (see [US-only Serverless](https://docs.fireworks.ai/serverless/us-only-serverless)). Check with `nexus model list`:
 
 ```bash
 nexus claude on --model kimi-k3-us
-nexus opencode on --model glm-5p3-flash-us
+nexus opencode on --model glm-5p3-us
 ```
 
-Which key is used, in order: `--api-key` → `FIREWORKS_API_KEY` → saved key. For rates,
+Which key is used, in order: `--api-key` → saved key. `FIREWORKS_API_KEY` in your environment is ignored. For rates,
 `nexus model list` and `nexus claude status` show Fireworks serverless pricing — not the
 Anthropic list prices Claude Code displays (see [Pricing estimates](#pricing-estimates)).
 
@@ -544,7 +619,7 @@ nexus opencode      # goes through your Foundry endpoint
 Harness-first: `nexus <harness> <command>`, plus a few global commands.
 `nexus <harness>` with no command runs `on`.
 
-**Per harness** (`claude`, `claude-desktop`, `opencode`, `codex` / `chatgpt`, `pi`, `cursor`, `vscode`, `copilot-app`, `copilot-cli`, `deepseek`)
+**Per harness** (`claude`, `claude-desktop`, `opencode`, `codex` / `chatgpt`, `pi`, `cursor`, `vscode`, `copilot-app`, `copilot-cli`, `deepseek`, `hermes`)
 
 ```text
 nexus <harness> on           Send the harness through Fireworks (the default when no command given).
@@ -561,8 +636,9 @@ Claude adds `nexus claude usage` and `nexus claude demo`. A few plumbing command
 **Global**
 
 ```text
-nexus login                  Sign in: browser (creates a key) or paste a key you have.
+nexus login                  Sign in through your browser (creates this machine's key).
 nexus logout                 Clear the stored key (keychain entry + config ref).
+nexus logout --revoke        Revoke this machine's key too; you approve it in the browser.
 nexus status                 Show sign-in state, environment, key storage, and each harness (on/off, installed).
 nexus status --json          Same as JSON. Each `perHarness` entry has `id`, `enabled`, `installed`, and `keyCurrent`.
 nexus model list             Browse the serverless catalog (`models` is an alias).
@@ -590,19 +666,93 @@ Your account's model restrictions always apply first.
 ## Keys and storage
 
 - **Your Fireworks key** is never stored literally in `~/.nexus/config.json`: that file holds a **reference** (`{keychain:fireworks-api-key}`). The key lives in the OS keychain, or an encrypted-file/plaintext fallback when no secret service exists (`nexus status` says which). Saved Anthropic/OpenAI Auto keys (and an Azure key you provide directly, rather than as an `$AZURE_API_KEY` reference) are the exception: they live literally in the same owner-only file (mode `0600`).
-- `login` creates a machine key in the browser or checks a pasted one live; `--paste` skips
-  the question, `--with-token` reads stdin (CI), `--account <id>` targets enterprise SSO.
+- `login` first asks which account you use: a Nexus account (Pro, Team, or Enterprise plan at
+  nexus.fireworks.ai) or a Fireworks Platform account (app.fireworks.ai). That picks the browser
+  sign-in and the API-keys page it points you to. A Nexus account signs in on the Nexus web app,
+  which hands the CLI a key and nothing else; a Platform account signs in on the Platform's hosted
+  sign-in, which creates a machine key. At a terminal, browser sign-in is the only way in: `--paste`
+  is refused, and so are `--with-token` and `--api-key`. Without a terminal (CI, scripts), where no
+  one can approve a browser sign-in, `nexus login --with-token < key.txt` (or `--api-key <key>`)
+  stores an API key you made on the keys page. Nexus never refreshes or deletes such a key: renew
+  or revoke it on the API keys page. Nexus ignores `FIREWORKS_API_KEY`. `--browser` goes straight to
+  the Nexus browser sign-in (keeping this machine's key if it still works; add `--force` to replace
+  it), and `--account <id>` signs in through your company's custom SSO.
+  After an SSO sign-in, the next `login` offers that account's SSO first, so you don't retype the ID.
+  The Nexus browser sign-in returns to a listener on this machine's port 18000, over SSH too.
+  When the browser is on this machine and 18000 is taken (another sign-in, or a port forward),
+  it uses a random free port instead and says so; over SSH it stays on 18000, since the forward
+  names that port.
+  The link it opens (or prints, or reports as `authorize_url`) is a one-time local page,
+  `http://localhost:18000/s/…`, that hands the browser on to the approval page. The first browser
+  to load it owns the sign-in: a second browser loading it stops the sign-in (`--json` error code
+  `contested`, exit 1) and undoes a key
+  being stored at that moment, putting the previous one back; the callback counts only from
+  the browser that loaded the page. That keeps another account on a shared machine from slipping
+  its own approval into yours.
+  Over SSH it prints the URL to open on your own computer: connect with the port forwarded
+  (`ssh -L 18000:localhost:18000 <host>`, or `LocalForward 18000 localhost:18000` for that host in
+  `~/.ssh/config`) and the browser comes back to this machine through it.
+  If you can't forward the port, `--paste-code` is an opt-in fallback: after you approve, the page
+  shows a one-time code (it expires in 2 minutes) to paste back into the terminal. Only paste a
+  code from a browser you are using right now, never one someone sent you: a code shown in a
+  browser can be phished. A pasted code is tied to the URL this terminal printed: if the web app
+  refuses it (approved from another terminal's URL, expired, or already used), login prints a
+  fresh URL and asks for the new code.
+  Every key the Nexus sign-in makes or deletes is approved in the browser: a sign-in that replaces
+  this machine's key (`--force`, "Sign in again and replace?", or a key in its last day) asks the
+  web app to make the new key and delete the old one in the same approval. The old key is deleted
+  only after this machine has stored the new one and confirmed it to the web app (within 5
+  minutes); if that confirmation fails, login puts the old key back (it still works), the web app
+  deletes the new one, and login says the replacement didn't finish (`--json` error code
+  `refresh_unconfirmed`). With an older web app that doesn't ask for that confirmation, the old
+  key is deleted during the approval itself, before the new key is stored. If the old key couldn't
+  be deleted, login says so and where to revoke it.
+  A Fireworks Platform or company-SSO sign-in that replaces this machine's key (`--force` or
+  "Sign in again and replace?") deletes the old key itself, with the token from that same
+  sign-in, once the new key is stored and the Fireworks API accepts it. It only deletes the key
+  this CLI made and still holds, never a pasted key or one the Nexus web app made. It keeps the
+  old key, and says where to delete it, when the new key can't be checked yet, a connected
+  harness still holds the old key (its update failed, or, like Cursor, it only takes a new key on
+  `nexus <harness> on`), or the delete is refused.
   On success it re-saves the key into every connected harness that keeps its own copy, so a
-  rotated key reaches all of them. `logout` can also revoke the machine key server-side.
+  rotated key reaches all of them.
+- For a recorded key minted by browser sign-in, `logout` can also revoke it server-side
+  (answer the prompt or use `--revoke`). You approve the revoke in the browser; no key ever
+  deletes a key, and no new key is made. A Nexus account's key is deleted by the web app (over
+  SSH through the forwarded port, or `--paste-code`, as for sign-in); a Platform or SSO account's key is deleted with a
+  sign-in token from a browser sign-in at a terminal.
+  If revocation cannot complete, a terminal asks `Log out anyway?` (default no);
+  non-TTY `--revoke` exits nonzero. Declining or failing without agreeing to log out
+  keeps the stored key and revoke record for a retry. `logout --json` (the desktop app) opens
+  the browser for the approval without needing a terminal (its URL also comes as an
+  `authorize_url` line, then `waiting` and `exchanging`, as for `login --browser --json`;
+  `--no-open` leaves opening it to the app), always logs out, and reports
+  `keyDeleted: false` with a warning when the key couldn't be deleted. When no browser can be
+  opened and there is no terminal (CI), it doesn't wait for an approval: it logs out at once and
+  warns until when the key stays active and where to revoke it. `login --browser` in the same
+  spot fails at once (`--json` error code `no_browser`).
+  A key stored with `--with-token` or `--api-key` (or by an older version) is only removed locally, even
+  with `--revoke`: logout says the key stays active on Fireworks and where to revoke it (a
+  `--json` warning), and non-TTY logout succeeds if local cleanup succeeds.
+- `login --browser --json` and `logout --json` print JSON lines on stdout ending in a `result`
+  line (never the key); `--version --json` lists them under `capabilities` (`key-actions-v1`:
+  browser-approved key actions, including `logout --revoke --json`; `paste-code`: `--paste-code`). Keys made by the
+  Nexus browser sign-in expire after 7 days: when the web app says when, the login result's
+  `key.expiresAt` holds it (ISO 8601; capability `login-json-key-expiry`), `nexus status` shows
+  it and warns in the last day, and a browser sign-in in that window replaces the key.
+  When the sign-in replaced this machine's previous key, the result's `previousKey` says what
+  happened to it: `deleted`, `kept` (still active; the output says where to delete it) or
+  `unknown` (capability `login-json-previous-key`).
+- If a browser sign-in is interrupted before it finishes, an unused key it made may be left on
+  your account: it is listed on the API keys page and expires within 7 days.
 - Some harness configs hold their own copy of the key (Claude's header, Codex, OpenCode, Pi,
   DeepSeek); Cursor and VS Code use IDE `safeStorage`. Files that hold keys are owner-only.
 - `nexus auto --unset <key>` clears a saved Anthropic/OpenAI key and removes it from every
   harness that stored a copy (Claude Code keeps an Anthropic key it signs in with).
 - `--home <path>` overrides HOME for config lookup. `--data-dir <path>` moves the backup/state folder, but only on harnesses that take it (Claude Code, OpenCode, Codex/`chatgpt`, Pi, Copilot CLI, and DeepSeek). Handy for sandboxes and tests.
 
-**`FIREWORKS_API_KEY` interaction.** When it's set, `login` uses it without copying it into
-secret storage, and combining `login` with a key-saving option fails before changing
-anything. Unset it first. `<harness> on` may still read, save, and bake it into a config.
+**`FIREWORKS_API_KEY` interaction.** Nexus ignores it. Run `nexus login` to sign in.
+`<harness> on` uses the stored key, not `FIREWORKS_API_KEY` from your shell.
 
 ## Troubleshooting
 
@@ -614,9 +764,10 @@ anything. Unset it first. `<harness> on` may still read, save, and bake it into 
 | `--model firerouter…` or `--model auto-instant` is rejected | Both routers are retired. Use `--model auto` (or a concrete model from `nexus model list`). |
 | A picker or config still shows `firerouter` | Re-run `nexus <harness>` (or `nexus update`): the selection moves to `auto` and retired rows are dropped. |
 | Claude Code shows a scary cost estimate | It uses [Anthropic list prices](#pricing-estimates). Check `nexus claude status` for Fireworks rates. |
+| Auto mode check requests add charges not shown in Nexus | [Safety checks](#auto-mode-safety-checks) bill to your Fireworks account at Fireworks rates, separately from the main model. `nexus claude usage` and the status line read local transcripts and may not include these checks. |
 | Claude session breaks after pasting an image | A [text-only](#text-only-models-and-images) model was active. `/rewind`, then pick a vision model. |
 | A harness gets 401s after you rotated your key | Run `nexus login` — it re-saves the new key everywhere. Quit VS Code first. |
-| `login` fails with a key-storage conflict | `FIREWORKS_API_KEY` is set. Unset it so Nexus CLI can store a key. |
+| No Fireworks API key found | Run `nexus login` to sign in. `FIREWORKS_API_KEY` in your environment is ignored. |
 | ChatGPT app thread ignores Fireworks models | Threads keep the provider they started on. Start a new thread (see [Codex](#codex)). |
 | Codex or the ChatGPT app says `duplicate key` in `config.toml` | Quit the app, then run `nexus update` (or `nexus codex on`): it keeps the newest Fireworks headers and removes the stale copy. |
 | Something else | `nexus status` shows sign-in, environment, storage, and whether each harness is on and installed. |
@@ -632,8 +783,17 @@ adding a text-only model with `--model` prints a one-line warning. Recover with 
 ```bash
 nexus update          # or re-run the installer
 nexus uninstall        # restores every harness, then removes ~/.nexus and the launcher
-nexus uninstall --force   # no questions (CI / scripts)
+nexus uninstall --force   # skip prompts (CI / scripts); safety checks still apply
 ```
+
+On Windows, uninstall refuses with exit code 1 if Nexus Desktop or another process
+is using `~/.nexus/cli` when uninstall starts. Nothing is restored or removed, even
+with `--force`. Quit Nexus Desktop
+and stop any other processes listed in the error, then rerun `nexus uninstall`.
+If Windows cannot safely inspect the processes, uninstall also refuses rather than
+risk removing files in use. It checks again before file cleanup, so a process
+started during restoration can also stop removal. This safety check does not apply
+on macOS or Linux.
 
 Upgrades leave your settings alone apart from re-saving keys and small forward migrations
 (VS Code's provider `apiType`, Claude's `ENABLE_TOOL_SEARCH`, removing the Claude telemetry

@@ -23,6 +23,7 @@ import {
 } from "../../../../lib/harnesses/claude/usage/format.mjs";
 import {
   COST_COL,
+  MODEL_COL,
   money,
 } from "../../../../lib/harnesses/claude/usage/meter-layout.mjs";
 
@@ -672,8 +673,8 @@ describe("alternate screen buffer", () => {
 });
 
 describe("model badge column", () => {
-  it("never exceeds its 8-column field, however many models a turn used", () => {
-    // turnRow pads with `8 - blen`, which floors at 0, so an over-wide badge
+  it("never exceeds its model column, however many models a turn used", () => {
+    // turnRow pads with `MODEL_COL - blen`, which floors at 0, so an over-wide badge
     // shifted every numeric column left of its heading. blen must also match
     // the real printable width or the padding is wrong by that difference.
     applyMeterStyle(false);
@@ -687,8 +688,17 @@ describe("model badge column", () => {
       const [badges, blen] = db.badges({ models });
       const plain = badges.replace(/\x1b\[[0-9;]*m/g, "");
       assert.equal(blen, plain.length, `${n} models: reported width must match rendered`);
-      assert.ok(blen <= 8, `${n} models: badge overflows the column (${blen}): ${plain}`);
+      assert.ok(blen <= MODEL_COL, `${n} models: badge overflows the column (${blen}): ${plain}`);
     }
+  });
+
+  it("fits Fireworks and OpenAI model names whole in the badge column", async () => {
+    const { badgeName } = await import("../../../../lib/harnesses/claude/usage/meter-model.mjs");
+    assert.deepEqual(
+      ["GLM 5.3 Fast (Latest)", "GPT-6.2 Sol", "nexus/auto", "Opus 4.6", "GLM 5.3 Flash (US)"].map(badgeName),
+      ["GLM5.3Fast", "GPT-6.2Sol", "nexus/auto", "Opus4.6", "GLM5.3Flash"],
+    );
+    for (const name of ["GLM5.3Fast", "GPT-6.2Sol", "nexus/auto"]) assert.ok(name.length <= MODEL_COL);
   });
 
   it("clears sibling spend on reset so it can't outlive its session", () => {

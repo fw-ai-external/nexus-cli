@@ -1,3 +1,4 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { isEnabledFireworksHarness, readGlobalConfig, setHarnessState } from "../../config/global-config.mjs";
 import {
   migrateLegacyClaudeModelMapping,
@@ -9,7 +10,6 @@ import { readJsonIfExists, writeJson } from "../../io/json.mjs";
 import { loadRegisterableModels } from "../../fireworks/models.mjs";
 import {
   AUTO_MODEL_ID,
-  isFirerouterModelPattern,
   isRetiredModelId,
   shortFireworksModelRef,
 } from "../../fireworks/model-id.mjs";
@@ -469,6 +469,7 @@ export async function migrateClaudeAttributionHeaderLeftoverOnUpgrade(home) {
     await readOrEmpty(backupPath),
   );
   if (backup) {
+    ensurePrivateParent(backupPath);
     await writeJson(backupPath, backup, { mode: 0o600 });
   }
   if (settings) {

@@ -40,6 +40,7 @@ describe("usage folder layout", () => {
       "display",
       "format",
       "live",
+      "meter-hooks",
       "meter-layout",
       "meter-model",
       "meter-render",
@@ -76,10 +77,11 @@ describe("cost meter module layering", () => {
     cost: [],
     pricing: [],
     "meter-style": [],
+    "meter-hooks": [],
     "meter-layout": ["cost", "format"],
     "meter-model": ["pricing"],
     "meter-render": ["cost", "meter-style", "meter-layout", "meter-model", "format"],
-    meter: ["meter-style", "meter-layout", "meter-model", "meter-render", "report"],
+    meter: ["meter-style", "meter-hooks", "meter-layout", "meter-model", "meter-render", "report"],
   };
 
   for (const [name, allowed] of Object.entries(ALLOWED)) {
@@ -157,11 +159,20 @@ describe("cost meter module layering", () => {
     }
   });
 
+  it("keeps the badge width and the model column the same", async () => {
+    // meter-model can't import meter-layout (layering), so the number is
+    // written twice; an over-wide badge would shift every numeric column.
+    const { BADGE_MAX } = await import(path.join(dir, "meter-model.mjs"));
+    const { MODEL_COL } = await import(path.join(dir, "meter-layout.mjs"));
+    assert.equal(BADGE_MAX, MODEL_COL);
+  });
+
   it("keeps every module small enough to read in one sitting", () => {
     // The whole point of the split. `meter` keeps the Dashboard and the tail loop;
     // `report` and `display` predate it and are budgeted where they stand.
     const limits = {
       "meter-style": 150,
+      "meter-hooks": 100,
       "meter-layout": 200,
       "meter-model": 300,
       "meter-render": 350,

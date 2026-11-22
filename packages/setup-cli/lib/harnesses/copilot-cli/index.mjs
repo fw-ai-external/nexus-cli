@@ -3,10 +3,10 @@ import {
   printNote,
   printRestartHint,
 } from "../../cli/messages.mjs";
-import { printStructuredHarnessStatus } from "../../harness/status-display.mjs";
+import { printModelAccessNote, printStructuredHarnessStatus } from "../../harness/status-display.mjs";
 import { planModelList } from "../../harness/catalog-refresh.mjs";
 import { isFireworksKey } from "../../keys/key-type.mjs";
-import { defineHarnessProfile } from "../../harness/engine.mjs";
+import { defineHarnessProfile, harnessModelAccess } from "../../harness/engine.mjs";
 import { ensureHomeForHarness, copilotCliPathsFor as copilotCliPathsForShared } from "../../harness/context.mjs";
 import { HARNESS } from "../../harness/id.mjs";
 import { isHarnessEnabled } from "../../config/global-config.mjs";
@@ -27,8 +27,6 @@ import {
 import {
   copilotCliModelIdFromSelection,
   copilotCliSelectionId,
-  copilotProvidersPath,
-  copilotSettingsPath,
   deselectCopilotCliModel,
   disableCopilotCli,
   enableCopilotCli,
@@ -37,6 +35,7 @@ import {
   selectCopilotCliModel,
 } from "./config.mjs";
 import { byokEnvFromHeaders } from "../../firerouter/core.mjs";
+import { fireworksInferenceUrl, recordedHarnessResidency } from "../../fireworks/residency.mjs";
 
 /**
  * GitHub Copilot **CLI** harness (`@github/copilot`, the `copilot` command).
@@ -55,9 +54,25 @@ async function copilotCliResolveKey(ctx) {
   return isFireworksKey(apiKey) ? apiKey.trim() : "";
 }
 
+/** The Fireworks models the Copilot CLI selects while routed (see HarnessAdapter.configuredModels). */
+async function copilotCliConfiguredModels(ctx) {
+  const paths = copilotCliPathsForShared(ctx);
+  const state = await readCopilotCliState(paths.providersPath, paths.settingsPath);
+  if (!state.configured) {
+    return [];
+  }
+  // Stored provider-qualified (`fireworks/<id>`), matched by its bare id in
+  // the shared catalog check.
+  return [
+    ...(state.selectedModel ? [{ slot: "main", model: state.selectedModel }] : []),
+    ...(state.models ?? []).map((model) => ({ slot: "picker", model })),
+  ];
+}
+
 export default defineHarnessProfile({
   id: HARNESS.COPILOT_CLI,
   label: "Copilot CLI",
+  configuredModels: copilotCliConfiguredModels,
   resolveKey: copilotCliResolveKey,
   keyEnvRef: "${FIREWORKS_API_KEY}",
   getExistingHarnessKey: copilotCliResolveKey,
@@ -162,13 +177,15 @@ export default defineHarnessProfile({
       harness: HARNESS.COPILOT_CLI,
       enabled,
       provider,
-      baseUrl: state.configured ? COPILOT_FIREWORKS_BASE_URL : null,
+      baseUrl: state.configured ? fireworksInferenceUrl(COPILOT_FIREWORKS_BASE_URL, recordedHarnessResidency("copilot-cli", ctx.home)) : null,
       providersPath: paths.providersPath,
       hasKey: Boolean(state.apiKey),
       keyType: provider === "none" ? "none" : "fireworks",
       selectedModel: state.selectedModel,
       registeredModels: state.models,
     };
+
+    payload.modelAccess = await harnessModelAccess(HARNESS.COPILOT_CLI, ctx);
 
     if (ctx.json) {
       console.log(JSON.stringify(payload, null, 2));
@@ -184,5 +201,6 @@ export default defineHarnessProfile({
       endpoint: payload.baseUrl,
       keySource: harnessStatusKeySource(HARNESS.COPILOT_CLI, payload.provider, { whenFireworks: false }),
     });
+    printModelAccessNote(HARNESS.COPILOT_CLI, payload.modelAccess);
   },
 });

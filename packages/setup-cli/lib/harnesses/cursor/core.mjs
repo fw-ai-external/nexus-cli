@@ -1,9 +1,11 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { chmod, mkdir, readdir, rename, unlink } from "node:fs/promises";
+import { mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import {
   AUTO_MODEL_ID,
+  NEXUS_AUTO_MODEL_ID,
   defaultMainModel,
   fullFireworksResourceId,
   isAutoModelId,
@@ -11,6 +13,7 @@ import {
   isRetiredModelId,
   normalizeModelId,
   shortFireworksModelRef,
+  FIREWORKS_OPENAI_BASE_URL,
 } from "../../fireworks/model-id.mjs";
 import { isCachedServerlessModelRef } from "../../fireworks/serverless-catalog-cache.mjs";
 import { planCatalogRefresh } from "../../harness/catalog-refresh.mjs";
@@ -31,10 +34,8 @@ import {
 } from "../../fireworks/azure-core.mjs";
 import {
   applyCursorWrites,
-  deleteCursorValue,
   ensureCursorTable,
   readCursorValue,
-  writeCursorValue,
 } from "./sqlite.mjs";
 import {
   decryptSecret,
@@ -44,6 +45,7 @@ import {
   plaintextMode,
   storedSecretHasCiphertext,
 } from "../vscode/safestorage.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 /**
  * Cursor stores AI settings in a SQLite DB (`state.vscdb`), not a JSON file.
@@ -65,7 +67,7 @@ import {
 
 export { ensureCursorStopped } from "./sqlite.mjs";
 
-export const CURSOR_FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+export const CURSOR_FIREWORKS_BASE_URL = FIREWORKS_OPENAI_BASE_URL;
 
 export const APPLICATION_USER_KEY =
   "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser";
@@ -89,25 +91,13 @@ export const CURSOR_AUTH_OPENAI_KEY_SECRET = "secret://cursorAuth/openAIKey";
  */
 const EMPTY_SAFE_STORAGE_CIPHERTEXT = JSON.stringify({ type: "Buffer", data: [] });
 
-/** Cursor "modes" that carry a selected model in aiSettings.modelConfig. */
-export const CURSOR_MODES = Object.freeze([
-  "composer",
-  "cmd-k",
-  "background-composer",
-  "composer-ensemble",
-  "plan-execution",
-  "spec",
-  "deep-search",
-  "quick-agent",
-]);
-
 export const CURSOR_DEFAULT_MODE = "composer";
 
 /**
  * Cursor's own Auto router reserves bare `auto` in the IDE, so Nexus
  * registers and selects Fireworks' `auto` router in Cursor as `nexus/auto`.
  */
-export const CURSOR_AUTO_MODEL_ID = `nexus/${AUTO_MODEL_ID}`;
+export const CURSOR_AUTO_MODEL_ID = NEXUS_AUTO_MODEL_ID;
 
 function cursorModelRef(model) {
   const short = shortFireworksModelRef(model);
@@ -221,7 +211,7 @@ export async function readCursorOpenAiKeyWithoutKeychain(dbPath, blob) {
   if (!storedSecretHasCiphertext(secretRaw ?? "")) {
     return { openAIKey: legacy, keyStored: Boolean(legacy) };
   }
-  const pointsAtFireworks = blob?.openAIBaseUrl === CURSOR_FIREWORKS_BASE_URL;
+  const pointsAtFireworks = isFireworksInferenceUrl(blob?.openAIBaseUrl, CURSOR_FIREWORKS_BASE_URL);
   const openAIKey = pointsAtFireworks && isFireworksShapedKey(legacy) ? legacy : "";
   return { openAIKey, keyStored: true };
 }
@@ -245,16 +235,6 @@ export async function readCursorOpenAiKey(dbPath) {
   }
   const legacy = await readCursorValue(dbPath, CURSOR_AUTH_OPENAI_KEY);
   return legacy ?? "";
-}
-
-/** @param {string} dbPath @param {string} key */
-export async function setCursorOpenAiKey(dbPath, key) {
-  await writeCursorValue(dbPath, CURSOR_AUTH_OPENAI_KEY, key);
-}
-
-/** @param {string} dbPath */
-export async function clearCursorOpenAiKey(dbPath) {
-  await deleteCursorValue(dbPath, CURSOR_AUTH_OPENAI_KEY);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -651,7 +631,7 @@ export function cursorProviderStatus(blob, openAIKey) {
     if (cursorHasFireconnectMarkers(blob)) {
       const managedBase = typeof blob?.openAIBaseUrl === "string" ? blob.openAIBaseUrl : "";
       if (managedBase) {
-        return managedBase === CURSOR_FIREWORKS_BASE_URL ? "fireworks" : "azure";
+        return isFireworksInferenceUrl(managedBase, CURSOR_FIREWORKS_BASE_URL) ? "fireworks" : "azure";
       }
     }
     return "none";
@@ -665,7 +645,7 @@ export function cursorProviderStatus(blob, openAIKey) {
   // OpenAI/Azure setup (which we didn't create) is never treated as managed.
   const managed = (blob?.aiSettings?.fireconnectAddedModels?.length ?? 0) > 0;
   const base = typeof blob?.openAIBaseUrl === "string" ? blob.openAIBaseUrl : "";
-  if (managed && base && base !== CURSOR_FIREWORKS_BASE_URL) {
+  if (managed && base && !isFireworksInferenceUrl(base, CURSOR_FIREWORKS_BASE_URL)) {
     return "azure";
   }
   return "none";
@@ -854,9 +834,8 @@ export async function writeCursorBackup(dataDir, dbPath, snapshot) {
   const backupPath = cursorBackupPath(dataDir, dbPath);
   // The backup can hold the user's prior API key — keep the dir + file
   // owner-only so a permissive umask can't leak it.
-  await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
-  await writeJson(backupPath, { dbPath: path.resolve(dbPath), snapshot });
-  await chmod(backupPath, 0o600);
+  ensurePrivateParent(backupPath);
+  await writeJson(backupPath, { dbPath: path.resolve(dbPath), snapshot }, { mode: 0o600 });
 }
 
 /** @param {string} dataDir @param {string} dbPath @returns {Promise<void>} */
@@ -969,7 +948,7 @@ export async function enableCursorFireworks({ dbPath, dataDir, apiKey, modelId, 
     ? currentModel
     : "";
 
-  let next = setOpenAiBaseUrl(blob, CURSOR_FIREWORKS_BASE_URL);
+  let next = setOpenAiBaseUrl(blob, fireworksInferenceUrl(CURSOR_FIREWORKS_BASE_URL, activeAccountResidency("cursor")));
   next = setUseOpenAiKey(next, true);
   const keepRegistered = (id) => (
     servable(id) || (requestedModel && !cursorBuiltinNames.has(id))

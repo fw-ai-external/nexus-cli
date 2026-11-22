@@ -109,6 +109,10 @@ export async function promptClaudeUsageAgent({
   trackingId = "",
   trackingLabel = "",
   listAgents = listSessionAgents,
+  // A harness whose log filename isn't the session id (Codex: `rollout-…`)
+  // passes the id to show.
+  sessionLabel = "",
+  harnessName = "Claude Code",
 } = {}) {
   if (!sessionPath) {
     throw new Error("sessionPath is required");
@@ -122,7 +126,7 @@ export async function promptClaudeUsageAgent({
     return agents[0];
   }
 
-  const sessionId = path.basename(sessionPath, ".jsonl").slice(0, 8);
+  const sessionId = sessionLabel || path.basename(sessionPath, ".jsonl").slice(0, 8);
   // Labels come from session logs, so sanitize before they reach the TTY (same
   // rule as the choice rows) and cap the length so the subhead can't wrap.
   const trackingText = (() => {
@@ -152,7 +156,7 @@ export async function promptClaudeUsageAgent({
       index = found >= 0 ? found : Math.min(index, agents.length - 1);
     },
     renderLines: () => [
-      `${accent("?", output)} ${bold(`Claude Code · Agents · session ${sessionId}…`)}`,
+      `${accent("?", output)} ${bold(`${harnessName} · Agents · session ${sessionId}…`)}`,
       // Say which agent the meter is on rather than asserting "Main is live":
       // that was still claimed while tracking a subagent, so the list gave no
       // hint that Main was the row to pick to get back.

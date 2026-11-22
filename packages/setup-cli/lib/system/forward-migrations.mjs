@@ -27,6 +27,7 @@ import { migrateCursorFirerouterOnUpgrade } from "../harnesses/cursor/upgrade-mi
 import { migrateDeepseekFirerouterOnUpgrade } from "../harnesses/deepseek/upgrade-migrations.mjs";
 import {
   migrateClaudeDesktopEgressOnUpgrade,
+  migrateClaudeDesktopCredentialOnUpgrade,
   migrateClaudeDesktopFirerouterOnUpgrade,
   restartClaudeDesktopShimOnUpgrade,
 } from "../harnesses/claude-desktop/upgrade-migrations.mjs";
@@ -248,6 +249,11 @@ const HARNESS_FORWARD_MIGRATIONS = [
     run: restartClaudeDesktopShimOnUpgrade,
     success: "Restarted the Claude Desktop shim so this update (including Nexus Auto scope and saved keys) takes effect.",
     failure: "Couldn't restart the Claude Desktop shim. Run `nexus claude-desktop` to apply this update.",
+  },
+  {
+    run: migrateClaudeDesktopCredentialOnUpgrade,
+    success: "Updated Claude Desktop's credential. Restart Claude Desktop to pick it up.",
+    failure: "Couldn't update Claude Desktop's credential. Re-run nexus claude-desktop on.",
   },
 ];
 

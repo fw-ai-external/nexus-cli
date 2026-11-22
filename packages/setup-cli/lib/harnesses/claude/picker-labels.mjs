@@ -1,4 +1,9 @@
-import { lookupModelSpec, resolveFireworksModelLabel, appendLatestRouterSuffix } from "../../fireworks/model-specs.mjs";
+import {
+  SERVING_TIER_LABELS,
+  appendLatestRouterSuffix,
+  lookupModelSpec,
+  resolveFireworksModelLabel,
+} from "../../fireworks/model-specs.mjs";
 import {
   formatAnthropicStylePerMtok,
   FIREWORKS_PRICING_DOCS_URL,
@@ -55,7 +60,8 @@ export function fireworksModelPickerDescription(modelId) {
   if (!perMtok) {
     return `Fireworks serverless. Rates: ${FIREWORKS_PRICING_DOCS_URL}`;
   }
-  const tierNote = pricing.tier === "fast" ? " · Fast tier" : "";
+  const tierLabel = SERVING_TIER_LABELS[pricing.tier];
+  const tierNote = tierLabel ? ` · ${tierLabel} tier` : "";
   return `Fireworks serverless${tierNote} · ${perMtok}`;
 }
 

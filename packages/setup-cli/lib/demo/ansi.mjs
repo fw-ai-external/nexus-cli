@@ -28,8 +28,6 @@ export const DIM = detectDarkBg() ? ANSI.dimFaint : ANSI.muted;
 
 export const HIDE_CURSOR = ANSI.hideCursor;
 export const SHOW_CURSOR = ANSI.showCursor;
-export const SAVE_CURSOR = `${ESC}s`;
-export const RESTORE_CURSOR = `${ESC}u`;
 export const CLEAR_SCREEN = ANSI.clearScreen;
 export const HOME_CURSOR = ANSI.homeCursor;
 
@@ -39,7 +37,6 @@ export function moveTo(row, col) {
 }
 
 export const CLEAR_LINE = ANSI.clearLine;
-export const CLEAR_FULL_LINE = `\r${CLEAR_LINE}`;
 
 /**
  * @param {string} s

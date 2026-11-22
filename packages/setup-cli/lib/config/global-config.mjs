@@ -8,9 +8,11 @@ import {
   normalizeAzureBaseUrl,
 } from "../fireworks/azure-core.mjs";
 import { readJsonIfExists, writeJson } from "../io/json.mjs";
+import { ensurePrivateParent } from "../io/private-files.mjs";
 import { isFireworksShapedKey } from "../keys/key-type.mjs";
 import { HARNESS, HARNESSES } from "../harness/id.mjs";
 import { normalizeAutoSettings } from "./auto-providers.mjs";
+import { supportedResidency } from "../fireworks/residency-regions.mjs";
 
 export const GLOBAL_CONFIG_RELATIVE_PATH = ".nexus/config.json";
 export const FIREWORKS_API_KEY_ENV_REF = "{env:FIREWORKS_API_KEY}";
@@ -36,18 +38,12 @@ export function isEnabledFireworksHarness(harnesses, harnessId) {
  *   enabled: boolean,
  *   provider?: "fireworks"|"azure",
  *   profiles?: Record<string, unknown>,
+ *   residency?: "US",
  * }} HarnessConfigEntry */
 /** @typedef {Record<string, HarnessConfigEntry>} HarnessConfigMap */
 
 export function globalConfigPath(home) {
   return path.join(home, GLOBAL_CONFIG_RELATIVE_PATH);
-}
-
-/**
- * @param {string} stored
- */
-export function isKnownApiKeyRef(stored) {
-  return stored === FIREWORKS_API_KEY_ENV_REF || stored === FIREWORKS_API_KEY_KEYCHAIN_REF;
 }
 
 /**
@@ -129,10 +125,14 @@ function normalizeHarnessEntry(entry) {
       && !Array.isArray(entry.profiles)
       ? entry.profiles
       : undefined;
+    // The account residency the harness's endpoint was last written for;
+    // absent means the global endpoint.
+    const residency = supportedResidency(entry.residency) || undefined;
     return {
       enabled: entry.enabled === true,
       ...(provider ? { provider } : {}),
       ...(profiles ? { profiles } : {}),
+      ...(residency ? { residency } : {}),
     };
   }
   return { enabled: false };
@@ -186,18 +186,21 @@ function normalizeProvider(raw) {
   return raw === "azure" ? "azure" : "fireworks";
 }
 
+/** @typedef {"nexus" | "platform" | "unknown"} AccountType */
+
+/** @returns {AccountType} */
+function normalizeAccountType(value) {
+  return value === "nexus" || value === "platform" ? value : "unknown";
+}
+
 /**
- * @param {string[]} harnessIds
- * @param {HarnessConfigMap} [existingMap]
- * @returns {HarnessConfigMap}
+ * Configs written before `accountType` existed only mark Nexus accounts.
+ * @returns {AccountType}
  */
-export function buildHarnessMapForConfigure(harnessIds, existingMap = {}) {
-  /** @type {HarnessConfigMap} */
-  const map = {};
-  for (const harnessId of harnessIds) {
-    map[harnessId] = existingMap[harnessId] ?? { enabled: false };
-  }
-  return map;
+function readAccountType(existing) {
+  const explicit = normalizeAccountType(existing.accountType);
+  if (explicit !== "unknown") return explicit;
+  return existing.nexusAccount === true ? "nexus" : "unknown";
 }
 
 /**
@@ -205,6 +208,7 @@ export function buildHarnessMapForConfigure(harnessIds, existingMap = {}) {
  */
 export async function readGlobalConfig(home) {
   const existing = await readJsonIfExists(globalConfigPath(home));
+  const accountType = readAccountType(existing);
   return {
     apiKey: typeof existing.apiKey === "string" ? existing.apiKey : "",
     anthropicApiKey: typeof existing.anthropicApiKey === "string" ? existing.anthropicApiKey : "",
@@ -212,9 +216,11 @@ export async function readGlobalConfig(home) {
     // Remembered enterprise SSO account (not a secret — just the org slug),
     // so `login` can reuse it instead of re-asking every time.
     ssoAccountId: typeof existing.ssoAccountId === "string" ? existing.ssoAccountId : "",
-    // Whether the account browser sign-in created the key in is a Nexus
-    // account (not a secret). Picks which site the CLI's key links open.
-    nexusAccount: existing.nexusAccount === true,
+    // Which kind of account the stored key belongs to (not a secret):
+    // "nexus", "platform", or "unknown". Picks which site the CLI's key
+    // links open. `nexusAccount` is the older boolean form, still written.
+    accountType,
+    nexusAccount: accountType === "nexus",
     provider: normalizeProvider(existing.provider),
     azure: normalizeAzureSettings(existing.azure),
     auto: normalizeAutoSettings(existing.auto),
@@ -255,40 +261,13 @@ export function readConfiguredProviderSync(home) {
 }
 
 /**
- * Store an Anthropic API key in global config (e.g. from on --anthropic-api-key).
- * @param {string} home
- * @param {string} anthropicApiKey
- */
-export async function persistGlobalAnthropicApiKey(home, anthropicApiKey) {
-  const trimmed = anthropicApiKey?.trim() ?? "";
-  if (!home || !trimmed) {
-    return false;
-  }
-  await writeGlobalConfig(home, { anthropicApiKey: trimmed });
-  return true;
-}
-
-/**
- * Store an OpenAI API key in global config (e.g. from on --openai-api-key).
- * @param {string} home
- * @param {string} openaiApiKey
- */
-export async function persistGlobalOpenaiApiKey(home, openaiApiKey) {
-  const trimmed = openaiApiKey?.trim() ?? "";
-  if (!home || !trimmed) {
-    return false;
-  }
-  await writeGlobalConfig(home, { openaiApiKey: trimmed });
-  return true;
-}
-
-/**
  * @param {string} home
  * @param {{
  *   apiKey?: string,
  *   anthropicApiKey?: string,
  *   openaiApiKey?: string,
  *   ssoAccountId?: string,
+ *   accountType?: AccountType,
  *   nexusAccount?: boolean,
  *   provider?: "azure" | "fireworks",
  *   azure?: { baseUrl?: string, apiKey?: string },
@@ -310,9 +289,11 @@ export async function writeGlobalConfig(home, config) {
   const ssoAccountId = config.ssoAccountId !== undefined
     ? config.ssoAccountId
     : (typeof existing.ssoAccountId === "string" ? existing.ssoAccountId : "");
-  const nexusAccount = config.nexusAccount !== undefined
-    ? config.nexusAccount === true
-    : existing.nexusAccount === true;
+  const accountType = config.accountType !== undefined
+    ? normalizeAccountType(config.accountType)
+    : config.nexusAccount !== undefined
+      ? (config.nexusAccount === true ? "nexus" : "unknown")
+      : readAccountType(existing);
   const provider = config.provider !== undefined
     ? normalizeProvider(config.provider)
     : normalizeProvider(existing.provider);
@@ -335,7 +316,8 @@ export async function writeGlobalConfig(home, config) {
     anthropicApiKey,
     openaiApiKey,
     ssoAccountId,
-    nexusAccount,
+    nexusAccount: accountType === "nexus",
+    ...(accountType === "unknown" ? {} : { accountType }),
     provider,
     azure,
     auto,
@@ -345,6 +327,7 @@ export async function writeGlobalConfig(home, config) {
     || (payload.anthropicApiKey && payload.anthropicApiKey !== ANTHROPIC_API_KEY_ENV_REF)
     || (payload.openaiApiKey && payload.openaiApiKey !== OPENAI_API_KEY_ENV_REF)
     || (payload.azure.apiKey && !isAzureApiKeyEnvRef(payload.azure.apiKey));
+  ensurePrivateParent(filePath);
   await writeJson(filePath, payload, { mode: hasLiteralKey ? 0o600 : undefined });
   return payload;
 }
@@ -355,10 +338,12 @@ export async function writeGlobalConfig(home, config) {
  * @param {boolean} enabled
  * @param {"fireworks"|"azure"|""} [provider]
  */
-export async function setHarnessEnabled(home, harnessId, enabled, provider = "") {
+export async function setHarnessEnabled(home, harnessId, enabled, provider = "", { residency } = {}) {
   const patch = {
     enabled,
     ...(provider === "fireworks" || provider === "azure" ? { provider } : {}),
+    // Only `on` passes it; "" clears a residency the harness was written for.
+    ...(residency !== undefined ? { residency } : {}),
   };
   await setHarnessState(home, harnessId, patch);
 }

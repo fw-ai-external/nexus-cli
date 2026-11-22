@@ -6,6 +6,9 @@ import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
 
 import { desktopDataDir } from "./lineup.mjs";
+import { stableNodeExec } from "../../system/node-exec.mjs";
+
+export { stableNodeExec } from "../../system/node-exec.mjs";
 
 const runExec = promisify(execFile);
 
@@ -68,14 +71,14 @@ export function shimServiceFilePath(home, {
 }
 
 /**
- * Pure launchd plist builder (no side effects; heavily unit-tested).
+ * Launchd plist builder, preferring an upgrade-stable Homebrew Node path.
  * @param {{ nodeExec: string, nodeArgs?: string[], entry: string, home: string, env?: Record<string, string>, logPath: string, errorPath: string, label?: string }} args
  */
 export function buildLaunchAgentPlist({ nodeExec, nodeArgs = [], entry, home, env = {}, logPath, errorPath, label = SHIM_AGENT_LABEL }) {
   const escape = (value) => String(value)
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;").replaceAll("'", "&apos;");
-  const args = [nodeExec, ...nodeArgs, entry, "--home", home]
+  const args = [stableNodeExec(nodeExec), ...nodeArgs, entry, "--home", home]
     .map((arg) => `    <string>${escape(arg)}</string>`).join("\n");
   const vars = Object.entries({ ...env, HOME: home })
     .map(([name, value]) => `    <key>${escape(name)}</key><string>${escape(value)}</string>`).join("\n");

@@ -22,6 +22,8 @@ function startMockGateway() {
   const state = {
     /** @type {boolean|undefined} */
     shareNexusAnalytics: undefined,
+    nexusAnalyticsId: undefined,
+    nexusAccountAnalyticsId: undefined,
     mode: "supported",
     /** @type {{ method: string, url: string, body: string }[]} */
     requests: [],
@@ -65,6 +67,10 @@ function startMockGateway() {
         json(200, {
           name: `${USER_NAME}/settings`,
           disableTraceContentCollection: false,
+          ...(state.mode === "supported" ? {
+            nexusAnalyticsId: state.nexusAnalyticsId,
+            nexusAccountAnalyticsId: state.nexusAccountAnalyticsId,
+          } : {}),
           ...(state.mode === "supported" && state.shareNexusAnalytics !== undefined
             ? { shareNexusAnalytics: state.shareNexusAnalytics }
             : {}),
@@ -100,6 +106,8 @@ describe("nexus usage-data", () => {
 
   beforeEach(() => {
     gateway.state.shareNexusAnalytics = undefined;
+    gateway.state.nexusAnalyticsId = undefined;
+    gateway.state.nexusAccountAnalyticsId = undefined;
     gateway.state.mode = "supported";
     gateway.state.requests = [];
   });
@@ -113,7 +121,7 @@ describe("nexus usage-data", () => {
       await seedKeychainConfig(home, VALID_KEY);
       const result = await runCliJson(["usage-data", "--json"], { home, env });
       assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null });
+      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
       assertNoIdentityLeak(result);
     });
   });
@@ -124,7 +132,7 @@ describe("nexus usage-data", () => {
       gateway.state.shareNexusAnalytics = true;
       const on = await runCliJson(["usage-data", "--json"], { home, env });
       assert.equal(on.code, 0, `stderr: ${on.stderr}`);
-      assert.deepEqual(on.json, { ok: true, shareNexusAnalytics: true });
+      assert.deepEqual(on.json, { ok: true, shareNexusAnalytics: true, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
       const lookups = gateway.state.requests.map((r) => new URL(r.url, "http://localhost"));
       assert.deepEqual(lookups.map((u) => u.pathname), ["/verifyApiKey", `/v1/accounts/${ACCOUNT}/users`, SETTINGS_PATH]);
       assert.equal(lookups[1].searchParams.get("filter"), `email="${EMAIL}"`);
@@ -132,11 +140,13 @@ describe("nexus usage-data", () => {
 
       gateway.state.shareNexusAnalytics = false;
       const off = await runCliJson(["usage-data", "--json"], { home, env });
-      assert.deepEqual(off.json, { ok: true, shareNexusAnalytics: false });
+      assert.deepEqual(off.json, { ok: true, shareNexusAnalytics: false, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
 
+      gateway.state.nexusAccountAnalyticsId = "example-account-id";
       const human = await runCli(["usage-data"], { home, env });
       assert.equal(human.code, 0);
-      assert.equal(human.stdout.trim(), "Sharing anonymous usage data: off");
+      assert.equal(human.stdout.trim(), "Analytics ID: not available yet");
+      assert.ok(!human.stdout.includes(gateway.state.nexusAccountAnalyticsId));
       for (const result of [on, off, human]) {
         assertNoIdentityLeak(result);
       }
@@ -150,7 +160,7 @@ describe("nexus usage-data", () => {
       gateway.state.mode = "predates-field";
       const result = await runCliJson(["usage-data", "--json"], { home, env });
       assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null });
+      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
     });
   });
 
@@ -163,8 +173,44 @@ describe("nexus usage-data", () => {
         env: { NEXUS_GATEWAY_URL: gateway.url },
       });
       assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null });
+      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
       assert.deepEqual(gateway.state.requests.map((r) => new URL(r.url, "http://localhost").pathname), [SETTINGS_PATH]);
+    });
+  });
+
+  it("returns pseudonymous IDs independently of the legacy preference", async () => {
+    await withTempHome("usage-data-ids-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      gateway.state.shareNexusAnalytics = false;
+      gateway.state.nexusAnalyticsId = "example-user-id-A1";
+      gateway.state.nexusAccountAnalyticsId = "example-account-id-Z9";
+      const result = await runCliJson(["usage-data", "--json"], { home, env });
+      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: false, nexusAnalyticsId: "example-user-id-A1", nexusAccountAnalyticsId: "example-account-id-Z9" });
+      assertNoIdentityLeak(result);
+      const human = await runCli(["usage-data"], { home, env });
+      assert.equal(human.code, 0);
+      assert.equal(human.stdout.trim(), "Analytics ID: available");
+      assert.ok(!human.stdout.includes(gateway.state.nexusAnalyticsId));
+      assert.ok(!human.stdout.includes(gateway.state.nexusAccountAnalyticsId));
+      assertNoIdentityLeak(human);
+    });
+  });
+
+  it("drops malformed IDs", async () => {
+    await withTempHome("usage-data-malformed-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      gateway.state.nexusAnalyticsId = EMAIL;
+      gateway.state.nexusAccountAnalyticsId = 123;
+      const result = await runCliJson(["usage-data", "--json"], { home, env });
+      assert.deepEqual(result.json, { ok: true, shareNexusAnalytics: null, nexusAnalyticsId: null, nexusAccountAnalyticsId: null });
+      assertNoIdentityLeak(result);
+
+      // At most 128 characters.
+      gateway.state.nexusAnalyticsId = "a".repeat(128);
+      gateway.state.nexusAccountAnalyticsId = "b".repeat(129);
+      const capped = await runCliJson(["usage-data", "--json"], { home, env });
+      assert.equal(capped.json.nexusAnalyticsId, "a".repeat(128));
+      assert.equal(capped.json.nexusAccountAnalyticsId, null);
     });
   });
 

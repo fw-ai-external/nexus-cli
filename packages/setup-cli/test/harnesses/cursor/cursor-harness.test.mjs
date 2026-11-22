@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { chmodSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
@@ -29,7 +29,7 @@ import {
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import { isCachedServerlessModelRef, setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
 import {
-  mockServerlessModel,
+  mockServerlessModel, mockServerlessModelRows,
   runCli,
   runCliJson,
   runFireconnect,
@@ -41,6 +41,8 @@ import { writeGlobalConfig } from "../../../lib/config/global-config.mjs";
 import { cursorPathsFor } from "../../../lib/harness/context.mjs";
 import { migrateCursorFirerouterOnUpgrade } from "../../../lib/harnesses/cursor/upgrade-migrations.mjs";
 import { ensureItemTable } from "../../../lib/harnesses/vscode/vscdb-sqlite.mjs";
+import { loadNodeSqlite } from "../../../lib/io/sqlite.mjs";
+import { appUserDataDir } from "../../../lib/io/user-data-dir.mjs";
 
 // Cursor's key cell is an Electron safeStorage-encrypted `secret://` row. Set
 // the plaintext seam process-wide so `encryptSecret`/`decryptSecret` are the
@@ -66,7 +68,7 @@ describe("state.vscdb file modes", () => {
     }
   });
 
-  it("preserves the mode of a pre-existing database", { skip: process.platform === "win32" }, async () => {
+  it("makes a pre-existing database private", { skip: process.platform === "win32" }, async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "fc-vscdb-existing-mode-"));
     const dbPath = path.join(dir, "state.vscdb");
     const previousUmask = process.umask(0o022);
@@ -74,7 +76,7 @@ describe("state.vscdb file modes", () => {
       await writeFile(dbPath, "");
       chmodSync(dbPath, 0o644);
       await ensureItemTable(dbPath);
-      assert.equal(statSync(dbPath).mode & 0o777, 0o644);
+      assert.equal(statSync(dbPath).mode & 0o777, 0o600);
     } finally {
       process.umask(previousUmask);
       await rm(dir, { recursive: true, force: true });
@@ -180,7 +182,7 @@ const SERVABLE_CATALOG_ROWS = [
     context_length: 1_048_576,
     aliases: ["accounts/fireworks/routers/glm-latest"],
   }),
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/kimi-k3",
     context_length: 1_048_576,
     aliases: ["accounts/fireworks/routers/kimi-fast-latest"],
@@ -422,6 +424,63 @@ describe("cursor-core pure transforms", () => {
 /* -------------------------------------------------------------------------- */
 
 describe("cursor harness integration", () => {
+  it("status reads a symlinked database without tightening its permissions", { skip: process.platform === "win32" }, async () => {
+    await withTempHome("cursor-status-link-", async (home) => {
+      const env = { XDG_CONFIG_HOME: path.join(home, ".config") };
+      const dbPath = path.join(appUserDataDir(home, "Cursor", { env }), "User", "globalStorage", "state.vscdb");
+      await mkdir(path.dirname(dbPath), { recursive: true });
+      writeCursorDb(dbPath, baseBlob());
+      const login = await runCli(["login", "--api-key", "fw_test_status_link_key_12345"], { home, env });
+      assert.equal(login.code, 0, login.stderr);
+      const on = await runCli(["cursor", "on", "--db-path", dbPath, "--force"], { home, env });
+      assert.equal(on.code, 0, on.stderr);
+      const target = path.join(home, "editor-state.vscdb");
+      await rename(dbPath, target);
+      chmodSync(target, 0o644);
+      await symlink(target, dbPath);
+      const status = await runCli(["cursor", "status", "--db-path", dbPath, "--json"], { home, env });
+      assert.equal(status.code, 0, status.stderr);
+      assert.equal(JSON.parse(status.stdout).provider, "fireworks");
+      const globalStatus = await runCli(["status", "--json"], { home, env });
+      assert.equal(globalStatus.code, 0, globalStatus.stderr);
+      assert.equal(statSync(target).mode & 0o777, 0o644);
+    });
+  });
+
+  it("on and off keep an existing database and live sidecars private", { skip: process.platform === "win32" }, async (t) => {
+    const DatabaseSync = await loadNodeSqlite();
+    if (!DatabaseSync) {
+      t.skip("requires node:sqlite to hold the WAL open");
+      return;
+    }
+    await withTempHome("cursor-private-", async (home) => {
+      const dbPath = path.join(home, "state.vscdb");
+      const original = baseBlob();
+      const priorKey = "example-original-key";
+      writeCursorDb(dbPath, original, { openAIKey: priorKey });
+      const held = new DatabaseSync(dbPath);
+      try {
+        held.exec("PRAGMA journal_mode=WAL; INSERT INTO ItemTable (key, value) VALUES ('example', 'keep me');");
+        const files = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
+        for (const file of files) chmodSync(file, 0o644);
+        const login = await runCli(["login", "--api-key", "fw_test_private_mode_key_12345"], { home });
+        assert.equal(login.code, 0, login.stderr);
+        const on = await runCli(["cursor", "on", "--db-path", dbPath, "--force"], { home });
+        assert.equal(on.code, 0, on.stderr);
+        for (const file of files) assert.equal(statSync(file).mode & 0o777, 0o600);
+        assert.equal(readKey(dbPath), "fw_test_private_mode_key_12345");
+        for (const file of files) chmodSync(file, 0o644);
+        const off = await runCli(["cursor", "off", "--db-path", dbPath, "--force"], { home });
+        assert.equal(off.code, 0, off.stderr);
+        assert.deepEqual(readBlob(dbPath), original);
+        assert.equal(readKey(dbPath), priorKey);
+        for (const file of files) assert.equal(statSync(file).mode & 0o777, 0o600);
+      } finally {
+        held.close();
+      }
+    });
+  });
+
   itIfSqlite("on persists --api-key flag to keychain", async () => {
     await withTempHome("cursor-keychain-flag-", async (home) => {
       const dbPath = path.join(home, "state.vscdb");

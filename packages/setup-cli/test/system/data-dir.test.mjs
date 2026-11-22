@@ -13,6 +13,7 @@ import {
   hasForeignDataDir,
   isNexusDataDir,
   migrateLegacyDataDir,
+  setAsideDirs,
 } from "../../lib/system/data-dir.mjs";
 import { runFireconnect, withTempHome } from "../helpers.mjs";
 
@@ -98,6 +99,20 @@ describe("migrateLegacyDataDir", () => {
     });
   });
 
+  it("leaves an existing rename-merging entry's contents alone when it claims ~/.nexus", async () => {
+    await withTempHome("data-dir-claim-existing-", async (home) => {
+      await mkdir(path.join(home, ".fireconnect"));
+      await writeFile(path.join(home, ".fireconnect/config.json"), "{\"harnesses\":{}}\n");
+      await mkdir(path.join(home, ".nexus"));
+      await writeFile(path.join(home, "elsewhere.txt"), "keep me\n");
+      await symlink(path.join(home, "elsewhere.txt"), path.join(home, ".nexus/rename-merging"));
+
+      assert.equal(migrateLegacyDataDir(home), "moved");
+      assert.equal(await readFile(path.join(home, "elsewhere.txt"), "utf8"), "keep me\n");
+      assert.deepEqual((await readdir(path.join(home, ".nexus"))).sort(), ["config.json"]);
+    });
+  });
+
   it("moves a symlinked ~/.fireconnect (dotfile manager) as a link", async () => {
     await withTempHome("data-dir-stow-", async (home) => {
       await mkdir(path.join(home, "dotfiles/fireconnect"), { recursive: true });
@@ -130,6 +145,24 @@ describe("migrateLegacyDataDir", () => {
       assert.equal(await readlink(path.join(home, ".fireconnect")), ".nexus");
       assert.match(dataDirMigrationNote("set-aside"), /the old copies are in ~\/\.nexus-pre\./);
       assert.equal(migrateLegacyDataDir(home), "none");
+    });
+  });
+
+  it("drops the set-aside record entry when the set-aside rename fails", async () => {
+    await withTempHome("data-dir-set-aside-fails-", async (home) => {
+      await mkdir(path.join(home, ".fireconnect"));
+      await writeFile(path.join(home, ".fireconnect/config.json"), "{\"old\":true}\n");
+      await mkdir(path.join(home, ".nexus"));
+      await writeFile(path.join(home, ".nexus/config.json"), NEXUS_CONFIG);
+      const rename = () => {
+        throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      };
+
+      assert.equal(migrateLegacyDataDir(home, { rename }), "failed");
+      assert.deepEqual(setAsideDirs(home), []);
+      assert.equal(existsSync(path.join(home, ".nexus-pre")), false);
+      assert.equal(migrateLegacyDataDir(home), "set-aside");
+      assert.deepEqual(setAsideDirs(home), [path.join(home, ".nexus-pre")]);
     });
   });
 
@@ -237,6 +270,7 @@ describe("migrateLegacyDataDir", () => {
         ".api-key",
         ".secret-memory",
         "set-aside.json",
+        "rename-merging",
       ];
       assert.deepEqual(
         [...(dataDirModule.NEXUS_OWNED_FILENAMES ?? ownedFilenames)].filter((name) => !["cli", "claude-desktop", "statusline-refresh"].includes(name)),
@@ -410,5 +444,161 @@ describe("migrateLegacyDataDir under concurrency", () => {
         assert.deepEqual((await readdir(home)).filter((e) => /^\.nexus-pre-/.test(e)), []);
       });
     }
+  });
+});
+
+describe("migrateLegacyDataDir when rmdir misreports", () => {
+  // Preloaded into a child: rmdirSync on ~/.fireconnect behaves as macOS did
+  // when another run set the directory aside at the same moment. That run
+  // records and renames the directory, and rmdir reports success although
+  // nothing was removed.
+  const RMDIR_RACE_PRELOAD = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import { syncBuiltinESMExports } from "node:module";
+    const realRename = fs.renameSync;
+    fs.rmdirSync = (dir) => {
+      if (path.basename(String(dir)) !== ".fireconnect") throw new Error("unexpected rmdir " + dir);
+      const home = path.dirname(String(dir));
+      fs.writeFileSync(path.join(home, ".nexus", "set-aside.json"), JSON.stringify([".nexus-pre"]) + "\\n");
+      realRename(dir, path.join(home, ".nexus-pre"));
+    };
+    syncBuiltinESMExports();
+  `;
+
+  it("does not claim a move another run's set-aside did", async () => {
+    await withTempHome("data-dir-rmdir-race-", async (home) => {
+      await mkdir(path.join(home, ".nexus"));
+      await writeFile(path.join(home, ".nexus/config.json"), NEXUS_CONFIG);
+      await mkdir(path.join(home, ".fireconnect"));
+      await writeFile(path.join(home, ".fireconnect/config.json"), "{\"old\":true}\n");
+      const preload = `data:text/javascript,${encodeURIComponent(RMDIR_RACE_PRELOAD)}`;
+      const module = new URL("../../lib/system/data-dir.mjs", import.meta.url).href;
+      const result = spawnSync(process.execPath, [
+        "--import", preload, "--input-type=module",
+        "--eval", `process.stdout.write((await import(${JSON.stringify(module)})).migrateLegacyDataDir(process.env.HOME));`,
+      ], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, "none");
+      // The old data is safe in the set-aside copy, and ~/.fireconnect links to ~/.nexus.
+      assert.equal(await readFile(path.join(home, ".nexus-pre/config.json"), "utf8"), "{\"old\":true}\n");
+      assert.equal(await readFile(path.join(home, ".nexus/config.json"), "utf8"), NEXUS_CONFIG);
+      assert.equal(await readlink(path.join(home, ".fireconnect")), ".nexus");
+    });
+  });
+});
+
+describe("migrateLegacyDataDir after a crash", () => {
+  // Preloaded into a child process: lists directories in sorted order (one
+  // order readdir may return) and kills the process right after it renames the
+  // named entry (CRASH_AFTER_RENAME) or onto the named file (CRASH_AFTER_RENAME_TO).
+  const CRASH_PRELOAD = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import { syncBuiltinESMExports } from "node:module";
+    const realReaddir = fs.readdirSync;
+    const realRename = fs.renameSync;
+    fs.readdirSync = (...args) => {
+      const entries = realReaddir(...args);
+      return entries.every((entry) => typeof entry === "string") ? [...entries].sort() : entries;
+    };
+    fs.renameSync = (from, to) => {
+      realRename(from, to);
+      if (path.basename(String(from)) === process.env.CRASH_AFTER_RENAME
+        || path.basename(String(to)) === process.env.CRASH_AFTER_RENAME_TO) {
+        process.exit(137);
+      }
+    };
+    syncBuiltinESMExports();
+  `;
+
+  function migrateThenCrash(home, entry, env = {}) {
+    const preload = `data:text/javascript,${encodeURIComponent(CRASH_PRELOAD)}`;
+    const module = new URL("../../lib/system/data-dir.mjs", import.meta.url).href;
+    return spawnSync(process.execPath, [
+      "--import", preload, "--input-type=module",
+      "--eval", `(await import(${JSON.stringify(module)})).migrateLegacyDataDir(process.env.HOME);`,
+    ], { env: { ...process.env, HOME: home, CRASH_AFTER_RENAME: entry, ...env }, encoding: "utf8" });
+  }
+
+  it("finishes a merge the process died in instead of judging ~/.nexus foreign", async () => {
+    await withTempHome("data-dir-crash-merge-", async (home) => {
+      await mkdir(path.join(home, ".fireconnect/claude"), { recursive: true });
+      await writeFile(path.join(home, ".fireconnect/claude/backup.json"), "{\"backup\":true}\n");
+      await writeFile(path.join(home, ".fireconnect/config.json"), NEXUS_CONFIG);
+      await mkdir(path.join(home, ".nexus"));
+      await writeFile(path.join(home, ".nexus/catalog-cache.json"), "{}\n");
+
+      const crashed = migrateThenCrash(home, "claude");
+      assert.equal(crashed.status, 137, crashed.stderr);
+      assert.equal(await readFile(path.join(home, ".nexus/claude/backup.json"), "utf8"), "{\"backup\":true}\n");
+
+      assert.equal(hasForeignDataDir(home), false);
+      assert.equal(migrateLegacyDataDir(home), "moved");
+      assert.equal(await readFile(path.join(home, ".nexus/config.json"), "utf8"), NEXUS_CONFIG);
+      assert.equal(await readFile(path.join(home, ".nexus/claude/backup.json"), "utf8"), "{\"backup\":true}\n");
+      assert.equal(await readlink(path.join(home, ".fireconnect")), ".nexus");
+    });
+  });
+
+  it("finishes a merge the process died in when ~/.fireconnect has no config.json", async () => {
+    await withTempHome("data-dir-crash-merge-noconfig-", async (home) => {
+      await mkdir(path.join(home, ".fireconnect/claude"), { recursive: true });
+      await writeFile(path.join(home, ".fireconnect/claude/backup.json"), "{\"backup\":true}\n");
+      await mkdir(path.join(home, ".nexus"));
+      await writeFile(path.join(home, ".nexus/catalog-cache.json"), "{}\n");
+
+      const crashed = migrateThenCrash(home, "claude");
+      assert.equal(crashed.status, 137, crashed.stderr);
+
+      assert.equal(hasForeignDataDir(home), false);
+      assert.equal(migrateLegacyDataDir(home), "moved");
+      assert.equal(await readFile(path.join(home, ".nexus/claude/backup.json"), "utf8"), "{\"backup\":true}\n");
+      assert.equal(await readlink(path.join(home, ".fireconnect")), ".nexus");
+      assert.deepEqual((await readdir(path.join(home, ".nexus"))).sort(), ["catalog-cache.json", "claude"]);
+    });
+  });
+
+  async function clashingDataDirs(home) {
+    await mkdir(path.join(home, ".fireconnect"));
+    await writeFile(path.join(home, ".fireconnect/config.json"), "{\"old\":true}\n");
+    await mkdir(path.join(home, ".nexus"));
+    await writeFile(path.join(home, ".nexus/config.json"), NEXUS_CONFIG);
+  }
+
+  it("keeps ~/.nexus-pre recorded when the process dies right after setting it aside", async () => {
+    await withTempHome("data-dir-crash-aside-", async (home) => {
+      await clashingDataDirs(home);
+
+      const crashed = migrateThenCrash(home, ".fireconnect");
+      assert.equal(crashed.status, 137, crashed.stderr);
+      assert.equal(await readFile(path.join(home, ".nexus-pre/config.json"), "utf8"), "{\"old\":true}\n");
+
+      assert.deepEqual(setAsideDirs(home), [path.join(home, ".nexus-pre")]);
+      migrateLegacyDataDir(home);
+      assert.deepEqual(setAsideDirs(home), [path.join(home, ".nexus-pre")]);
+    });
+  });
+
+  it("sets the old directory aside under the recorded name when the process died after recording it", async () => {
+    await withTempHome("data-dir-crash-record-", async (home) => {
+      await clashingDataDirs(home);
+      await mkdir(path.join(home, ".nexus-pre"));
+      await writeFile(path.join(home, ".nexus-pre/mine.txt"), "not from this run\n");
+
+      const crashed = migrateThenCrash(home, "", { CRASH_AFTER_RENAME_TO: "set-aside.json" });
+      assert.equal(crashed.status, 137, crashed.stderr);
+      assert.equal(await readFile(path.join(home, ".fireconnect/config.json"), "utf8"), "{\"old\":true}\n");
+      const [recorded, ...more] = setAsideDirs(home);
+      assert.deepEqual(more, []);
+      assert.match(path.basename(recorded), /^\.nexus-pre-\d+$/);
+      assert.equal(existsSync(recorded), false);
+
+      assert.equal(migrateLegacyDataDir(home), "set-aside");
+      assert.deepEqual(setAsideDirs(home), [recorded]);
+      assert.equal(await readFile(path.join(recorded, "config.json"), "utf8"), "{\"old\":true}\n");
+      assert.equal(await readFile(path.join(home, ".nexus-pre/mine.txt"), "utf8"), "not from this run\n");
+      assert.equal(await readlink(path.join(home, ".fireconnect")), ".nexus");
+    });
   });
 });

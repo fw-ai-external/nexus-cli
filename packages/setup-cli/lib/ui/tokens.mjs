@@ -28,11 +28,3 @@ export const DATA_COLORS = Object.freeze({
 
 /** Install screen only. */
 export const LOGO_GRADIENT = Object.freeze(["#D97547", "#DE4A7D", "#D361AD", "#D494BB"]);
-
-/** Semantic terminal roles — mapped in theme.mjs to ANSI slots, not hex literals. */
-export const SEMANTIC = {
-  interactive: "accent",
-  success: "primary",
-  muted: "muted",
-  spend: "data",
-};

@@ -18,14 +18,22 @@
  * - existing user profiles are backed up before we write and restored on off.
  */
 import process from "node:process";
+import os from "node:os";
+import { harnessCommandEnv, resolveHarnessCommandAsync } from "../../harness/detect.mjs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat } from "node:fs/promises";
-import { assertResolvedKeyNotRejected, resolveFireworksKeyWithSource, tryReadKeychainSecret } from "../../keys/api-key.mjs";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
+import {
+  assertResolvedKeyNotRejected,
+  keyStoreUnreadableError,
+  resolveFireworksKeyWithSource,
+  tryReadKeychainSecret,
+} from "../../keys/api-key.mjs";
 import { loadServerlessCatalog } from "../../fireworks/models.mjs";
 import { isFirerouterModelPattern } from "../../fireworks/model-specs.mjs";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
+import { copyPrivateTree, ensurePrivateParent, restoreTreeModes, writePrivateFileAtomic } from "../../io/private-files.mjs";
 import { printBody, printNote } from "../../cli/messages.mjs";
 import { claudeDesktopDataDir } from "./core.mjs";
 import {
@@ -34,6 +42,8 @@ import {
 } from "./platform.mjs";
 import { preferDataDirPath } from "../../system/data-dir.mjs";
 import { ensureShimSecret, probeShimIdentity, readShimSecret } from "./shim-auth.mjs";
+import { isDesktopToken } from "./desktop-token.mjs";
+import { readServiceGatewayKey, removeDesktopCredential, selectDesktopCredential } from "./gateway-key.mjs";
 import { isLoopbackHostname } from "../../system/loopback.mjs";
 
 const SHIM_DEFAULT_PORT = 8799;
@@ -57,7 +67,11 @@ function backupDir(home) {
 }
 // The pure lineup logic lives in lineup.mjs (the shim imports only that leaf);
 // re-export so existing callers keep working.
-import { DEFAULT_MODEL_MAP, PICKER_MODELS, firstPartyDir, serverlessLineup, thirdPartyDir } from "./lineup.mjs";
+import { modelNotAvailableMessage } from "../../fireworks/model-access.mjs";
+import {
+  DEFAULT_MODEL_MAP, PICKER_MODELS, firstPartyDir, isCustomModelOffered, serverlessLineup, servedStaticLineup, thirdPartyDir,
+} from "./lineup.mjs";
+import { recordedHarnessResidency, resolveHarnessResidency } from "../../fireworks/residency.mjs";
 export { DEFAULT_MODEL_MAP, PICKER_MODELS, firstPartyDir, serverlessLineup, thirdPartyDir } from "./lineup.mjs";
 function configLibraryDir(home) {
   return path.join(thirdPartyDir(home), "configLibrary");
@@ -68,7 +82,20 @@ async function readJson(file) {
 }
 
 export async function readProfileState(home) {
-  return readJson(profileStatePath(home));
+  const state = await readJson(profileStatePath(home));
+  return state?.profileId !== undefined && !validProfileId(state.profileId) ? null : state;
+}
+
+function validProfileId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id);
+}
+
+function profilePath(lib, id) {
+  return validProfileId(id) ? path.join(lib, `${id}.json`) : null;
+}
+
+function profileEntries(meta) {
+  return Array.isArray(meta?.entries) ? meta.entries.filter((entry) => validProfileId(entry?.id)) : [];
 }
 
 /**
@@ -129,39 +156,26 @@ const OAUTH_ISSUERS = {
 };
 
 /**
- * Claude.ai connector relay candidates: {name, serverId} pairs found in
- * session files. server_id addresses Anthropic's connector relay:
- * https://mcp-proxy.anthropic.com/v1/mcp/{server_id}.
- */
-export async function listHostedCandidates(home) {
-  const hostedByUuid = new Map();
-  for (const root of [firstPartyDir(home), thirdPartyDir(home)]) {
-    await walk(path.join(root, "local-agent-mode-sessions"), new Map(), hostedByUuid);
-  }
-  return [...hostedByUuid.values()];
-}
-
-/**
  * Connectors hosted on Anthropic/Google infrastructure authenticate through
- * the claude.ai control plane (their vendor tokens live server-side); the
+ * claude.ai's hosted connector service (their vendor tokens live server-side); the
  * 3p app cannot self-register with them, so sync skips them unless the entry
  * carries its own pre-registered OAuth client.
  */
 // mcp-proxy.anthropic.com is claude.ai's connector relay: a session file
-// carrying that URL is really a hosted connector (see listHostedCandidates),
+// carrying that URL is really a hosted connector,
 // and the relay only answers for claude.ai sessions — a 3p profile pointing
-// at it gets a dead server, so it is skipped like the other control-plane
+// at it gets a dead server, so it is skipped like the other hosted
 // hosts.
-const CONTROL_PLANE_HOSTS = /googleapis\.com$|claudemcpcontent\.com$|\.mcp\.claude\.com$|^mcp\.claude\.com$|^mcp-proxy\.anthropic\.com$/;
+const HOSTED_CONNECTOR_HOSTS = /googleapis\.com$|claudemcpcontent\.com$|\.mcp\.claude\.com$|^mcp\.claude\.com$|^mcp-proxy\.anthropic\.com$/;
 
 export function reliesOnClaudeAiLogin(entry) {
   const url = entry?.url ?? "";
   let host = "";
   try { host = new URL(url).hostname; } catch { return false; }
-  return CONTROL_PLANE_HOSTS.test(host) && !entry?.oauth?.clientId;
+  return HOSTED_CONNECTOR_HOSTS.test(host) && !entry?.oauth?.clientId;
 }
 
-/** claude.ai's connector relay (see listHostedCandidates). */
+/** Whether a URL points to the hosted connector relay. */
 function isRelayUrl(url) {
   try { return new URL(url).hostname === "mcp-proxy.anthropic.com"; } catch { return false; }
 }
@@ -177,7 +191,7 @@ function hostOf(url) {
 
 /** Entries that can never work in the 3p profile: relay URLs (dead even
  * with an OAuth client — the relay answers claude.ai sessions only),
- * control-plane connectors without their own client, and connectors that
+ * hosted connectors without their own client, and connectors that
  * require a pre-registered OAuth client the user has not supplied. */
 function isUnmigratable(entry) {
   return isRelayUrl(entry?.url) || reliesOnClaudeAiLogin(entry)
@@ -265,7 +279,7 @@ export function parseClaudeMcpList(stdout) {
  * user settings are excluded because either one hides claude.ai connectors.
  * Bounded by a timeout; any failure yields [] so sync still completes.
  */
-export async function listOrgConnectorsViaClaudeCli({ timeoutMs = 90_000 } = {}) {
+export async function listOrgConnectorsViaClaudeCli({ timeoutMs = 90_000, home = os.homedir() } = {}) {
   if (process.env.NEXUS_TEST === "1") return [];
   const { execFile } = await import("node:child_process");
   const env = { ...process.env };
@@ -275,9 +289,10 @@ export async function listOrgConnectorsViaClaudeCli({ timeoutMs = 90_000 } = {})
   const { tmpdir } = await import("node:os");
   const cwd = await mkdtemp(path.join(tmpdir(), "nexus-mcp-list-"));
   try {
+    const bin = await resolveHarnessCommandAsync("claude", home) || "claude";
     return await new Promise((resolve, reject) => {
-      execFile("claude", ["--setting-sources", "project,local", "mcp", "list"], {
-        env, cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
+      execFile(bin, ["--setting-sources", "project,local", "mcp", "list"], {
+        env: harnessCommandEnv(bin, env), cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
       }, (error, stdout) => {
         if (error && !stdout) reject(new Error(`claude mcp list failed: ${error.message}`));
         else resolve(parseClaudeMcpList(stdout));
@@ -289,7 +304,7 @@ export async function listOrgConnectorsViaClaudeCli({ timeoutMs = 90_000 } = {})
 }
 
 function appliedProfilePath(home, state) {
-  return path.join(configLibraryDir(home), `${state.profileId}.json`);
+  return profilePath(configLibraryDir(home), state.profileId);
 }
 
 async function requireEnabledProfile(home) {
@@ -310,7 +325,7 @@ async function setConnectorExcluded(home, name, excluded) {
   const set = new Set(Array.isArray(state.excludedConnectors) ? state.excludedConnectors : []);
   if (excluded) set.add(key); else set.delete(key);
   state.excludedConnectors = [...set].sort();
-  await writeFileAtomic(profileStatePath(home), JSON.stringify(state, null, 2));
+  await writePrivateFileAtomic(profileStatePath(home), JSON.stringify(state, null, 2));
   await persistConnectorStore(home, { excluded: state.excludedConnectors }).catch(() => {});
 }
 
@@ -364,8 +379,8 @@ async function readConnectorStore(home) {
 }
 
 async function writeConnectorStore(home, { servers, excluded }) {
-  await mkdir(claudeDesktopDataDir(home), { recursive: true });
-  await writeFileAtomic(connectorStorePath(home), JSON.stringify({ servers, excluded }, null, 2), { mode: 0o600 });
+  await mkdir(claudeDesktopDataDir(home), { recursive: true, mode: 0o700 });
+  await writePrivateFileAtomic(connectorStorePath(home), JSON.stringify({ servers, excluded }, null, 2), { mode: 0o600 });
 }
 
 /** Mirror the applied profile's connector setup into the durable store.
@@ -408,15 +423,15 @@ async function backfillClientUrls(home, durable, servers) {
     changed = true;
   }
   if (!changed) return;
-  await writeFileAtomic(oauthClientsPath(home), JSON.stringify(durable, null, 2), { mode: 0o600 });
+  await writePrivateFileAtomic(oauthClientsPath(home), JSON.stringify(durable, null, 2), { mode: 0o600 });
 }
 
 async function saveOauthClient(home, name, oauth, url) {
   if (!oauth || typeof oauth !== "object") return;
   const all = await readOauthClients(home);
   all[name] = { ...oauth, registeredUrl: url };
-  await mkdir(claudeDesktopDataDir(home), { recursive: true });
-  await writeFileAtomic(oauthClientsPath(home), JSON.stringify(all, null, 2), { mode: 0o600 });
+  await mkdir(claudeDesktopDataDir(home), { recursive: true, mode: 0o700 });
+  await writePrivateFileAtomic(oauthClientsPath(home), JSON.stringify(all, null, 2), { mode: 0o600 });
 }
 
 export async function addProfileConnector(home, { name, url, command, args, env, oauth }) {
@@ -468,9 +483,9 @@ export async function syncProfileConnectors(home, { listOrgConnectors = listOrgC
   // Local sources first (sessions + first-party config), then the org
   // registry from the Claude Code CLI for connectors never used in Desktop.
   // Names the user removed stay out. Durable OAuth clients (mcp add
-  // --client-id) are overlaid BEFORE the control-plane filter: an entry with
+  // --client-id) are overlaid BEFORE the hosted-connector filter: an entry with
   // its own client authenticates standalone and is kept; without one,
-  // control-plane connectors (Google/Anthropic-hosted) are skipped.
+  // hosted connectors (Google/Anthropic-hosted) are skipped.
   const durable = await readOauthClients(home);
   await backfillClientUrls(home, durable, profile.managedMcpServers).catch(() => {});
   const previousOauth = new Map((Array.isArray(profile.managedMcpServers) ? profile.managedMcpServers : [])
@@ -501,7 +516,7 @@ export async function syncProfileConnectors(home, { listOrgConnectors = listOrgC
   };
   const [detectedAll, orgRaw] = await Promise.all([
     detectConnectors(home),
-    listOrgConnectors().catch(() => null),
+    listOrgConnectors({ home }).catch(() => null),
   ]);
   const registryRead = orgRaw !== null;
   // Skipped connectors are reported by name with a reason (first source wins).
@@ -515,7 +530,7 @@ export async function syncProfileConnectors(home, { listOrgConnectors = listOrgC
   };
   const detected = detectedAll.map(withClients).filter(keep);
   const org = (orgRaw ?? []).map(withClients).filter(keep);
-  if (bound) await writeFileAtomic(oauthClientsPath(home), JSON.stringify(durable, null, 2), { mode: 0o600 }).catch(() => {});
+  if (bound) await writePrivateFileAtomic(oauthClientsPath(home), JSON.stringify(durable, null, 2), { mode: 0o600 }).catch(() => {});
   // The list is rebuilt strictly from sources: org-registered + locally used.
   // Standard-catalog connectors that the org has not added are ignored, and
   // entries only present in the profile from an earlier sync are dropped.
@@ -628,14 +643,14 @@ async function refreshSignedCatalog(catalogPath, { maxAgeMs = 24 * 3600_000 } = 
 /** Custom models from `on --model <id>` — durable: `off` removes
  * profile-state.json, so they live in manual-models.json (like the OAuth
  * client store). */
-async function readManualModels(home) {
+export async function readManualModels(home) {
   const list = await readJson(path.join(claudeDesktopDataDir(home), "manual-models.json"));
   return Array.isArray(list) ? list : [];
 }
 
 async function writeManualModels(home, list) {
-  await mkdir(claudeDesktopDataDir(home), { recursive: true });
-  await writeFileAtomic(path.join(claudeDesktopDataDir(home), "manual-models.json"), JSON.stringify(list, null, 2));
+  await mkdir(claudeDesktopDataDir(home), { recursive: true, mode: 0o700 });
+  await writePrivateFileAtomic(path.join(claudeDesktopDataDir(home), "manual-models.json"), JSON.stringify(list, null, 2));
 }
 
 /**
@@ -656,7 +671,7 @@ export async function customModelEntry(home, shortId, { catalogIds, usedNames } 
     .flatMap((c) => c?.models ?? []).map((m) => m?.id).filter(Boolean));
   const state = await readProfileState(home);
   const lib = configLibraryDir(home);
-  const profile = state?.profileId ? await readJson(path.join(lib, `${state.profileId}.json`)) : null;
+  const profile = state?.profileId ? await readJson(profilePath(lib, state.profileId)) : null;
   const used = new Set([
     ...(Array.isArray(profile?.inferenceModels) ? profile.inferenceModels : []).map((m) => m.name),
     // The lineup about to be written (a first on has no profile yet).
@@ -680,16 +695,24 @@ export async function customModelEntry(home, shortId, { catalogIds, usedNames } 
 export async function loadDesktopLineup({ apiKey, signedCatalogPath }) {
   await refreshSignedCatalog(signedCatalogPath);
   let entries = [];
+  let catalogError = null;
   try {
-    ({ catalog: entries } = await loadServerlessCatalog({ apiKey }));
-  } catch {
-    // No cached snapshot and the gateway is unreachable.
+    const { catalog, staleReason } = await loadServerlessCatalog({ apiKey });
+    entries = catalog;
+    if (!entries.length && staleReason) {
+      catalogError = new Error(`Couldn't fetch the Fireworks model catalog. ${staleReason}`);
+    }
+  } catch (error) {
+    catalogError = error;
   }
   const full = serverlessLineup(entries, await readJson(signedCatalogPath));
+  const curated = full ? null : servedStaticLineup(entries);
   return {
     full: Boolean(full),
-    models: full?.models ?? PICKER_MODELS,
-    modelMap: full?.modelMap ?? DEFAULT_MODEL_MAP,
+    models: full?.models ?? curated.models,
+    modelMap: full?.modelMap ?? curated.modelMap,
+    entries,
+    catalogError,
   };
 }
 
@@ -744,7 +767,7 @@ function buildProfile({
  * regardless of profile-state.json (which older installs may lack). The port
  * alone is not the signal (a user may run another loopback gateway, or the
  * default port may change): fingerprint on the full shape only we write —
- * loopback host + fw_ key + gateway/static credentials. */
+ * loopback host + Nexus credential + gateway/static credentials. */
 function isShimProfile(profile, shimUrl) {
   const url = profile?.inferenceGatewayBaseUrl;
   if (typeof url !== "string") return false;
@@ -754,44 +777,79 @@ function isShimProfile(profile, shimUrl) {
   if (!loopback) return false;
   const key = profile?.inferenceGatewayApiKey;
   // Older installs also wrote Fire Pass (fpk_) keys; `off` must still find them.
-  const fingerprint = typeof key === "string" && /^(fw_|fpk_)/.test(key)
+  const fingerprint = typeof key === "string" && (/^(fw_|fpk_)/.test(key) || isDesktopToken(key))
     && profile?.inferenceProvider === "gateway" && profile?.inferenceCredentialKind === "static";
   return fingerprint && (port === "" || port === String(new URL(shimUrl).port));
 }
 
+async function writeCredentialProfile(filePath, build, options) {
+  const original = await readFile(filePath, "utf8").catch((error) => { if (error.code === "ENOENT") return null; throw error; });
+  const mode = await stat(filePath).then((info) => info.mode & 0o777, () => 0o600);
+  return selectDesktopCredential({ ...options, writeProfile: async (credential) => {
+    const value = build(credential);
+    if (value === null) return;
+    await writeFileAtomic(filePath, value, { mode: 0o600 });
+    return () => original === null ? rm(filePath, { force: true }) : writeFileAtomic(filePath, original, { mode });
+  } });
+}
+
 /**
- * Re-point the applied Nexus profile at `fireworksKey`: Desktop sends the
- * profile's literal key, so it must track the stored key. Returns true when
- * the profile changed.
+ * Refresh the applied Nexus profile's credential. Returns true when changed.
  * @param {{ home: string, fireworksKey: string }} params
  */
-export async function refreshClaudeDesktopGatewayKey({ home, fireworksKey }) {
+export async function refreshClaudeDesktopGatewayKey({ home, fireworksKey, readServiceKey = readServiceGatewayKey, warn = printNote }) {
   const key = fireworksKey?.trim();
   // Like `on`, bake only the stored key, never one from this shell's environment.
   if (!key || key !== await tryReadKeychainSecret(home)) return false;
   const state = await readProfileState(home);
   if (!state?.enabled || !state.profileId) return false;
-  const profilePath = path.join(configLibraryDir(home), `${state.profileId}.json`);
-  const profile = await readJson(profilePath);
-  if (!isShimProfile(profile, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`)
-    || profile.inferenceGatewayApiKey === key) return false;
-  await writeFileAtomic(profilePath, JSON.stringify({ ...profile, inferenceGatewayApiKey: key }, null, 2), { mode: 0o600 });
-  return true;
+  const filePath = profilePath(configLibraryDir(home), state.profileId);
+  const profile = await readJson(filePath);
+  if (!isShimProfile(profile, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`)) return false;
+  const credential = await writeCredentialProfile(filePath, (value) => profile.inferenceGatewayApiKey === value ? null
+    : JSON.stringify({ ...profile, inferenceGatewayApiKey: value }, null, 2), { home, dataDir: claudeDesktopDataDir(home), key, readServiceKey, warn });
+  return profile.inferenceGatewayApiKey !== credential;
 }
 
 /**
- * The key Claude Desktop sends while the Nexus profile is applied: the
- * profile's literal `inferenceGatewayApiKey` (the shim forwards it as-is).
- * null when the lane is off or the profile isn't ours. Reads files only.
+ * The stored key for token profiles, or a legacy profile's literal key.
+ * null when the lane is off or the profile isn't ours.
  * @param {string} home
  * @returns {Promise<string | null>}
  */
 export async function readClaudeDesktopProfileKey(home) {
   const state = await readProfileState(home);
   if (!state?.enabled || !state.profileId) return null;
-  const profile = await readJson(path.join(configLibraryDir(home), `${state.profileId}.json`));
+  const profile = await readJson(profilePath(configLibraryDir(home), state.profileId));
   if (!isShimProfile(profile, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`)) return null;
-  return profile.inferenceGatewayApiKey;
+  return isDesktopToken(profile.inferenceGatewayApiKey)
+    ? await tryReadKeychainSecret(home).catch(() => null) || null : profile.inferenceGatewayApiKey;
+}
+
+/**
+ * Whether the Claude Desktop lane is on with a token profile: it holds no copy
+ * of the key, since the local proxy reads the stored one on each request.
+ * @param {string} home
+ * @returns {Promise<boolean>}
+ */
+export async function claudeDesktopProfileUsesToken(home) {
+  const state = await readProfileState(home);
+  if (!state?.enabled || !state.profileId) return false;
+  const profile = await readJson(profilePath(configLibraryDir(home), state.profileId));
+  return isShimProfile(profile, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`)
+    && isDesktopToken(profile.inferenceGatewayApiKey);
+}
+
+/**
+ * The profile's key when it is written in the profile itself, never read
+ * from the keychain (a Desktop token gives null). For prompt-free callers.
+ */
+export async function readClaudeDesktopProfileLiteralKey(home) {
+  const state = await readProfileState(home);
+  if (!state?.enabled || !state.profileId) return null;
+  const profile = await readJson(profilePath(configLibraryDir(home), state.profileId));
+  if (!isShimProfile(profile, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`)) return null;
+  return isDesktopToken(profile.inferenceGatewayApiKey) ? null : profile.inferenceGatewayApiKey || null;
 }
 
 /** Durable registry of profile ids Nexus has written (survives off, so
@@ -802,28 +860,28 @@ function writtenProfilesPath(home) {
 
 export async function readWrittenProfiles(home) {
   const list = await readJson(writtenProfilesPath(home));
-  return new Set(Array.isArray(list) ? list : []);
+  return new Set(Array.isArray(list) ? list.filter(validProfileId) : []);
 }
 
 async function rememberWrittenProfile(home, profileId) {
   const set = await readWrittenProfiles(home);
   if (set.has(profileId)) return;
   set.add(profileId);
-  await mkdir(claudeDesktopDataDir(home), { recursive: true });
-  await writeFileAtomic(writtenProfilesPath(home), JSON.stringify([...set], null, 2), { mode: 0o600 });
+  await mkdir(claudeDesktopDataDir(home), { recursive: true, mode: 0o700 });
+  await writePrivateFileAtomic(writtenProfilesPath(home), JSON.stringify([...set], null, 2), { mode: 0o600 });
 }
 
 /** The id of our profile in a config library: prefer the durable registry,
  * fall back to the content fingerprint for pre-registry installs. */
 export async function detectShimProfileId(lib, shimUrl, home) {
   const meta = await readJson(path.join(lib, "_meta.json"));
-  const entries = meta?.entries ?? [];
+  const entries = profileEntries(meta);
   const written = home ? await readWrittenProfiles(home) : new Set();
   for (const entry of entries) {
     if (written.has(entry.id)) return entry.id;
   }
   for (const entry of entries) {
-    const profile = await readJson(path.join(lib, `${entry.id}.json`));
+    const profile = await readJson(profilePath(lib, entry.id));
     if (isShimProfile(profile, shimUrl)) return entry.id;
   }
   return null;
@@ -835,10 +893,10 @@ async function sanitizeAppliedId(lib, shimUrl) {
   const metaPath = path.join(lib, "_meta.json");
   const meta = await readJson(metaPath);
   if (!meta?.appliedId) return;
-  const applied = await readJson(path.join(lib, `${meta.appliedId}.json`));
+  const applied = await readJson(profilePath(lib, meta.appliedId));
   if (applied && !isShimProfile(applied, shimUrl)) return;
   meta.appliedId = null;
-  await writeFileAtomic(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  await writeFileAtomic(metaPath, JSON.stringify(meta, null, 2));
 }
 
 /**
@@ -865,7 +923,7 @@ async function applyDeviceCatalogConfig(home, shimUrl) {
 }
 
 /** Capture the device config keys we touch, for off to restore. */
-async function backupDeviceCatalogConfig(home) {
+export async function backupDeviceCatalogConfig(home) {
   const config = (await readJson(path.join(thirdPartyDir(home), "claude_desktop_config.json"))) ?? {};
   const saved = {};
   for (const key of DEVICE_CATALOG_KEYS) if (key in config) saved[key] = config[key];
@@ -873,7 +931,7 @@ async function backupDeviceCatalogConfig(home) {
 }
 
 /** Restore the device config keys to their pre-Nexus values. */
-async function restoreDeviceCatalogConfig(home, saved) {
+export async function restoreDeviceCatalogConfig(home, saved) {
   const configPath = path.join(thirdPartyDir(home), "claude_desktop_config.json");
   const config = (await readJson(configPath)) ?? {};
   for (const key of DEVICE_CATALOG_KEYS) {
@@ -973,10 +1031,20 @@ export async function waitForShim(port, {
  * @param {{ profileId?: string, meta?: { appliedId?: string|null, entries?: Array<{ id: string }> } | null, readdirFn?: typeof readdir }} options
  */
 async function restoreProfileLibrary(lib, backup, { profileId, meta, readdirFn = readdir }) {
-  const staged = `${lib}.nexus-restore-${Date.now()}`;
-  await rm(staged, { recursive: true, force: true });
-  await cp(backup, staged, { recursive: true });
+  const target = await realpath(lib).catch((error) => {
+    if (error.code === "ENOENT") return lib;
+    throw error;
+  });
+  const staged = `${target}.nexus-restore-${randomUUID()}`;
   try {
+    const modes = new Map(await copyPrivateTree(backup, staged));
+    const savedModes = await readJson(`${backup}.modes.json`);
+    if (Array.isArray(savedModes)) {
+      for (const entry of savedModes) {
+        if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isInteger(entry[1])
+          && entry[1] >= 0 && entry[1] <= 0o7777) modes.set(entry[0], entry[1]);
+      }
+    }
     let current = [];
     try {
       current = await readdirFn(lib, { withFileTypes: true });
@@ -990,22 +1058,32 @@ async function restoreProfileLibrary(lib, backup, { profileId, meta, readdirFn =
       if (entry.isFile()) {
         const before = await readFile(to).catch(() => null);
         const now = await readFile(from);
-        if (before && before.equals(now)) continue;
+        if (before && before.equals(now)) {
+          modes.set(entry.name, (await stat(from)).mode & 0o7777);
+          continue;
+        }
       }
       await rm(to, { recursive: true, force: true });
-      await cp(from, to, { recursive: true });
+      const currentModes = await copyPrivateTree(from, to, { sourceSymlink: "preserve" });
+      for (const [relative, mode] of currentModes) modes.set(path.join(entry.name, relative), mode);
     }
     const backupMeta = await readJson(path.join(staged, "_meta.json"));
-    const later = new Map((meta?.entries ?? []).filter((entry) => entry.id !== profileId).map((entry) => [entry.id, entry]));
+    const later = new Map(profileEntries(meta).filter((entry) => entry.id !== profileId).map((entry) => [entry.id, entry]));
     // `on` carries every listed profile over, so a backup entry missing from
     // a readable current listing was deleted by the user. An unreadable
     // listing proves nothing, and the backup is kept whole.
     const currentFiles = new Set(current.map((entry) => entry.name));
     const deleted = (entry) => Array.isArray(meta?.entries) && !later.has(entry.id) && !currentFiles.has(`${entry.id}.json`);
-    const backupEntries = (backupMeta?.entries ?? []).filter((entry) => !deleted(entry));
-    for (const entry of backupMeta?.entries ?? []) {
-      if (deleted(entry)) await rm(path.join(staged, `${entry.id}.json`), { force: true });
+    // A repeat `on` after the user switched away from our profile backs up a
+    // library that lists it; restoring that copy would leave a profile
+    // pointing at the stopped shim.
+    const ours = (entry) => entry.id === profileId;
+    const backupEntries = profileEntries(backupMeta).filter((entry) => !ours(entry) && !deleted(entry));
+    for (const entry of profileEntries(backupMeta)) {
+      if (ours(entry) || deleted(entry)) await rm(profilePath(staged, entry.id), { force: true });
     }
+    const stagedOurs = profilePath(staged, profileId);
+    if (stagedOurs) await rm(stagedOurs, { force: true });
     const entries = [
       ...backupEntries.map((entry) => later.get(entry.id) ?? entry),
       ...[...later.values()].filter((entry) => !backupEntries.some((old) => old.id === entry.id)),
@@ -1025,18 +1103,19 @@ async function restoreProfileLibrary(lib, backup, { profileId, meta, readdirFn =
         { mode: 0o600 },
       );
     }
-    const old = `${lib}.nexus-old-${Date.now()}`;
+    await restoreTreeModes(staged, [...modes]);
+    const old = `${target}.nexus-old-${randomUUID()}`;
     let movedOld = false;
     try {
-      await rename(lib, old);
+      await rename(target, old);
       movedOld = true;
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
     try {
-      await rename(staged, lib);
+      await rename(staged, target);
     } catch (error) {
-      if (movedOld) await rename(old, lib).catch(() => {});
+      if (movedOld) await rename(old, target).catch(() => {});
       throw error;
     }
     if (movedOld) await rm(old, { recursive: true, force: true }).catch(() => {});
@@ -1049,9 +1128,10 @@ async function restoreProfileLibrary(lib, backup, { profileId, meta, readdirFn =
 async function backupConfigLibrary(home, log, { shimUrl } = {}) {
   const lib = configLibraryDir(home);
   try { await stat(lib); } catch { return null; }
-  const dest = path.join(backupDir(home), `configLibrary-${Date.now()}`);
-  await mkdir(path.dirname(dest), { recursive: true });
-  await cp(lib, dest, { recursive: true });
+  const dest = path.join(backupDir(home), `configLibrary-${Date.now()}-${randomUUID()}`);
+  ensurePrivateParent(dest, { root: claudeDesktopDataDir(home) });
+  const modes = await copyPrivateTree(lib, dest, { sourceSymlink: "follow" });
+  await writePrivateFileAtomic(`${dest}.modes.json`, JSON.stringify(modes), { root: claudeDesktopDataDir(home) });
   // Never bake a shim-pointing appliedId into a backup: off restores the
   // backup wholesale, and a stale shim appliedId would leave the app on a
   // dead gateway instead of Default.
@@ -1061,38 +1141,126 @@ async function backupConfigLibrary(home, log, { shimUrl } = {}) {
 }
 
 /**
+ * Write the shim's service file for this install and (re)start it, then wait
+ * until the listener proves it is our shim. A service this call created is
+ * removed again on failure; one that already existed is left for `off`.
+ * @param {string} home
+ * @param {{ port: number, secret: string, allowSystemChanges: boolean, start?: typeof startShimService, wait?: typeof waitForShim }} options
+ */
+async function installShimService(home, { port, secret, allowSystemChanges, start = startShimService, wait = waitForShim }) {
+  const dataDir = claudeDesktopDataDir(home);
+  const entry = preferDataDirPath(fileURLToPath(new URL("shim.mjs", import.meta.url)));
+  const servicePath = shimServicePath(home);
+  const firstInstall = await stat(servicePath).then(() => false, () => true);
+  const errorPath = path.join(dataDir, "shim.err.log");
+  const errorOffset = await fileSize(errorPath);
+  try {
+    await mkdir(path.dirname(servicePath), { recursive: true, mode: 0o700 });
+    await writeFileAtomic(servicePath, buildShimServiceFile({
+      nodeExec: process.execPath,
+      entry,
+      home,
+      ...shimTrustOptions(),
+      label: SHIM_LABEL,
+      logPath: path.join(dataDir, "shim.log"),
+      errorPath,
+    }));
+    await retireLegacyShimAgent(home, { allowSystemChanges }).catch(() => {});
+    await start(servicePath, { allowSystemChanges, label: SHIM_LABEL });
+    await wait(port, { secret, errorPath, errorOffset });
+  } catch (error) {
+    // A first install has no profile state yet, so `off` would not know to
+    // remove the service; undo it here (e.g. no systemd user session over
+    // SSH). A pre-existing service is left for `off`.
+    if (firstInstall) {
+      await stopShimService({ allowSystemChanges, label: SHIM_LABEL, unitPath: servicePath }).catch(() => {});
+      await rm(servicePath, { force: true });
+    }
+    throw error;
+  }
+}
+
+/**
+ * Bring the shim back without touching the profile or the key: rewrite its
+ * service file for this install (the Node and shim paths `on` would write)
+ * and restart it. The fix for a shim that is down after a reboot, an
+ * upgrade, or a crash; safe while Claude Desktop is running.
+ * @param {string} home
+ * @param {{ allowSystemChanges?: boolean, start?: typeof startShimService, wait?: typeof waitForShim }} [options]
+ */
+export async function restartShim(home, {
+  allowSystemChanges = process.env.NEXUS_TEST !== "1", start, wait,
+} = {}) {
+  const state = await readProfileState(home);
+  if (!state?.port || !(await stat(shimStatePath(home)).then(() => true, () => false))) {
+    throw new Error("Claude Desktop isn't connected. Run `nexus claude-desktop on`.");
+  }
+  if (!allowSystemChanges) return;
+  const secret = await ensureShimSecret(claudeDesktopDataDir(home));
+  await installShimService(home, { port: state.port, secret, allowSystemChanges, start, wait });
+}
+
+/**
  * Enable the profile lane: start the shim service, write the 3p profile,
  * migrate sessions. Idempotent; pre-existing profiles are backed up first.
  */
-export async function enableProfileLane(home, {
+/**
+ * `nexus claude-desktop on`. The account's residency is recorded before the
+ * shim starts (it forwards to that host). If setup fails before the shim
+ * restarts, the previous value is put back, so `status` keeps describing the
+ * shim that is running; once it has restarted, the new value is the true one.
+ * @param {string} home
+ * @param {Parameters<typeof enableProfileLaneSteps>[1]} [options]
+ */
+export async function enableProfileLane(home, options = {}) {
+  const previousResidency = recordedHarnessResidency("claude-desktop", home);
+  const progress = { shimRestarted: false };
+  try {
+    return await enableProfileLaneSteps(home, { ...options, progress });
+  } catch (error) {
+    if (!progress.shimRestarted && recordedHarnessResidency("claude-desktop", home) !== previousResidency) {
+      const { setHarnessState } = await import("../../config/global-config.mjs");
+      await setHarnessState(home, "claude-desktop", { residency: previousResidency }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function enableProfileLaneSteps(home, {
   allowSystemChanges = true,
   port = SHIM_DEFAULT_PORT,
   model,
+  readServiceKey = readServiceGatewayKey,
   log = (line) => console.log(line),
+  progress = { shimRestarted: false },
 } = {}) {
   if (!SUPPORTED_PLATFORMS.includes(process.platform)) {
     throw new Error("Claude Desktop support requires macOS or Linux.");
   }
   const key = await resolveFireworksKeyWithSource({ home });
-  if (!key.key) throw new Error("No Fireworks credential found. Run `nexus login` or set FIREWORKS_API_KEY first.");
-  if (key.source === "env") {
-    throw new Error(
-      "The Fireworks key comes from FIREWORKS_API_KEY in this shell only. "
-      + "Run `nexus login --api-key <key>` so the shim service can use a stored credential.",
-    );
+  if (!key.key) {
+    throw keyStoreUnreadableError()
+      ?? new Error("No Fireworks credential found. Run `nexus login` first.");
   }
   // Same stop as every other `on`: never bake a saved key the gateway
   // rejects into the profile or the shim (a dead key would 401 every turn).
   await assertResolvedKeyNotRejected(key.key, { harnessId: "claude-desktop" });
+  // Recorded before the shim starts: it forwards to the endpoint for the
+  // residency stored here.
+  const residencyState = await resolveHarnessResidency(key.key, "claude-desktop", home, { onNote: log });
+  if (residencyState.residency !== undefined) {
+    const { setHarnessState } = await import("../../config/global-config.mjs");
+    await setHarnessState(home, "claude-desktop", residencyState);
+  }
 
   const dataDir = claudeDesktopDataDir(home);
-  await mkdir(dataDir, { recursive: true });
+  ensurePrivateParent(path.join(dataDir, ".entry"));
   const shimUrl = `http://127.0.0.1:${port}`;
 
   // Full serverless line-up: auto plus one picker entry per -latest router
   // alias, paired with a unique signed-catalog id (tier-matched when the pool
   // allows) so every entry gets descriptions and an effort menu.
-  const { models, modelMap } = await loadDesktopLineup({
+  const { models, modelMap, entries: catalogEntries, catalogError } = await loadDesktopLineup({
     apiKey: key.key,
     signedCatalogPath: path.join(dataDir, "catalog", "catalog.json"),
   });
@@ -1107,51 +1275,16 @@ export async function enableProfileLane(home, {
   }
   if (model) {
     const pair = await customModelEntry(home, model, { usedNames: models.map((m) => m.name) });
-    if (!pair) throw new Error(`Unknown serverless model: ${model} (see: nexus model list)`);
+    if (!pair) throw catalogError ?? new Error(modelNotAvailableMessage(model));
     if (!customModels.some((m) => m.shortId === pair.shortId)) {
       customModels.push({ shortId: pair.shortId, name: pair.entry.name, label: pair.entry.labelOverride, tier: pair.entry.anthropicFamilyTier });
       await writeManualModels(home, customModels);
     }
   }
 
-    const stateModelMap = {
-    ...modelMap,
-    models: { ...(modelMap.models ?? {}), ...Object.fromEntries(customModels.map((m) => [m.name, m.shortId])) },
-  };
-  await writeFileAtomic(shimStatePath(home), JSON.stringify({ port, modelMap: stateModelMap }, null, 2));
-  // Before the service starts, so the shim can prove itself on first probe.
-  const shimSecret = await ensureShimSecret(dataDir);
-  if (process.env.NEXUS_TEST !== "1" && allowSystemChanges) {
-    const entry = preferDataDirPath(fileURLToPath(new URL("shim.mjs", import.meta.url)));
-    const servicePath = shimServicePath(home);
-    const firstInstall = await stat(servicePath).then(() => false, () => true);
-    const errorPath = path.join(dataDir, "shim.err.log");
-    const errorOffset = await fileSize(errorPath);
-    try {
-      await mkdir(path.dirname(servicePath), { recursive: true });
-      await writeFileAtomic(servicePath, buildShimServiceFile({
-        nodeExec: process.execPath,
-        entry,
-        home,
-        ...shimTrustOptions(),
-        label: SHIM_LABEL,
-        logPath: path.join(dataDir, "shim.log"),
-        errorPath,
-      }));
-      await retireLegacyShimAgent(home, { allowSystemChanges }).catch(() => {});
-      await startShimService(servicePath, { allowSystemChanges, label: SHIM_LABEL });
-      await waitForShim(port, { secret: shimSecret, errorPath, errorOffset });
-    } catch (error) {
-      // No profile state is written yet, so `off` would not know to remove
-      // a service this run installed; undo it here (e.g. no systemd user
-      // session over SSH). A pre-existing service is left for `off`.
-      if (firstInstall) {
-        await stopShimService({ allowSystemChanges, label: SHIM_LABEL, unitPath: servicePath }).catch(() => {});
-        await rm(servicePath, { force: true });
-      }
-      throw error;
-    }
-  }
+  // Saved customs stay on disk; the picker lists only the ones the catalog
+  // serves (see isCustomModelOffered). Their routes stay mapped.
+  const offeredCustomModels = customModels.filter((m) => isCustomModelOffered(m, catalogEntries));
 
   // Names only (profile-state and the summary); syncProfileConnectors below
   // is what lands connectors and their OAuth clients in the profile.
@@ -1169,46 +1302,68 @@ export async function enableProfileLane(home, {
   const shimProfileId = await detectShimProfileId(lib, shimUrl, home);
   const profileId = priorState?.profileId ?? shimProfileId ?? randomUUID();
   const appliedIsOurs = existing?.appliedId === profileId;
-  // A repeat on must not wipe the path to the user's pre-Nexus profiles.
-  const backup = appliedIsOurs
+  // A repeat on must not wipe the path to the user's pre-Nexus profiles, and
+  // neither may a retry after an on that failed partway.
+  const backup = appliedIsOurs || (priorState && !priorState.enabled)
     ? (priorState?.backup ?? null)
     : existing
       ? await backupConfigLibrary(home, log, { shimUrl })
       : null;
 
-  await mkdir(lib, { recursive: true });
+  // Recapture only when there is no prior snapshot — a repeat on would
+  // otherwise back up Nexus's own keys and off would restore them.
+  const deviceBackup = priorState?.deviceBackup ?? (await backupDeviceCatalogConfig(home));
+  const excludedConnectors = priorState?.excludedConnectors ?? (await readConnectorStore(home)).excluded;
+  const writeState = (enabled) => writePrivateFileAtomic(profileStatePath(home), JSON.stringify({
+    enabled, lane: "profile", port, profileId, backup, deviceBackup,
+    connectors: connectors.map((c) => c.name),
+    excludedConnectors,
+    writtenAt: new Date().toISOString(),
+  }, null, 2));
+  // Record the backups before the shim service or profile changes, so `off`
+  // can undo an `on` that fails partway and a retried `on` keeps the
+  // pre-Nexus snapshots.
+  if (!priorState?.enabled) await writeState(false);
+  // Uninstall finds Desktop through this flag, so set it before the first
+  // write to Desktop; `off` clears it only after restoring.
+  await markHarnessEnabled(home);
+
+    const stateModelMap = {
+    ...modelMap,
+    models: { ...(modelMap.models ?? {}), ...Object.fromEntries(customModels.map((m) => [m.name, m.shortId])) },
+  };
+  await writePrivateFileAtomic(shimStatePath(home), JSON.stringify({ port, modelMap: stateModelMap }, null, 2));
+  // Before the service starts, so the shim can prove itself on first probe.
+  const shimSecret = await ensureShimSecret(dataDir);
+  if (process.env.NEXUS_TEST !== "1" && allowSystemChanges) {
+    await installShimService(home, { port, secret: shimSecret, allowSystemChanges });
+    progress.shimRestarted = true;
+  }
+
+  await mkdir(lib, { recursive: true, mode: 0o700 });
   // Connectors: preserve what the applied profile already has; when it has
   // none (first on, or off deleted it), restore from the durable store so an
   // off/on cycle keeps the user's mcp add/sync setup.
   const durableStore = await readConnectorStore(home);
-  const priorProfile = await readJson(path.join(lib, `${profileId}.json`));
+  const priorProfile = await readJson(profilePath(lib, profileId));
   const profileServers = priorProfile?.managedMcpServers;
   const existingServers = Array.isArray(profileServers) ? profileServers : durableStore.servers;
-  await writeFileAtomic(path.join(lib, `${profileId}.json`), JSON.stringify(buildProfile({
-    shimUrl, apiKey: key.key, models, existingServers, customModels,
-    coworkEgressAllowedHosts: egressHosts(priorProfile, await readJson(egressStorePath(home))),
-  }), null, 2), { mode: 0o600 });
+  const coworkEgressAllowedHosts = egressHosts(priorProfile, await readJson(egressStorePath(home)));
+  await writeCredentialProfile(profilePath(lib, profileId), (credential) => JSON.stringify(buildProfile({
+    shimUrl, apiKey: credential, models, existingServers, customModels: offeredCustomModels, coworkEgressAllowedHosts,
+  }), null, 2), { home, dataDir, key: key.key, readServiceKey, warn: printNote });
 
   const entries = (existing?.entries ?? []).filter((e) => e.id !== profileId);
   entries.push({ id: profileId, name: "Fireworks" });
   await writeFileAtomic(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: profileId, entries }, null, 2), { mode: 0o600 });
   await rememberWrittenProfile(home, profileId);
 
-  // Recapture only when there is no prior snapshot — a repeat on would
-  // otherwise back up Nexus's own keys and off would restore them.
-  const deviceBackup = priorState?.deviceBackup ?? (await backupDeviceCatalogConfig(home));
   await applyDeviceCatalogConfig(home, shimUrl);
-  await markHarnessEnabled(home);
 
   const migrated = await migrateSkillsPlugin(home, { log });
   if (migrated) log(`Copied ${migrated} skills/plugin file(s) into the 3p deployment.`);
 
-  await writeFileAtomic(profileStatePath(home), JSON.stringify({
-    enabled: true, lane: "profile", port, profileId, backup, deviceBackup,
-    connectors: connectors.map((c) => c.name),
-    excludedConnectors: priorState?.excludedConnectors ?? durableStore.excluded,
-    writtenAt: new Date().toISOString(),
-  }, null, 2));
+  await writeState(true);
 
   // Reconcile the freshly written profile with every detection source (session
   // files, pre-Nexus config, org registry) — this is what actually lands
@@ -1228,11 +1383,11 @@ export async function enableProfileLane(home, {
     const state = await readJson(profileStatePath(home));
     if (state?.connectors) {
       state.connectors = synced.migrated.map((e) => e.name);
-      await writeFileAtomic(profileStatePath(home), JSON.stringify(state, null, 2));
+      await writePrivateFileAtomic(profileStatePath(home), JSON.stringify(state, null, 2));
     }
   }
   return { port, profileId, connectors: synced?.total ?? connectors.length, migrated,
-    models: [...models.map((m) => m.labelOverride ?? m.name), ...customModels.map((m) => m.label)] };
+    models: [...models.map((m) => m.labelOverride ?? m.name), ...offeredCustomModels.map((m) => m.label)] };
 }
 
 /** Disable the profile lane: restore the backed-up profiles (or remove ours) and stop the shim. */
@@ -1242,17 +1397,21 @@ export async function disableProfileLane(home, {
   readdirFn = readdir,
 } = {}) {
   const state = await readProfileState(home);
-  if (!state) { log("Desktop profile lane is not configured; nothing to do."); return; }
+  if (!state) {
+    await removeDesktopCredential(claudeDesktopDataDir(home));
+    log("Desktop profile lane is not configured; nothing to do.");
+    return;
+  }
 
   const lib = configLibraryDir(home);
   const meta = await readJson(path.join(lib, "_meta.json"));
   // Snapshot the connector setup before the profile/state files go away, so a
   // later on restores it (see the durable connector store).
   try {
-    const profile = state.profileId ? await readJson(path.join(lib, `${state.profileId}.json`)) : null;
+    const profile = state.profileId ? await readJson(profilePath(lib, state.profileId)) : null;
     await persistConnectorStore(home, { servers: profile?.managedMcpServers, excluded: state.excludedConnectors });
     const hosts = userEgressHosts(profile);
-    if (hosts) await writeFileAtomic(egressStorePath(home), JSON.stringify(hosts, null, 2));
+    if (hosts) await writePrivateFileAtomic(egressStorePath(home), JSON.stringify(hosts, null, 2));
     else await rm(egressStorePath(home), { force: true });
   } catch { /* best effort — the store may already hold the latest writes */ }
   await restoreDeviceCatalogConfig(home, state.deviceBackup).catch((error) => log(`Device config restore skipped: ${error?.message ?? error}`));
@@ -1264,16 +1423,23 @@ export async function disableProfileLane(home, {
     await restoreProfileLibrary(lib, state.backup, { profileId: state.profileId, meta, readdirFn });
     await sanitizeAppliedId(lib, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`);
     log("Restored the Desktop setup you had before.");
-  } else if (meta?.appliedId === state.profileId) {
-    await rm(path.join(lib, `${state.profileId}.json`), { force: true });
-    const entries = (meta.entries ?? []).filter((e) => e.id !== state.profileId);
-    await writeFileAtomic(path.join(lib, "_meta.json"), JSON.stringify({ appliedId: entries[0]?.id ?? null, entries }, null, 2), { mode: 0o600 });
-    await sanitizeAppliedId(lib, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`);
-    log("Removed the Fireworks provider profile.");
   } else {
-    log("The applied 3p profile is not ours; leaving profiles untouched.");
+    // Remove ours even when the user has since selected another profile (or
+    // Default) in Desktop, keeping their selection.
+    const applied = meta?.appliedId === state.profileId;
+    const listed = Array.isArray(meta?.entries) && meta.entries.some((e) => e?.id === state.profileId);
+    const ourFile = profilePath(lib, state.profileId);
+    if (ourFile) await rm(ourFile, { force: true });
+    if (applied || listed) {
+      const entries = (meta.entries ?? []).filter((e) => e?.id !== state.profileId);
+      const appliedId = applied ? (entries[0]?.id ?? null) : meta.appliedId;
+      await writeFileAtomic(path.join(lib, "_meta.json"), JSON.stringify({ ...meta, appliedId, entries }, null, 2), { mode: 0o600 });
+      await sanitizeAppliedId(lib, `http://127.0.0.1:${state.port ?? SHIM_DEFAULT_PORT}`);
+    }
+    log("Removed the Fireworks provider profile.");
   }
 
+  await removeDesktopCredential(claudeDesktopDataDir(home));
   if (process.env.NEXUS_TEST !== "1" && allowSystemChanges) {
     await stopShimService({ allowSystemChanges, label: SHIM_LABEL, unitPath: shimServicePath(home) });
     await retireLegacyShimAgent(home, { allowSystemChanges }).catch(() => {});

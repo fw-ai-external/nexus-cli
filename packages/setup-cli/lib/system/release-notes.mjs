@@ -93,7 +93,7 @@ async function readReleaseNotesState(statePath) {
   }
 }
 
-async function printUnseenReleaseNotes({
+export async function printUnseenReleaseNotes({
   home,
   releases,
   output,

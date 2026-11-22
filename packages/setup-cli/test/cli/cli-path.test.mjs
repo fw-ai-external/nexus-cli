@@ -7,10 +7,50 @@ import assert from "node:assert/strict";
 import {
   keyExportCommand,
   resolveCliPath,
+  shellQuote,
 } from "../../lib/cli/path.mjs";
 import { withTempHome } from "../helpers.mjs";
+import { stableNodeExec } from "../../lib/system/node-exec.mjs";
+import { claudeStatusLineCommand } from "../../lib/harnesses/claude/statusline.mjs";
 
 describe("cli-path", () => {
+  it("uses an existing Homebrew opt Node in saved helper and status-line commands", async () => {
+    await withTempHome("cli-stable-node", async (home) => {
+      const previous = process.execPath;
+      const cellar = path.join(home, "brew prefix", "Cellar/node@24/24.21.0/bin/node");
+      const stable = path.join(home, "brew prefix", "opt/node@24/bin/node");
+      const entry = path.join(home, "nexus.mjs");
+      await mkdir(path.join(home, ".local/bin"), { recursive: true });
+      await writeFile(entry, "");
+      await symlink(entry, path.join(home, ".local/bin/nexus"));
+      process.execPath = cellar;
+      try {
+        for (const available of [false, true]) {
+          if (available) {
+            await mkdir(path.dirname(stable), { recursive: true });
+            await writeFile(stable, "");
+          }
+          const expected = `${shellQuote(available ? stable : cellar)} `;
+          assert.ok(keyExportCommand(home).startsWith(expected));
+          assert.ok(claudeStatusLineCommand().startsWith(expected));
+        }
+      } finally { process.execPath = previous; }
+    });
+  });
+  it("quotes an interpreter path containing spaces and shell metacharacters", async () => {
+    await withTempHome("cli-path-interpreter", async (home) => {
+      const binDir = path.join(home, ".local/bin");
+      const entry = path.join(home, "nexus.mjs");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(entry, "");
+      await symlink(entry, path.join(binDir, "nexus"));
+      const previous = process.execPath;
+      process.execPath = "/example/Node's runtime/node;echo example";
+      try {
+        assert.equal(keyExportCommand(home), `${shellQuote(process.execPath)} ${shellQuote(realpathSync(entry))} --home ${shellQuote(home)} key export --stored-only`);
+      } finally { process.execPath = previous; }
+    });
+  });
   it("follows npm-global launcher symlink to nexus.mjs for apiKeyHelper", async () => {
     await withTempHome("cli-path-symlink", async (home) => {
       const binDir = path.join(home, ".local/bin");
@@ -28,7 +68,7 @@ describe("cli-path", () => {
       assert.equal(resolved, realpathSync(entry));
 
       const cmd = keyExportCommand(home);
-      assert.match(cmd, new RegExp(`^${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} `));
+      assert.ok(cmd.startsWith(`${shellQuote(stableNodeExec(process.execPath))} `));
       assert.match(cmd, /--home /);
       assert.match(cmd, /nexus\.mjs --home .+ key export --stored-only$/);
     });

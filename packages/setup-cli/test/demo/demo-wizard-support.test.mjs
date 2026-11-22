@@ -16,7 +16,7 @@ import {
 } from "../../lib/demo/demo-models.mjs";
 import { buildServerlessCatalogSnapshot } from "../../lib/fireworks/models.mjs";
 import { setServerlessCatalogSnapshot } from "../../lib/fireworks/serverless-catalog-cache.mjs";
-import { mockServerlessModel } from "../helpers.mjs";
+import { mockServerlessModelRows } from "../helpers.mjs";
 import {
   assessDemoReadiness,
   formatReadinessError,
@@ -31,15 +31,17 @@ import {
 // Alias routers (`glm-fast-latest`, `kimi-fast-latest`, `glm-latest`) are only
 // offered via the API's per-row `aliases` after the refactor, so warm the demo
 // picker with them before resolving wizard defaults against them.
+// Standard and fast rows each: a `-fast-latest` alias needs its model's fast
+// mode listed.
 const WIZARD_ALIAS_ROWS = [
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/glm-5p2",
     aliases: [
       "accounts/fireworks/routers/glm-latest",
       "accounts/fireworks/routers/glm-fast-latest",
     ],
   }),
-  mockServerlessModel({
+  ...mockServerlessModelRows({
     name: "accounts/fireworks/models/kimi-k3",
     aliases: ["accounts/fireworks/routers/kimi-fast-latest"],
   }),
@@ -96,7 +98,7 @@ test("resolveDemoWizardDefaults: CLI overrides beat saved prefs", () => withDemo
   assert.equal(resolved.matchupPresetId, CUSTOM_MATCHUP_ID);
 }));
 
-test("resolveDemoWizardDefaults: saved matchup applies when no CLI models", () => {
+test("resolveDemoWizardDefaults: saved matchup applies when no CLI models", () => withDemoCatalog(() => {
   const resolved = resolveDemoWizardDefaults({
     saved: {
       leftModel: "opus",
@@ -106,9 +108,9 @@ test("resolveDemoWizardDefaults: saved matchup applies when no CLI models", () =
   });
   assert.equal(resolved.leftModel, "auto");
   assert.equal(resolved.rightModel, "glm-fast-latest");
-});
+}));
 
-test("resolveDemoWizardDefaults: restores saved custom matchup models", () => {
+test("resolveDemoWizardDefaults: restores saved custom matchup models", () => withDemoCatalog(() => {
   const resolved = resolveDemoWizardDefaults({
     saved: {
       leftModel: "sonnet",
@@ -120,7 +122,7 @@ test("resolveDemoWizardDefaults: restores saved custom matchup models", () => {
   // A saved FireRouter model is retired: the pair sanitizer falls back.
   assert.equal(resolved.rightModel, "glm-fast-latest");
   assert.equal(resolved.matchupPresetId, "custom");
-});
+}));
 
 test("resolveDemoWizardDefaults: saved custom duplicate pair is deduped", () => {
   const resolved = resolveDemoWizardDefaults({
@@ -133,7 +135,7 @@ test("resolveDemoWizardDefaults: saved custom duplicate pair is deduped", () => 
   assert.notEqual(resolved.leftModel, resolved.rightModel);
 });
 
-test("resolveDemoWizardDefaults: saved custom ignores stale catalog ids", () => {
+test("resolveDemoWizardDefaults: saved custom ignores stale catalog ids", () => withDemoCatalog(() => {
   const resolved = resolveDemoWizardDefaults({
     saved: {
       leftModel: "glm-5p2-fast",
@@ -143,7 +145,7 @@ test("resolveDemoWizardDefaults: saved custom ignores stale catalog ids", () => 
   });
   assert.equal(resolved.leftModel, defaultLeftModel());
   assert.equal(resolved.rightModel, "glm-fast-latest");
-});
+}));
 
 test("resolveDemoWizardDefaults: dedupes identical left/right", () => {
   const resolved = resolveDemoWizardDefaults({
@@ -153,16 +155,16 @@ test("resolveDemoWizardDefaults: dedupes identical left/right", () => {
   assert.notEqual(resolved.leftModel, resolved.rightModel);
 });
 
-test("resolveDemoWizardDefaults: fresh run selects the first matchup option, not custom", () => {
+test("resolveDemoWizardDefaults: fresh run selects the first matchup option, not custom", () => withDemoCatalog(() => {
   // No saved prefs, no CLI overrides — the wizard must open on the first
   // option ("Claude Opus vs Fireworks") with its models, not drift to custom.
   const resolved = resolveDemoWizardDefaults({});
   assert.equal(resolved.matchupPresetId, "subscription-vs-fireworks");
   assert.equal(resolved.leftModel, "opus");
   assert.equal(resolved.rightModel, "glm-fast-latest");
-});
+}));
 
-test("resolveDemoWizardDefaults: fresh run ignores live status mapping drift", () => {
+test("resolveDemoWizardDefaults: fresh run ignores live status mapping drift", () => withDemoCatalog(() => {
   // Even when the user's live Claude opus slot is a Fireworks model (which used
   // to seed the right side and drift to custom), a fresh run stays on the first
   // matchup option.
@@ -172,7 +174,7 @@ test("resolveDemoWizardDefaults: fresh run ignores live status mapping drift", (
   assert.equal(resolved.matchupPresetId, "subscription-vs-fireworks");
   assert.equal(resolved.leftModel, "opus");
   assert.equal(resolved.rightModel, "glm-fast-latest");
-});
+}));
 
 test("resolveDemoWizardDefaults: dedupes identical default-right pairs", () => withDemoCatalog(() => {
   const resolved = resolveDemoWizardDefaults({
@@ -208,7 +210,7 @@ test("resolveDemoWizardDefaults: sanitize that flips orientation marks custom", 
   assert.equal(resolved.matchupPresetId, CUSTOM_MATCHUP_ID);
 }));
 
-test("resolveDemoWizardDefaults: keeps curated id when models still match", () => {
+test("resolveDemoWizardDefaults: keeps curated id when models still match", () => withDemoCatalog(() => {
   const resolved = resolveDemoWizardDefaults({
     cliLeft: "opus",
     cliRight: "opus",
@@ -217,7 +219,7 @@ test("resolveDemoWizardDefaults: keeps curated id when models still match", () =
   assert.equal(resolved.leftModel, "opus");
   assert.equal(resolved.rightModel, "glm-fast-latest");
   assert.equal(resolved.matchupPresetId, "subscription-vs-fireworks");
-});
+}));
 
 test("demo preferences: round-trip under ~/.nexus/demo.json", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "fc-demo-prefs-"));

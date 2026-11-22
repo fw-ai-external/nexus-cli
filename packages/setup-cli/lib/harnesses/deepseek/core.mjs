@@ -1,3 +1,4 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, lstat, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -6,13 +7,14 @@ import { parseDocument, stringify } from "yaml";
 import {
   defaultMainModel,
   dropRetiredModelId,
-  isFirerouterModelPattern,
   isRetiredModelId,
   normalizeModelId,
   shortFireworksModelRef,
 } from "../../fireworks/model-id.mjs";
 import { isAutoModelId, resolveFireworksCatalog } from "../../fireworks/model-specs.mjs";
 import { autoDisplayName, prettyModelName, warmServerlessPricingCache } from "../../fireworks/models.mjs";
+import { resolveManagedDisplayName } from "../../fireworks/model-display.mjs";
+import { planModelList } from "../../harness/catalog-refresh.mjs";
 import { readJsonIfExists, writeJson } from "../../io/json.mjs";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 import { omitHeaders } from "../../firerouter/core.mjs";
@@ -34,6 +36,7 @@ import {
   DEEPSEEK_PROFILE_ROOT_FILENAME,
   DEEPSEEK_PROFILES_DIRNAME,
 } from "./constants.mjs";
+import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 export {
   DEEPSEEK_API_KEY_ENV,
@@ -184,7 +187,7 @@ function credentialsDocIsEmpty(raw) {
 }
 
 /** Upsert one `NAME=value` line in dotenv text, preserving every other line. */
-function upsertEnvAssignment(raw, name, value) {
+export function upsertEnvAssignment(raw, name, value) {
   const re = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=`);
   const lines = raw.split("\n").filter((line) => line.trim() !== "");
   const idx = lines.findIndex((line) => re.test(line));
@@ -198,7 +201,7 @@ function upsertEnvAssignment(raw, name, value) {
 }
 
 /** The value of the first `NAME=value` line in dotenv text, or "" when absent. */
-function readEnvAssignment(raw, name) {
+export function readEnvAssignment(raw, name) {
   const re = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=(.*)$`);
   for (const line of raw.split("\n")) {
     const match = re.exec(line);
@@ -210,7 +213,7 @@ function readEnvAssignment(raw, name) {
 }
 
 /** Drop every `NAME=` / `export NAME=` line; empty output means delete the file. */
-function stripEnvAssignment(raw, name) {
+export function stripEnvAssignment(raw, name) {
   const re = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=`);
   const lines = raw.split("\n").filter((line) => line.trim() !== "" && !re.test(line));
   return lines.length ? `${lines.join("\n")}\n` : "";
@@ -260,7 +263,7 @@ function isManagedFireworksProvider(settings) {
   if (!provider
     || provider.apiKeyEnv !== DEEPSEEK_API_KEY_ENV
     || provider.api !== "openai-completions"
-    || provider.baseURL !== DEEPSEEK_FIREWORKS_BASE_URL) {
+    || !isFireworksInferenceUrl(provider.baseURL, DEEPSEEK_FIREWORKS_BASE_URL)) {
     return false;
   }
   return asPlainObject(settings[DEEPSEEK_DEFAULT_MODEL_NS])?.provider
@@ -281,15 +284,6 @@ export function deepseekCurrentModelId(settings) {
   return typeof model === "string" && model.trim()
     ? shortFireworksModelRef(model)
     : null;
-}
-
-/** @returns {DeepseekAuthMode} */
-export function deepseekAuthMode(settings, credentials) {
-  if (!isManagedFireworksProvider(settings)) {
-    return "missing";
-  }
-  const stored = credentials[DEEPSEEK_API_KEY_ENV];
-  return typeof stored === "string" && stored.trim() ? "literal" : "env-reference";
 }
 
 /**
@@ -356,14 +350,110 @@ export function buildDeepseekFireworksModelEntry(modelId, name) {
   };
 }
 
+/** Short gateway slug DeepSeek stores (`auto`, `<family>-latest`) for any id spelling. */
+function deepseekModelSlug(modelId) {
+  return shortFireworksModelRef(normalizeModelId(String(modelId ?? "")));
+}
+
+/**
+ * provider.models rows for the picker: `modelIds` in their order, as short
+ * slugs, deduplicated. The selection is always present (first when missing),
+ * so changing the selection never reorders the picker. A row in `keptRows`
+ * (by slug) is written back as it is, so a list kept without a fresh catalog
+ * keeps the capabilities and limits recorded when it was served; every other
+ * row is built from the catalog.
+ * @param {string} slug the selected model
+ * @param {string[] | undefined} modelIds
+ * @param {string} [modelName] display name for the selected model
+ * @param {Map<string, Record<string, unknown>>} [keptRows]
+ */
+function deepseekProviderModels(slug, modelIds, modelName, keptRows = new Map()) {
+  const listed = (modelIds ?? []).map(deepseekModelSlug);
+  const ids = [...new Set((listed.includes(slug) ? listed : [slug, ...listed]).filter(Boolean))];
+  return ids.map((id) => {
+    const kept = keptRows.get(id);
+    if (kept) {
+      return structuredClone(kept);
+    }
+    return buildDeepseekFireworksModelEntry(
+      id,
+      id === slug ? modelName : resolveManagedDisplayName(id),
+    );
+  });
+}
+
+/**
+ * The Fireworks provider's model rows by short slug, in their order. Rows
+ * without a string id are dropped (dsh rejects them anyway).
+ * @param {unknown} provider
+ * @returns {Map<string, Record<string, unknown>>}
+ */
+function providerModelRows(provider) {
+  const rows = new Map();
+  const models = asPlainObject(provider)?.models;
+  for (const row of Array.isArray(models) ? models : []) {
+    const plain = asPlainObject(row);
+    const id = typeof plain?.id === "string" ? deepseekModelSlug(plain.id) : "";
+    if (id && !rows.has(id)) {
+      rows.set(id, { ...plain, id });
+    }
+  }
+  return rows;
+}
+
+/**
+ * The Fireworks provider in a patch entry list, if Nexus routes through it.
+ * @param {unknown[]} entries
+ */
+function patchFireworksProvider(entries) {
+  for (const rawEntry of entries) {
+    const entry = asPlainObject(rawEntry);
+    if (entry && isProfilePatchEntry(entry, DEEPSEEK_LLM_PI_AI_ENTRY_ID, DEEPSEEK_LLM_PI_AI_PLUGIN)) {
+      const provider = asPlainObject(asPlainObject(asPlainObject(entry.config)?.providers)?.[DEEPSEEK_FIREWORKS_PROVIDER_ID]);
+      if (provider?.apiKeyEnv === DEEPSEEK_API_KEY_ENV) {
+        return provider;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Model rows already registered under the Fireworks provider, by short slug:
+ * from settings.yaml or, once dsh migrated it away, the first patch layer
+ * that carries the route.
+ * @param {string} settingsPath
+ * @param {Record<string, unknown>} settings
+ * @returns {Promise<Map<string, Record<string, unknown>>>}
+ */
+async function deepseekRegisteredModelRows(settingsPath, settings) {
+  if (isManagedFireworksProvider(settings)) {
+    return providerModelRows(fireworksProvider(settings));
+  }
+  for (const patchPath of await deepseekPatchPaths(settingsPath)) {
+    let patch;
+    try {
+      patch = await readDeepseekProfilePatch(patchPath);
+    } catch {
+      continue;
+    }
+    const provider = patchFireworksProvider(patch.entries);
+    if (provider) {
+      return providerModelRows(provider);
+    }
+  }
+  return new Map();
+}
+
 /**
  * Persist short gateway slugs (`kimi-k2p5`, `firerouter`, …) — not full
  * `accounts/fireworks/...` resource ids. Catalog limits come from the shared
  * serverless/static helpers via {@link buildDeepseekFireworksModelEntry}.
+ * `modelIds` lists the picker's models; the selection is always among them.
  * @param {Record<string, unknown>} settings
- * @param {{ modelId: string, modelName?: string }} opts
+ * @param {{ modelId: string, modelName?: string, modelIds?: string[], keptRows?: Map<string, Record<string, unknown>>, headers?: Record<string, string> }} opts
  */
-export function patchDeepseekFireworksSettings(settings, { modelId, modelName, headers = {} }) {
+export function patchDeepseekFireworksSettings(settings, { modelId, modelName, modelIds, keptRows, headers = {} }) {
   const slug = shortFireworksModelRef(normalizeModelId(modelId));
   const next = structuredClone(settings);
   const llm = asPlainObject(next[DEEPSEEK_LLM_PI_AI_NS]) ?? {};
@@ -373,12 +463,12 @@ export function patchDeepseekFireworksSettings(settings, { modelId, modelName, h
     displayName: "Fireworks",
     apiKeyEnv: DEEPSEEK_API_KEY_ENV,
     api: "openai-completions",
-    baseURL: DEEPSEEK_FIREWORKS_BASE_URL,
+    baseURL: fireworksInferenceUrl(DEEPSEEK_FIREWORKS_BASE_URL, activeAccountResidency("deepseek")),
     // dsh's llm-pi-ai provider profile carries per-provider request
     // headers (`headers` dict in its schema); rebuilt wholesale here,
     // so a later `on` without them removes them again.
     ...(Object.keys(headers).length ? { headers } : {}),
-    models: [buildDeepseekFireworksModelEntry(slug, modelName)],
+    models: deepseekProviderModels(slug, modelIds, modelName, keptRows),
   };
   llm.providers = providers;
   next[DEEPSEEK_LLM_PI_AI_NS] = llm;
@@ -520,18 +610,18 @@ function isProfilePatchEntry(entry, id, plugin) {
  * preserved; missing entries are appended in the shape dsh's legacy-settings
  * import writes.
  * @param {unknown[]} entries
- * @param {{ modelId: string, modelName?: string }} opts
+ * @param {{ modelId: string, modelName?: string, modelIds?: string[], keptRows?: Map<string, Record<string, unknown>>, headers?: Record<string, string> }} opts
  * @returns {Record<string, unknown>[]}
  */
-export function patchDeepseekProfilePatchEntries(entries, { modelId, modelName, headers = {} }) {
+export function patchDeepseekProfilePatchEntries(entries, { modelId, modelName, modelIds, keptRows, headers = {} }) {
   const slug = shortFireworksModelRef(normalizeModelId(modelId));
   const fireworksProvider = {
     displayName: "Fireworks",
     apiKeyEnv: DEEPSEEK_API_KEY_ENV,
     api: "openai-completions",
-    baseURL: DEEPSEEK_FIREWORKS_BASE_URL,
+    baseURL: fireworksInferenceUrl(DEEPSEEK_FIREWORKS_BASE_URL, activeAccountResidency("deepseek")),
     ...(Object.keys(headers).length ? { headers } : {}),
-    models: [buildDeepseekFireworksModelEntry(slug, modelName)],
+    models: deepseekProviderModels(slug, modelIds, modelName, keptRows),
   };
   /** @type {Record<string, unknown>[]} */
   const next = entries.map((entry) => structuredClone(asPlainObject(entry) ?? {}));
@@ -738,6 +828,8 @@ export async function enableDeepseekFireworks({
   effectiveApiKey: effectiveApiKeyInput = "",
   modelId,
   headers = {},
+  catalogModelIds = [],
+  catalogAvailable = catalogModelIds.length > 0,
 }) {
   const effectiveApiKey = effectiveApiKeyInput.trim();
   if (!effectiveApiKey) {
@@ -806,13 +898,33 @@ export async function enableDeepseekFireworks({
       },
       profilePatchSnapshots: patchSnapshots,
     };
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
-    await writeJson(backupPath, backup);
+    ensurePrivateParent(backupPath);
+    await writeJson(backupPath, backup, { mode: 0o600 });
     await chmod(backupPath, 0o600);
   }
 
+  // Shared list policy (lib/harness/catalog-refresh.mjs): a fresh install
+  // seeds the account's catalog, a re-`on` reconciles with it, and an
+  // unavailable catalog keeps the registered list as it is.
+  const currentRows = await deepseekRegisteredModelRows(settingsPath, settingsSnap.settings);
+  const currentIds = [...currentRows.keys()];
+  const modelIds = planModelList({
+    currentIds,
+    freshIds: catalogModelIds.map(deepseekModelSlug).filter(Boolean),
+    catalogAvailable,
+    freshInstall: currentIds.length === 0,
+    selectedId: storedModel,
+    keepUnserved: (id) => isAutoModelId(id) && !isRetiredModelId(id),
+  }).filter((id) => id === storedModel || !isRetiredModelId(id));
+  // Rows the catalog serves are re-rendered from it (names, limits and
+  // prices drift). Without a fresh catalog, kept rows stay as written: the
+  // snapshot that described them may be gone (another account's cache).
+  const keptRows = catalogAvailable ? new Map() : currentRows;
+
   const nextSettings = patchDeepseekFireworksSettings(settingsSnap.settings, {
     modelId: storedModel,
+    modelIds,
+    keptRows,
     headers,
   });
   const nextCredentials = {
@@ -848,17 +960,26 @@ export async function enableDeepseekFireworks({
     } catch {
       continue; // Unparseable user patch (e.g. !!js expressions) — leave it alone.
     }
-    const raw = serializeProfilePatch(patchDeepseekProfilePatchEntries(patch.entries, { modelId: storedModel, headers }));
+    const raw = serializeProfilePatch(patchDeepseekProfilePatchEntries(patch.entries, { modelId: storedModel, modelIds, keptRows, headers }));
     await writeFileAtomic(patchPath, raw, { mode: 0o600 });
   }
 
   return {
     model: storedModel,
-    modelsAdded: [storedModel],
+    modelsAdded: modelIds,
     modelSpec: `${DEEPSEEK_FIREWORKS_PROVIDER_ID}:${storedModel}`,
     authMode: "literal",
     apiKeyMode: "literal",
   };
+}
+
+/**
+ * A provider's rows minus retired ones: a migration has no catalog, so it
+ * keeps the rest of the picker exactly as written.
+ * @param {unknown} provider
+ */
+function supportedProviderModelRows(provider) {
+  return new Map([...providerModelRows(provider)].filter(([id]) => !isRetiredModelId(id)));
 }
 
 /**
@@ -880,8 +1001,11 @@ export async function migrateDeepseekFirerouterModel({ settingsPath }) {
   if (isManagedFireworksProvider(settingsSnap.settings)
     && isRetiredModelId(deepseekCurrentModelId(settingsSnap.settings) ?? "")) {
     const provider = fireworksProvider(settingsSnap.settings);
+    const keptRows = supportedProviderModelRows(provider);
     await writeFileAtomic(settingsPath, serializeYaml(patchDeepseekFireworksSettings(settingsSnap.settings, {
       modelId: target,
+      modelIds: [...keptRows.keys()],
+      keptRows,
       headers: asPlainObject(provider?.headers) ?? {},
     })), { mode: 0o600 });
     changed = true;
@@ -898,15 +1022,23 @@ export async function migrateDeepseekFirerouterModel({ settingsPath }) {
       continue;
     }
     let headers = {};
+    let keptRows = new Map();
     for (const rawEntry of patch.entries) {
       const entry = asPlainObject(rawEntry);
       if (entry && isProfilePatchEntry(entry, DEEPSEEK_LLM_PI_AI_ENTRY_ID, DEEPSEEK_LLM_PI_AI_PLUGIN)) {
-        headers = asPlainObject(asPlainObject(asPlainObject(entry.config)?.providers)?.[DEEPSEEK_FIREWORKS_PROVIDER_ID]?.headers) ?? {};
+        const provider = asPlainObject(asPlainObject(asPlainObject(entry.config)?.providers)?.[DEEPSEEK_FIREWORKS_PROVIDER_ID]);
+        headers = asPlainObject(provider?.headers) ?? {};
+        keptRows = supportedProviderModelRows(provider);
       }
     }
     await writeFileAtomic(
       patchPath,
-      serializeProfilePatch(patchDeepseekProfilePatchEntries(patch.entries, { modelId: target, headers })),
+      serializeProfilePatch(patchDeepseekProfilePatchEntries(patch.entries, {
+        modelId: target,
+        modelIds: [...keptRows.keys()],
+        keptRows,
+        headers,
+      })),
       { mode: 0o600 },
     );
     changed = true;

@@ -102,6 +102,10 @@ export function liveMeterKeyHint({ canPickSession = false } = {}) {
  *   sleep?: (ms: number) => Promise<void>,
  *   promptAgent?: typeof promptClaudeUsageAgent,
  *   promptSession?: (opts: { home: string, input?: NodeJS.ReadStream, output?: NodeJS.WriteStream }) => Promise<string | null>,
+ *   translate?: (filePath: string) => (record: any) => any[],
+ *   sessionLabelOf?: (filePath: string) => string,
+ *   refreshServed?: (sessionPath: string) => Promise<boolean>,
+ *   harnessName?: string,
  * }} opts
  */
 export async function runClaudeUsageLive({
@@ -117,13 +121,35 @@ export async function runClaudeUsageLive({
   sleep,
   promptAgent = promptClaudeUsageAgent,
   promptSession,
+  // Hooks for a harness whose logs are not Claude-shaped (see
+  // `runUsageMeter`); unset, the meter reads Claude Code logs as before.
+  translate,
+  sessionLabelOf,
+  refreshServed,
+  harnessName = "Claude Code",
 } = {}) {
   if (!home) {
-    throw new Error("HOME is required to follow Claude Code session usage.");
+    throw new Error(`HOME is required to follow ${harnessName} session usage.`);
   }
 
-  let sessionPath = await resolveSession({ home, session });
 
+  let sessionPath = await resolveSession({ home, session });
+  /** Meter options every run of this session shares. */
+  const harnessMeterOptions = () => ({
+    ...(translate ? { translate } : {}),
+    ...(sessionLabelOf ? { sessionLabel: sessionLabelOf(sessionPath) } : {}),
+    ...(refreshServed
+      ? {
+        refreshServed: async () => {
+          const changed = await refreshServed(sessionPath);
+          // Newly known models reprice the agents too: drop the shared listing.
+          if (changed) agentsMemo = null;
+          return changed;
+        },
+      }
+      : {}),
+    ...(harnessName !== "Claude Code" ? { harnessName } : {}),
+  });
   // `listAgents` prices every subagent log in the session, so back-to-back
   // callers (find Main, then compute the first frame's peer total) would read
   // the same files twice. Share a result for a beat; the meter's peer refresh
@@ -191,6 +217,7 @@ export async function runClaudeUsageLive({
       sleep,
       agentLabel: "Main",
       readPeers: () => peersExcluding(sessionPath),
+      ...harnessMeterOptions(),
     });
   }
 
@@ -277,6 +304,7 @@ export async function runClaudeUsageLive({
         // Handed back so a keypress repaints at once instead of waiting out the
         // poll interval, which made pane navigation feel unresponsive.
         onReady: (dashboard) => { repaint = () => dashboard.draw(); },
+        ...harnessMeterOptions(),
       });
       // Stop repainting a dashboard whose run has ended.
       repaint = null;
@@ -353,6 +381,7 @@ export async function runClaudeUsageLive({
         trackingId: current.id,
         trackingLabel: current.label,
         listAgents,
+        ...(sessionLabelOf ? { sessionLabel: sessionLabelOf(sessionPath) } : {}), harnessName,
       });
     } catch {
       continue;

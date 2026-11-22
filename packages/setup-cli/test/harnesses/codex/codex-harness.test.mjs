@@ -19,7 +19,6 @@ import { parseToml } from "../../../lib/harnesses/codex/toml.mjs";
 import {
   FIRECONNECT_REFERER,
   FW_CODEX_KEY,
-  SK_ANT_KEY,
   mockServerlessModel,
   runFireconnect,
   seedKeychainConfig,
@@ -145,7 +144,7 @@ describe("codex harness integration", () => {
     assert.equal(result.code, 0, result.stderr);
     const config = await readFile(codexConfigPath(home), "utf8");
     assert.match(config, /model_provider = "fireworks-ai"/);
-    assert.match(config, /^model = "auto"$/m);
+    assert.match(config, /^model = "nexus\/auto"$/m);
     assert.doesNotMatch(config, /x-anthropic-api-key/);
     assert.doesNotMatch(result.stderr, /ANTHROPIC_API_KEY or workspace BYOK/);
   });
@@ -170,10 +169,10 @@ describe("codex harness integration", () => {
     const rerun = await (await runFireconnect(["login", "--api-key", apiKey], { HOME: home, FIREWORKS_API_KEY: "" }), await runFireconnect(["codex", "on"], { HOME: home, FIREWORKS_API_KEY: "" }));
     assert.equal(rerun.code, 0, rerun.stderr);
     const afterRerun = await readFile(codexConfigPath(home), "utf8");
-    assert.match(afterRerun, /^model = "auto"$/m);
+    assert.match(afterRerun, /^model = "nexus\/auto"$/m);
     assert.match(afterRerun, /model_catalog_json/);
     const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
-    assert.ok(slugs.includes("auto"));
+    assert.ok(slugs.includes("nexus/auto"));
     assert.ok(!slugs.includes("firerouter/test-model"));
   });
 
@@ -419,7 +418,7 @@ describe("codex harness integration", () => {
 
     const unknown = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" }), await runFireconnect(["codex", "on", "--model", "gpt-example-model"], { HOME: home, FIREWORKS_API_KEY: "" }));
     assert.notEqual(unknown.code, 0);
-    assert.match(unknown.stderr, /not available on Fireworks/);
+    assert.match(unknown.stderr, /isn't in this account's model list/);
   });
 
   it("Codex forwards only the saved Anthropic key: never an OpenAI key, never an exported key", async () => {
@@ -594,7 +593,7 @@ describe("codex harness integration", () => {
 
     const on = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env));
     assert.equal(on.code, 0, on.stderr);
-    assert.match(await readFile(configPath, "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
     assert.match(on.stdout, /Codex → Fireworks · auto\n/);
     assert.match(on.stdout, /GPT turns use your plan/);
     assert.equal((await providerTable()).requires_openai_auth, true);
@@ -607,14 +606,14 @@ describe("codex harness integration", () => {
 
     const reOn = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env));
     assert.equal(reOn.code, 0, reOn.stderr);
-    assert.match(await readFile(configPath, "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
     assert.equal((await providerTable()).requires_openai_auth, true);
 
     // After `off`, the next `on` is a first one again.
     assert.equal((await runFireconnect(["codex", "off"], env)).code, 0);
     const again = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env));
     assert.equal(again.code, 0, again.stderr);
-    assert.match(await readFile(configPath, "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
     assert.equal((await providerTable()).requires_openai_auth, true);
   });
 
@@ -706,7 +705,7 @@ describe("codex harness integration", () => {
       assert.notEqual(rejected.code, 0, model);
       assert.match(rejected.stderr, /is no longer supported/, model);
     }
-    assert.match(await readFile(codexConfigPath(home), "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(codexConfigPath(home), "utf8"), /^model = "nexus\/auto"$/m);
     assert.deepEqual(await catalogSlugs(), slugs);
   });
 
@@ -720,7 +719,7 @@ describe("codex harness integration", () => {
     // What an earlier release saved for `--model firerouter/astra`.
     await writeFile(
       configPath,
-      (await readFile(configPath, "utf8")).replace(/^model = "auto"$/m, 'model = "firerouter/astra"'),
+      (await readFile(configPath, "utf8")).replace(/^model = "nexus\/auto"$/m, 'model = "firerouter/astra"'),
     );
     const seededCatalog = JSON.parse(await readFile(codexCatalogPath(home), "utf8"));
     seededCatalog.models.push({ slug: "firerouter/astra", display_name: "FireRouter · Astra" });
@@ -734,7 +733,7 @@ describe("codex harness integration", () => {
 
     const reOn = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env));
     assert.equal(reOn.code, 0, reOn.stderr);
-    assert.match(await readFile(configPath, "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
     const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
     assert.deepEqual(slugs.filter((slug) => slug.startsWith("firerouter")), []);
   });
@@ -747,7 +746,7 @@ describe("codex harness integration", () => {
     assert.equal((await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env))).code, 0);
     await writeFile(
       configPath,
-      (await readFile(configPath, "utf8")).replace(/^model = "auto"$/m, 'model = "firerouter/astra"'),
+      (await readFile(configPath, "utf8")).replace(/^model = "nexus\/auto"$/m, 'model = "firerouter/astra"'),
     );
     // 0.9.8 and 0.9.9 wrote the FireRouter row with the Astra slug.
     const catalog = JSON.parse(await readFile(codexCatalogPath(home), "utf8"));
@@ -756,7 +755,7 @@ describe("codex harness integration", () => {
 
     const reOn = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env));
     assert.equal(reOn.code, 0, reOn.stderr);
-    assert.match(await readFile(configPath, "utf8"), /^model = "auto"$/m);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
     const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
     assert.deepEqual(slugs.filter((slug) => slug.startsWith("firerouter")), []);
     assert.equal(
@@ -789,7 +788,7 @@ describe("codex harness integration", () => {
     const on = await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" }), await runFireconnect(["codex", "on", "--model", "auto"], { HOME: home, FIREWORKS_API_KEY: "" }));
     assert.equal(on.code, 0, on.stderr);
     const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
-    assert.ok(slugs.includes("auto"));
+    assert.ok(slugs.includes("nexus/auto"));
     assert.ok(!slugs.includes("firerouter"), slugs.join(","));
     assert.ok(slugs.includes("gpt-6-astra") && slugs.includes("gpt-6-luna"), slugs.join(","));
   });
@@ -820,7 +819,7 @@ describe("codex harness integration", () => {
       }));
     assert.equal(result.code, 0, result.stderr);
     const config = await readFile(codexConfigPath(home), "utf8");
-    assert.match(config, /model = "auto"/);
+    assert.match(config, /model = "nexus\/auto"/);
     assert.doesNotMatch(config, /env_http_headers = \{ "x-anthropic-api-key"/);
   });
 
@@ -845,7 +844,7 @@ describe("codex harness integration", () => {
     assert.equal((await runFireconnect(["codex", "on"], { HOME: home, ...env })).code, 0);
     await writeFile(
       codexConfigPath(home),
-      (await readFile(codexConfigPath(home), "utf8")).replace(/^model = "auto"$/m, 'model = "firerouter/opus"'),
+      (await readFile(codexConfigPath(home), "utf8")).replace(/^model = "nexus\/auto"$/m, 'model = "firerouter/opus"'),
     );
     let raw = await readFile(codexConfigPath(home), "utf8");
     assert.match(raw, /^model = "firerouter\/opus"$/m);
@@ -853,7 +852,7 @@ describe("codex harness integration", () => {
     const plain = await runFireconnect(["codex", "on"], { HOME: home, ...env });
     assert.equal(plain.code, 0, plain.stderr);
     raw = await readFile(codexConfigPath(home), "utf8");
-    assert.match(raw, /^model = "auto"$/m);
+    assert.match(raw, /^model = "nexus\/auto"$/m);
     assert.match(raw, /"x-anthropic-api-key" = "sk-ant-stored"/);
     assert.doesNotMatch(raw, /ANTHROPIC_API_KEY|sk-ant-shell-only/);
     assert.doesNotMatch(raw, /x-openai-api-key|sk-example-0000/);
@@ -883,7 +882,7 @@ describe("codex harness integration", () => {
 
     const enabled = await readFile(configPath, "utf8");
     assert.match(enabled, /model_provider = "fireworks-ai"/);
-    assert.match(enabled, /^model = "auto"$/m);
+    assert.match(enabled, /^model = "nexus\/auto"$/m);
     assert.match(enabled, /\[model_providers\.fireworks-ai\]/);
     assert.doesNotMatch(enabled, /profile = "fireconnect"/);
     assert.doesNotMatch(enabled, /\[profiles\.nexus\]/);
@@ -901,6 +900,38 @@ describe("codex harness integration", () => {
 
     const restored = await readFile(configPath, "utf8");
     assert.equal(restored, original);
+    assert.equal(existsSync(catalogPath), false);
+  });
+
+  it("a re-on moves an earlier release's bare auto to nexus/auto, and off still restores byte-for-byte", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "fc-codex-auto-slug-"));
+    const configPath = codexConfigPath(home);
+    const catalogPath = codexCatalogPath(home);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = 'model_provider = "openai"\nmodel = "gpt-4.1"\n';
+    await writeFile(configPath, original);
+    const env = { HOME: home, FIREWORKS_API_KEY: "" };
+    assert.equal((await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env))).code, 0);
+
+    // What a release before the nexus/auto slug wrote: `auto` in both files.
+    await writeFile(configPath, (await readFile(configPath, "utf8")).replace(/^model = "nexus\/auto"$/m, 'model = "auto"'));
+    const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
+    catalog.models = catalog.models.map((row) => (row.slug === "nexus/auto"
+      ? { ...row, slug: "auto", auto_review_model_override: "auto" }
+      : row));
+    await writeFile(catalogPath, JSON.stringify(catalog));
+    assert.equal(JSON.parse((await runFireconnect(["codex", "status", "--json"], env)).stdout).current.main, "auto");
+
+    const reon = await runFireconnect(["codex", "on"], env);
+    assert.equal(reon.code, 0, reon.stderr);
+    assert.match(await readFile(configPath, "utf8"), /^model = "nexus\/auto"$/m);
+    const slugs = JSON.parse(await readFile(catalogPath, "utf8")).models.map((row) => row.slug);
+    assert.deepEqual(slugs.filter((slug) => slug.endsWith("auto")), ["nexus/auto"], slugs.join(","));
+    assert.equal(JSON.parse((await runFireconnect(["codex", "status", "--json"], env)).stdout).current.main, "auto");
+
+    const off = await runFireconnect(["codex", "off"], { HOME: home });
+    assert.equal(off.code, 0, off.stderr);
+    assert.equal(await readFile(configPath, "utf8"), original);
     assert.equal(existsSync(catalogPath), false);
   });
 
@@ -1135,7 +1166,7 @@ describe("codex harness integration", () => {
     await writeFile(configPath, legacyCanonical);
     assert.equal((await (await runFireconnect(["login", "--api-key", "fw_test_key_12345"], env), await runFireconnect(["codex", "on"], env))).code, 0);
     await assert.rejects(access(backupPath));
-    assert.match(await readFile(configPath, "utf8"), /model = "auto"/);
+    assert.match(await readFile(configPath, "utf8"), /model = "nexus\/auto"/);
 
     let offResult = await runFireconnect(["codex", "off"], { HOME: home });
     assert.equal(offResult.code, 0);

@@ -7,6 +7,8 @@
  * migrate.ts` in OpenCode), so both keys describe the same provider.
  */
 
+import { isDeepStrictEqual } from "node:util";
+
 const AISDK_PREFIX = "aisdk:";
 const DEFAULT_CAPABILITIES = { tools: true, input: ["text", "image"], output: ["text"] };
 
@@ -183,6 +185,24 @@ export function mirrorOpencodeV2Providers(config, ownedIds) {
     }
   }
   return { ...config, providers };
+}
+
+/**
+ * Whether `providers[id]` is still the mirror Nexus wrote for `provider[id]`:
+ * absent, or structurally equal to the entry `mirrorOpencodeV2Providers`
+ * would rebuild from the v1 entry right now. A `providers[id]` that differs
+ * is the entry OpenCode v2 actually uses, and the user authored it.
+ * @param {Record<string, any>} config
+ * @param {string} id
+ */
+export function isMirroredOpencodeV2Provider(config, id) {
+  if (!isPlainObject(config.providers) || config.providers[id] === undefined) {
+    return true;
+  }
+  if (!isPlainObject(config.provider?.[id])) {
+    return false;
+  }
+  return isDeepStrictEqual(config.providers[id], opencodeV2ProviderEntry(config.provider[id]));
 }
 
 /**

@@ -14,13 +14,14 @@ import {
   readLoginShellPath,
 } from "../../lib/harness/detect.mjs";
 import { HARNESSES } from "../../lib/harness/id.mjs";
+import { detectVscodeInstall } from "../../lib/harnesses/vscode/install.mjs";
 import { withTempHome } from "../helpers.mjs";
 
 const ALL = HARNESSES;
 
-// Harnesses with no reliable install signal on a platform: never refused,
-// never shown as detected. Anything else must have a spec.
+// Harnesses whose absence is inconclusive: never refused when not detected.
 const UNKNOWN = { darwin: [], linux: [], win32: ["claude-desktop", "copilot-app"] };
+const NULL_SPECS = { darwin: [], linux: [], win32: ["claude-desktop"] };
 
 /**
  * Options that hide the host's own installs: PATH is one empty dir, the
@@ -80,12 +81,22 @@ describe("findCommand", () => {
 });
 
 describe("harnessInstallSpecs", () => {
+  it("freebsd: leaves Copilot app installation unknown", async () => {
+    await withTempHome("detect-freebsd-copilot-", async (home) => {
+      const { options } = sandbox(home, "freebsd");
+      assert.equal(harnessInstallSpecs(home, options)["copilot-app"], null);
+      assert.deepEqual(checkHarnessInstall(home, "copilot-app", options), { state: "unknown", hint: "" });
+      assert.ok(isHarnessInstalled(home, "copilot-app", options));
+      assert.ok(!detected(home, options).has("copilot-app"));
+    });
+  });
+
   for (const platform of ["darwin", "linux", "win32"]) {
     it(`${platform}: has a spec for every harness, null only where intended`, () => {
       const specs = harnessInstallSpecs("/home/test", { platform, env: {} });
       for (const id of HARNESSES) {
         assert.ok(Object.hasOwn(specs, id), `${platform}: ${id} has no entry`);
-        assert.equal(specs[id] === null, UNKNOWN[platform].includes(id), `${platform}: ${id}`);
+        assert.equal(specs[id] === null, NULL_SPECS[platform].includes(id), `${platform}: ${id}`);
         if (specs[id]) {
           assert.ok(specs[id].hint, `${platform}: ${id} has no hint`);
         }
@@ -126,9 +137,7 @@ describe("detectInstalledHarnesses", () => {
         for (const id of ["claude", "codex", "opencode", "pi", "deepseek", "copilot-cli", "cursor", "vscode"]) {
           assert.ok(found.has(id), `${platform}: ${id}`);
         }
-        if (platform !== "win32") {
-          assert.ok(!found.has("copilot-app"), "the Copilot CLI doesn't install the app");
-        }
+        assert.ok(!found.has("copilot-app"), "the Copilot CLI doesn't install the app");
       });
     });
   }
@@ -188,14 +197,102 @@ describe("detectInstalledHarnesses", () => {
     });
   });
 
-  it("win32: Claude Desktop and the Copilot app are never refused, nor shown as detected", async () => {
+  it("win32: finds Cursor and OpenCode Desktop executables off PATH before first launch", async () => {
+    await withTempHome("detect-win-desktop-exes-", async (home) => {
+      const { localAppData, programFiles, options } = sandbox(home, "win32");
+      assert.equal(checkHarnessInstall(home, "cursor", options).state, "missing");
+      assert.equal(checkHarnessInstall(home, "opencode", options).state, "missing");
+      await fakeFile(path.join(programFiles, "cursor", "Cursor.exe"));
+      await fakeFile(path.join(localAppData, "Programs", "@opencode-aidesktop", "OpenCode.exe"));
+      assert.equal(checkHarnessInstall(home, "cursor", options).state, "installed");
+      assert.equal(checkHarnessInstall(home, "opencode", options).state, "installed");
+    });
+  });
+
+  it("win32: finds native Cursor and VS Code from 32-bit Node without duplicate roots", async () => {
+    await withTempHome("detect-win-native-programs-", async (home) => {
+      const { programFiles, root, options } = sandbox(home, "win32");
+      const programFiles86 = path.join(root, "Program Files (x86)");
+      Object.assign(options.env, {
+        ProgramW6432: programFiles,
+        ProgramFiles: programFiles86,
+        "ProgramFiles(x86)": programFiles86,
+      });
+      const systemExes = [programFiles, programFiles86].map((dir) => path.join(dir, "cursor", "Cursor.exe"));
+      assert.deepEqual(harnessInstallSpecs(home, options).cursor.paths.filter((file) => systemExes.includes(file)), systemExes);
+      await fakeFile(systemExes[0]);
+      assert.equal(checkHarnessInstall(home, "cursor", options).state, "installed");
+      const productJson = path.join(programFiles, "Microsoft VS Code Insiders", "resources", "app", "product.json");
+      await mkdir(path.dirname(productJson), { recursive: true });
+      await writeFile(productJson, "{}");
+      assert.equal(checkHarnessInstall(home, "vscode", options).state, "installed");
+      assert.equal(detectVscodeInstall(undefined, { ...options, home })?.folder, "Code - Insiders");
+    });
+  });
+
+  it("win32: Claude Desktop is never refused, nor shown as detected", async () => {
     await withTempHome("detect-win-desktop-", async (home) => {
       const { options } = sandbox(home, "win32");
       const found = detected(home, options);
-      for (const id of ["claude-desktop", "copilot-app"]) {
+      for (const id of ["claude-desktop"]) {
         assert.ok(isHarnessInstalled(home, id, options), id);
         assert.ok(!found.has(id), id);
       }
+    });
+  });
+
+  for (const location of ["user", "fallback", "machine", "x86"]) {
+    it(`win32: detects Copilot app's github.exe (${location})`, async () => {
+      await withTempHome("detect-win-copilot-", async (home) => {
+        const { localAppData, programFiles, root, options } = sandbox(home, "win32");
+        options.env["ProgramFiles(x86)"] = path.join(root, "Program Files (x86)");
+        const dir = location === "machine" ? programFiles
+          : location === "x86" ? options.env["ProgramFiles(x86)"]
+            : path.join(localAppData, "Programs");
+        if (location === "fallback") delete options.env.LOCALAPPDATA;
+        const appDir = path.join(dir, "GitHub Copilot");
+        await fakeFile(path.join(appDir, "copilot.exe"));
+        await fakeFile(path.join(appDir, "GitHubDesktop.exe"));
+        assert.deepEqual(checkHarnessInstall(home, "copilot-app", options), {
+          state: "unknown", hint: "GitHub Copilot's github.exe in Programs or Program Files",
+        });
+        assert.ok(isHarnessInstalled(home, "copilot-app", options));
+        assert.ok(!detected(home, options).has("copilot-app"));
+        await fakeFile(path.join(appDir, "github.exe"));
+        assert.equal(checkHarnessInstall(home, "copilot-app", options).state, "installed");
+        assert.ok(detected(home, options).has("copilot-app"));
+      });
+    });
+  }
+
+  it("win32: allows Copilot app setup outside the known install roots", async () => {
+    await withTempHome("detect-win-copilot-custom-", async (home) => {
+      const { localAppData, options } = sandbox(home, "win32");
+      delete options.env.ProgramFiles;
+      assert.deepEqual(harnessInstallSpecs(home, options)["copilot-app"].paths, [
+        path.join(localAppData, "Programs", "GitHub Copilot", "github.exe"),
+      ]);
+      await fakeFile(path.join(home, "custom-install", "github.exe"));
+      assert.deepEqual(checkHarnessInstall(home, "copilot-app", options), {
+        state: "unknown", hint: "GitHub Copilot's github.exe in Programs or Program Files",
+      });
+      assert.ok(isHarnessInstalled(home, "copilot-app", options));
+      assert.ok(!detected(home, options).has("copilot-app"));
+    });
+  });
+
+  it("win32: detects native Program Files from 32-bit Node without duplicate roots", async () => {
+    await withTempHome("detect-win-copilot-native-", async (home) => {
+      const { programFiles, root, options } = sandbox(home, "win32");
+      options.env.ProgramW6432 = programFiles;
+      options.env.ProgramFiles = path.join(root, "Program Files (x86)");
+      options.env["ProgramFiles(x86)"] = options.env.ProgramFiles;
+      const paths = harnessInstallSpecs(home, options)["copilot-app"].paths;
+      assert.equal(paths.length, 3);
+      assert.equal(new Set(paths).size, paths.length);
+      await fakeFile(path.join(programFiles, "GitHub Copilot", "github.exe"));
+      assert.equal(checkHarnessInstall(home, "copilot-app", options).state, "installed");
+      assert.ok(detected(home, options).has("copilot-app"));
     });
   });
 

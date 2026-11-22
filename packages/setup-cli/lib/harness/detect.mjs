@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import process from "node:process";
 import { HARNESS } from "./id.mjs";
 import { appUserDataDir } from "../io/user-data-dir.mjs";
 import { desktopDataDir } from "../harnesses/claude-desktop/lineup.mjs";
 import { vscodeInstallCandidates } from "../harnesses/vscode/install.mjs";
+import { stableNodeExec } from "../system/node-exec.mjs";
+import { windowsProgramFilesRoots, withDefaultWindowsProgramFilesRoots } from "../system/windows-install-roots.mjs";
 
 /**
  * @typedef {{ env?: NodeJS.ProcessEnv, platform?: string, root?: string, loginPath?: string }} DetectOptions
@@ -66,6 +69,58 @@ function splitPath(value, platform) {
 export function findCommand(name, options = {}) {
   const { env = process.env, platform = process.platform } = options;
   return findCommandIn(splitPath(env.PATH ?? env.Path, platform), name, { env, platform });
+}
+
+/** Resolve a directly executable harness command without starting a shell. Never throws. */
+export function resolveHarnessCommand(name, home = os.homedir(), options = {}) {
+  try {
+    const { env = process.env, platform = process.platform } = options;
+    const executableEnv = platform === "win32"
+      ? { ...env, PATHEXT: String(env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter((ext) => !/^\.(cmd|bat)$/i.test(ext)).join(";") || ".EXE" }
+      : env;
+    const search = { ...options, env: executableEnv, platform };
+    const bin = findCommand(name, search)
+      || findCommandIn(commandFallbackDirs(home, search), name, search);
+    return bin ? path.resolve(bin) : "";
+  } catch {
+    return "";
+  }
+}
+
+let loginShellPathPromise;
+
+/** Clear the process-local login-shell PATH cache. Tests only. */
+export function resetHarnessCommandPathForTests() {
+  loginShellPathPromise = undefined;
+}
+
+/** Also search the bounded login-shell PATH when the process environment cannot resolve the command. */
+export async function resolveHarnessCommandAsync(name, home = os.homedir(), options = {}) {
+  try {
+    const bin = resolveHarnessCommand(name, home, options);
+    if (bin) return bin;
+    const useCache = options.env === undefined && options.shell === undefined
+      && options.platform === undefined && options.timeoutMs === undefined;
+    const loginPath = await (useCache
+      ? (loginShellPathPromise ??= readLoginShellPath())
+      : readLoginShellPath(options));
+    if (!loginPath) return "";
+    return resolveHarnessCommand(name, home, { ...options, env: { ...(options.env || process.env), PATH: loginPath } });
+  } catch {
+    return "";
+  }
+}
+
+/** Give resolved scripts access to their sibling executables and this Node runtime. */
+export function harnessCommandEnv(bin, env = process.env, platform = process.platform) {
+  if (!path.isAbsolute(bin)) return env;
+  const key = platform === "win32" ? Object.keys(env).find((name) => name.toLowerCase() === "path") || "PATH" : "PATH";
+  const delimiter = platform === "win32" ? ";" : ":";
+  const dirs = String(env[key] || "").split(delimiter).filter(Boolean);
+  for (const dir of [path.dirname(bin), path.dirname(stableNodeExec(process.execPath))]) {
+    if (!dirs.includes(dir)) dirs.push(dir);
+  }
+  return { ...env, [key]: dirs.join(delimiter) };
 }
 
 /**
@@ -150,6 +205,7 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
     ? [sys("Applications"), path.join(home, "Applications")].flatMap((dir) => names.map((name) => path.join(dir, `${name}.app`)))
     : []);
   const localAppData = win ? (env.LOCALAPPDATA || path.join(home, "AppData", "Local")) : "";
+  const programFilesRoots = win ? windowsProgramFilesRoots(env) : [];
   // Where Linux users keep AppImages, which have no fixed install path.
   const appImageDirs = linux
     ? [path.join(home, "Applications"), path.join(home, ".local", "bin"), path.join(home, "AppImages"), sys("opt")]
@@ -167,6 +223,11 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
   // The same overrides the harnesses honor when they write their config.
   const copilotHome = env.COPILOT_HOME?.trim() ? path.resolve(env.COPILOT_HOME.trim()) : path.join(home, ".copilot");
   const dshHome = env.DSH_HOME?.trim() || path.join(home, ".dsh");
+  const hermesHome = env.HERMES_HOME?.trim()
+    ? path.resolve(env.HERMES_HOME.trim())
+    : platform === "win32"
+      ? path.join(env.LOCALAPPDATA?.trim() || path.join(home, "AppData", "Local"), "hermes")
+      : path.join(home, ".hermes");
   /** @returns {InstallSpec} */
   const spec = (hint, commands, paths = [], entries = []) => ({ hint, commands, paths, entries });
 
@@ -190,8 +251,11 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
         ? spec("the `claude-desktop` command", ["claude-desktop"], [path.join(desktopDataDir(home, "Claude", { platform, env }), "logs")])
         : null,
     // OpenCode keeps sessions under ~/.local/share/opencode on every platform.
-    [HARNESS.OPENCODE]: spec("the `opencode` command or OpenCode's session data", ["opencode"], [
+    [HARNESS.OPENCODE]: spec(win
+      ? "the `opencode` command, the OpenCode app, or OpenCode's session data"
+      : "the `opencode` command or OpenCode's session data", ["opencode"], [
       path.join(home, ".opencode", "bin", `opencode${exe}`),
+      ...(win ? [path.join(localAppData, "Programs", "@opencode-aidesktop", "OpenCode.exe")] : []),
       path.join(home, ".local", "share", "opencode"),
     ]),
     // `nexus codex` also routes the ChatGPT and Codex desktop apps, so either
@@ -221,19 +285,24 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
       ["cursor"],
       [
         ...apps("Cursor"),
-        ...(win ? [path.join(localAppData, "Programs", "cursor")] : []),
+        ...(win ? [
+          ...withDefaultWindowsProgramFilesRoots(programFilesRoots)
+            .map((dir) => path.join(dir, "cursor", "Cursor.exe")),
+          path.join(localAppData, "Programs", "cursor", "Cursor.exe"),
+          path.join(localAppData, "Programs", "cursor"),
+        ] : []),
         ...(linux ? [sys("usr", "share", "cursor", "cursor"), sys("opt", "cursor", "cursor"), sys("opt", "Cursor", "cursor")] : []),
         appLogs("Cursor"),
       ],
       appImages(/^cursor.*\.appimage$/i),
     ),
-    // The machine-wide installs vscode/install.mjs already knows, plus the
-    // shell command, the Windows per-user installer, snap, and flatpak.
+    // The installs vscode/install.mjs already knows, plus the shell command,
+    // Windows per-user install folders, snap, and flatpak.
     [HARNESS.VSCODE]: spec(
       "the `code` command, the VS Code app, or VS Code's own logs",
       ["code", "code-insiders"],
       [
-        ...vscodeInstallCandidates({ platform, env, home, root }).map((candidate) => candidate.productJson),
+        ...vscodeInstallCandidates({ platform, env, home, root, programFilesRoots }).map((candidate) => candidate.productJson),
         // Also catches a copy dragged into ~/Applications.
         ...apps("Visual Studio Code", "Visual Studio Code - Insiders"),
         ...(win ? [
@@ -247,8 +316,8 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
     ),
     // The app's data.db can't count: Nexus creates it on a never-launched
     // install. Linux: the official .deb installs `github`, AppImage wrappers
-    // use `github-copilot`. The Windows setup.exe documents no install path,
-    // so Windows has no reliable signal.
+    // use `github-copilot`. Windows: the NSIS/MSI installers ship github.exe
+    // under GitHub Copilot, not the CLI's copilot.exe.
     [HARNESS.COPILOT_APP]: darwin
       ? spec("GitHub Copilot.app", [], apps("GitHub Copilot"))
       : linux
@@ -258,7 +327,12 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
           [],
           appImages(/^github[-_ ]?copilot.*\.appimage$/i),
         )
-        : null,
+        : win
+          ? spec("GitHub Copilot's github.exe in Programs or Program Files", [], [
+            path.join(localAppData, "Programs", "GitHub Copilot", "github.exe"),
+            ...programFilesRoots.map((dir) => path.join(dir, "GitHub Copilot", "github.exe")),
+          ])
+          : null,
     // The CLI's own session history (older releases used history-session-state).
     // Not providers.json: that's the file `on` writes.
     [HARNESS.COPILOT_CLI]: spec("the `copilot` command or the Copilot CLI's session history", ["copilot"], [
@@ -269,6 +343,9 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
     // patches profiles that already exist, and $DSH_HOME itself doesn't count:
     // `on` creates it for settings.yaml.
     [HARNESS.DEEPSEEK]: spec("the `dsh` command or DeepSeek Harness's profiles", ["dsh"], [path.join(dshHome, "profiles")]),
+    // Hermes writes a session per chat under $HERMES_HOME/sessions. Not
+    // config.yaml or .env: those are the files `on` writes.
+    [HARNESS.HERMES]: spec("the `hermes` command or Hermes Agent's sessions", ["hermes"], [path.join(hermesHome, "sessions")]),
   };
 }
 
@@ -276,7 +353,8 @@ export function harnessInstallSpecs(home, { env = process.env, platform = proces
  * Check whether `harnessId` is installed on this machine, and say what was
  * looked for. Config folders don't count, since Nexus itself creates them,
  * and neither do empty folders.
- * `unknown` means the platform has no reliable signal for this harness.
+ * `unknown` means no reliable signal, including a Windows Copilot app that
+ * may be installed outside the known folders.
  *
  * @param {string} home
  * @param {string} harnessId
@@ -297,6 +375,10 @@ export function checkHarnessInstall(home, harnessId, options = {}) {
   const found = spec.commands.some((name) => findCommandIn(commandDirs, name, { env, platform }))
     || spec.paths.some(hasFootprint)
     || spec.entries.some(({ dir, pattern }) => hasEntryMatching(dir, pattern));
+  // Windows installers may use a custom directory outside the known roots.
+  if (!found && platform === "win32" && harnessId === HARNESS.COPILOT_APP) {
+    return { state: "unknown", hint: spec.hint };
+  }
   return { state: found ? "installed" : "missing", hint: spec.hint };
 }
 

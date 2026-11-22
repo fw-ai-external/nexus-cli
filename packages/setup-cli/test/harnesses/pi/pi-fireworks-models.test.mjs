@@ -57,6 +57,10 @@ describe("fullFireworksResourceId router classification", () => {
       "accounts/fireworks/routers/sample-model-fast",
     );
     assert.equal(
+      fullFireworksResourceId("sample-model-ultrafast"),
+      "accounts/fireworks/routers/sample-model-ultrafast",
+    );
+    assert.equal(
       fullFireworksResourceId("glm-5p2-fast"),
       "accounts/fireworks/routers/glm-5p2-fast",
     );

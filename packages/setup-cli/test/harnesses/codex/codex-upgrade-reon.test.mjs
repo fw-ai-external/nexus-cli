@@ -10,9 +10,12 @@ import { CODEX_CATALOG_TOML_REF, codexCatalogPath, codexConfigPath } from "../..
 import { clearListPriceCache, setListPriceCacheRates } from "../../../lib/pricing/list-price-cache.mjs";
 import {
   CODEX_AUTO_EFFORT_NOTE,
+  CODEX_GPT_EFFORT_NOTE,
   CODEX_AUTO_RENAME_NOTE,
+  CODEX_AUTO_SLUG_NOTE,
   CODEX_DUPLICATE_KEY_REPAIR_NOTE,
   CODEX_ENV_PROVIDER_KEYS_NOTE,
+  CODEX_IMAGE_GENERATION_NOTE,
   CODEX_SAVED_ANTHROPIC_KEY_NOTE,
   CODEX_FIREROUTER_MIGRATION_NOTE,
   CODEX_SIGN_IN_UPGRADE_NOTE,
@@ -75,6 +78,41 @@ async function seedLegacyCodex(home, { enabled = true } = {}) {
 }
 
 describe("reapplyCodexOnUpgrade", () => {
+  it("backfills the image preference from a cached catalog and converges", async () => {
+    await withTempHome("codex-image-upgrade-", async (home) => {
+      await seedLegacyCodex(home);
+      await inHome(home, () => cacheServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([mockServerlessModel()])));
+      try {
+        await inHome(home, () => reapplyCodexOnUpgrade(home));
+        const configPath = codexConfigPath(home);
+        const current = await readFile(configPath, "utf8");
+        await writeFile(configPath, current.replace(/^image_generation = false # nexus: image_generation\n/m, ""));
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_IMAGE_GENERATION_NOTE]);
+        assert.equal(parseToml(await readFile(configPath, "utf8")).tables.features.image_generation, false);
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
+      } finally {
+        setServerlessCatalogSnapshot(null);
+      }
+    });
+  });
+
+  it("does not upgrade an explicit image preference", async () => {
+    await withTempHome("codex-image-upgrade-user-", async (home) => {
+      await seedLegacyCodex(home);
+      await inHome(home, () => cacheServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([mockServerlessModel()])));
+      try {
+        await inHome(home, () => reapplyCodexOnUpgrade(home));
+        const configPath = codexConfigPath(home);
+        const raw = (await readFile(configPath, "utf8")).replace("image_generation = false # nexus: image_generation", "image_generation = true");
+        await writeFile(configPath, raw);
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
+        assert.equal(await readFile(configPath, "utf8"), raw);
+      } finally {
+        setServerlessCatalogSnapshot(null);
+      }
+    });
+  });
+
   it("re-runs codex on so an earlier config uses Codex's sign-in, then leaves it alone", async () => {
     await withTempHome("codex-sign-in-upgrade-", async (home) => {
       await seedLegacyCodex(home);
@@ -90,7 +128,7 @@ describe("reapplyCodexOnUpgrade", () => {
       assert.equal(table.http_headers["x-fireworks-api-key"], KEY);
       assert.equal(table.env_http_headers, undefined);
       assert.doesNotMatch(raw, /x-openai-api-key|x-anthropic-api-key/);
-      assert.equal(doc.root.model, "auto", "the legacy FireRouter selection drops to auto");
+      assert.equal(doc.root.model, "nexus/auto", "the legacy FireRouter selection drops to auto");
       assert.match(raw, /\[features\]\nweb_search = true/);
 
       const again = await inHome(home, () => reapplyCodexOnUpgrade(home));
@@ -171,7 +209,7 @@ describe("reapplyCodexOnUpgrade", () => {
       await writeFile(
         configPath,
         (await readFile(configPath, "utf8"))
-          .replace(/^model = "auto"$/m, 'model = "firerouter/astra"')
+          .replace(/^model = "nexus\/auto"$/m, 'model = "firerouter/astra"')
           .replace(/^model = /m, `model_catalog_json = "${CODEX_CATALOG_TOML_REF}"\nmodel = `),
       );
       // 0.9.8 and 0.9.9 wrote the FireRouter row with the Astra slug.
@@ -183,7 +221,7 @@ describe("reapplyCodexOnUpgrade", () => {
       assert.deepEqual(notes, [CODEX_FIREROUTER_MIGRATION_NOTE]);
       const raw = await readFile(configPath, "utf8");
       const doc = parseToml(raw);
-      assert.equal(doc.root.model, "auto");
+      assert.equal(doc.root.model, "nexus/auto");
       assert.equal(doc.tables["model_providers.fireworks-ai"].requires_openai_auth, true);
       const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
       assert.deepEqual(slugs.filter((slug) => slug.startsWith("firerouter")), []);
@@ -201,7 +239,7 @@ describe("reapplyCodexOnUpgrade", () => {
       await writeFile(
         configPath,
         (await readFile(configPath, "utf8"))
-          .replace(/^model = "auto"$/m, `model_catalog_json = "${CODEX_CATALOG_TOML_REF}"\nmodel = "glm-latest"`),
+          .replace(/^model = "nexus\/auto"$/m, `model_catalog_json = "${CODEX_CATALOG_TOML_REF}"\nmodel = "glm-latest"`),
       );
       await writeFile(codexCatalogPath(home), JSON.stringify({
         models: [{ slug: "firerouter/astra", display_name: "FireRouter" }, { slug: "glm-latest", display_name: "GLM" }],
@@ -225,7 +263,7 @@ describe("reapplyCodexOnUpgrade", () => {
       await writeFile(
         configPath,
         (await readFile(configPath, "utf8"))
-          .replace(/^model = "auto"$/m, `model_catalog_json = "${CODEX_CATALOG_TOML_REF}"\nmodel = "firerouter/astra"`)
+          .replace(/^model = "nexus\/auto"$/m, `model_catalog_json = "${CODEX_CATALOG_TOML_REF}"\nmodel = "firerouter/astra"`)
           .replace(/"HTTP-Referer" = "fireconnect\/[^"]*"/, '"HTTP-Referer" = "fireconnect/v0.9.9"'),
       );
       await writeFile(codexCatalogPath(home), JSON.stringify({
@@ -236,7 +274,7 @@ describe("reapplyCodexOnUpgrade", () => {
       // selection saved by an earlier release is carried over, so the
       // upgrade drops it like any other FireRouter usage.
       assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_FIREROUTER_MIGRATION_NOTE]);
-      assert.equal(parseToml(await readFile(configPath, "utf8")).root.model, "auto");
+      assert.equal(parseToml(await readFile(configPath, "utf8")).root.model, "nexus/auto");
       const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
       assert.deepEqual(slugs.filter((slug) => slug.startsWith("firerouter")), []);
 
@@ -260,7 +298,7 @@ describe("reapplyCodexOnUpgrade", () => {
         const notes = await inHome(home, () => reapplyCodexOnUpgrade(home));
         assert.deepEqual(notes, ["Added gpt-99-sol to Codex's model list. Restart Codex to pick it up."]);
         assert.ok((await slugs()).includes("gpt-99-sol"));
-        assert.equal(parseToml(await readFile(codexConfigPath(home), "utf8")).root.model, "auto");
+        assert.equal(parseToml(await readFile(codexConfigPath(home), "utf8")).root.model, "nexus/auto");
 
         assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
       } finally {
@@ -277,15 +315,46 @@ describe("reapplyCodexOnUpgrade", () => {
       try {
         await inHome(home, () => reapplyCodexOnUpgrade(home));
         const catalogPath = codexCatalogPath(home);
-        const autoRow = async () => JSON.parse(await readFile(catalogPath, "utf8")).models.find((row) => row.slug === "auto");
+        const autoRow = async () => JSON.parse(await readFile(catalogPath, "utf8")).models.find((row) => row.slug === "nexus/auto");
         const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
-        catalog.models = catalog.models.map((row) => (row.slug === "auto" ? { ...row, display_name: "Auto" } : row));
+        catalog.models = catalog.models.map((row) => (row.slug === "nexus/auto" ? { ...row, display_name: "Auto" } : row));
         await writeFile(catalogPath, JSON.stringify(catalog));
 
         // The upgrade runs the catalog-constants migration first; a label-only change must reach the re-on.
         assert.equal(await inHome(home, () => migrateCodexCatalogConstantsOnUpgrade(home)), false);
         assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_AUTO_RENAME_NOTE]);
         assert.equal((await autoRow()).display_name, "Nexus Auto");
+
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
+      } finally {
+        setServerlessCatalogSnapshot(null);
+      }
+    });
+  });
+
+  it("moves an earlier release's bare auto to nexus/auto in config.toml and the picker, then leaves it alone", async () => {
+    await withTempHome("codex-upgrade-reon-auto-slug-", async (home) => {
+      await seedLegacyCodex(home);
+      await inHome(home, () => cacheServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([mockServerlessModel()])));
+      try {
+        await inHome(home, () => reapplyCodexOnUpgrade(home));
+        const configPath = codexConfigPath(home);
+        const catalogPath = codexCatalogPath(home);
+        // What a release before the nexus/auto slug wrote: `auto` in both files.
+        await writeFile(configPath, (await readFile(configPath, "utf8")).replace(/^model = "nexus\/auto"$/m, 'model = "auto"'));
+        const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
+        catalog.models = catalog.models.map((row) => (row.slug === "nexus/auto"
+          ? { ...row, slug: "auto", auto_review_model_override: "auto" }
+          : row));
+        await writeFile(catalogPath, JSON.stringify(catalog));
+
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_AUTO_SLUG_NOTE]);
+        assert.equal(parseToml(await readFile(configPath, "utf8")).root.model, "nexus/auto");
+        const rows = JSON.parse(await readFile(catalogPath, "utf8")).models;
+        assert.deepEqual(rows.map((row) => row.slug).filter((slug) => slug.endsWith("auto")), ["nexus/auto"]);
+        const autoRow = rows.find((row) => row.slug === "nexus/auto");
+        assert.equal(autoRow.auto_review_model_override, "nexus/auto");
+        assert.equal(autoRow.display_name, "Nexus Auto");
 
         assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
       } finally {
@@ -301,7 +370,7 @@ describe("reapplyCodexOnUpgrade", () => {
       try {
         await inHome(home, () => reapplyCodexOnUpgrade(home));
         const catalogPath = codexCatalogPath(home);
-        const autoRow = (catalog) => catalog.models.find((row) => row.slug === "auto");
+        const autoRow = (catalog) => catalog.models.find((row) => row.slug === "nexus/auto");
         const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
         autoRow(catalog).supported_reasoning_levels.splice(3);
         await writeFile(catalogPath, JSON.stringify(catalog));
@@ -310,6 +379,31 @@ describe("reapplyCodexOnUpgrade", () => {
         assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_AUTO_EFFORT_NOTE]);
         const upgraded = autoRow(JSON.parse(await readFile(catalogPath, "utf8")));
         assert.deepEqual(upgraded.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high", "xhigh", "max"]);
+
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
+      } finally {
+        setServerlessCatalogSnapshot(null);
+      }
+    });
+  });
+
+  it("gives an earlier release's three-level fallback GPT rows xhigh, then leaves them alone", async () => {
+    await withTempHome("codex-upgrade-reon-gpt-effort-", async (home) => {
+      await seedLegacyCodex(home);
+      await inHome(home, () => cacheServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([mockServerlessModel()])));
+      try {
+        await inHome(home, () => reapplyCodexOnUpgrade(home));
+        const catalogPath = codexCatalogPath(home);
+        const gptRows = (catalog) => catalog.models.filter((row) => row.slug.startsWith("gpt-") && !row.base_instructions);
+        const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
+        assert.ok(gptRows(catalog).length, "fallback GPT rows are present without a stock list");
+        for (const row of gptRows(catalog)) row.supported_reasoning_levels.splice(3);
+        await writeFile(catalogPath, JSON.stringify(catalog));
+
+        assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), [CODEX_GPT_EFFORT_NOTE]);
+        for (const row of gptRows(JSON.parse(await readFile(catalogPath, "utf8")))) {
+          assert.deepEqual(row.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high", "xhigh"], row.slug);
+        }
 
         assert.deepEqual(await inHome(home, () => reapplyCodexOnUpgrade(home)), []);
       } finally {

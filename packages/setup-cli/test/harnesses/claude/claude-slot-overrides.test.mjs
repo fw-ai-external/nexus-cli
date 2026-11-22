@@ -188,7 +188,7 @@ describe("Claude tier-slot overrides", () => {
     seedCatalogFor(home);
     const result = await (await runFireconnect(["login", "--api-key", FIREWORKS_KEY], cliEnv(home)), await runFireconnect(["claude", "on", "--sonnet", "foo/bar"], cliEnv(home)));
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /not available on Fireworks/);
+    assert.match(result.stderr, /isn't in this account's model list/);
   });
 
   it("rejects a slot set to a FireRouter route", async () => {

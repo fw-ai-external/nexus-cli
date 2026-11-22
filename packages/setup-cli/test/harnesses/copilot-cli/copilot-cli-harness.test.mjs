@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildCliModels,
   copilotCliModelIdFromSelection,
   copilotCliSelectionId,
   copilotProvidersPath,
@@ -16,6 +17,7 @@ import {
   selectCopilotCliModel,
 } from "../../../lib/harnesses/copilot-cli/config.mjs";
 import { describeCopilotModels } from "../../../lib/harnesses/copilot-shared.mjs";
+import { MODEL_REASONING } from "../../../lib/fireworks/reasoning.mjs";
 import {
   runCli,
   runCliJson,
@@ -46,6 +48,35 @@ describe("describeCopilotModels", () => {
 });
 
 describe("copilot-cli config", () => {
+  it("publishes per-model reasoning arrays for short, full, and versioned ids", () => {
+    const ref = "accounts/fireworks/models/test-reasoning-model";
+    MODEL_REASONING[ref] = { levels: ["low", "medium", "high", "max"].map((effort) => ({ effort })) };
+    try {
+      for (const id of ["test-reasoning-model", ref, "test-reasoning-model-1234", `${ref}-1234`]) {
+        const [model] = buildCliModels([{ id, displayName: "Test model", vision: true }]);
+        assert.deepEqual(model.capabilities.supports, {
+          reasoning_effort: ["low", "medium", "high", "max"],
+          vision: true,
+        });
+        assert.equal(Object.hasOwn(model.capabilities.supports, "reasoningEffort"), false);
+      }
+    } finally {
+      delete MODEL_REASONING[ref];
+    }
+  });
+
+  it("publishes Auto's ladder and the unknown-model fallback without claiming vision", () => {
+    for (const [id, levels] of [
+      ["auto", ["low", "medium", "high", "xhigh", "max"]],
+      ["test-unknown-model", ["low", "medium", "high"]],
+    ]) {
+      const [model] = buildCliModels([{ id, displayName: "Test model" }]);
+      assert.deepEqual(model.capabilities.supports, { reasoning_effort: levels });
+      assert.equal(Object.hasOwn(model.capabilities.supports, "reasoningEffort"), false);
+    }
+    assert.deepEqual(buildCliModels([]), []);
+  });
+
   it("qualifies selection ids with the provider name", () => {
     // A bare id is rejected by the CLI ("Model … is not available") and falls
     // back to another model, so the prefix is not cosmetic.

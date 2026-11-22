@@ -8,6 +8,8 @@
  * the network. The one interpolated value (the authorize URL) is HTML-escaped.
  */
 
+import { NEXUS_KEYS_URL } from "../keys/api-key.mjs";
+
 /** Account creation happens on the web app. */
 export const WEB_SIGNUP_URL = "https://nexus.fireworks.ai/signup";
 
@@ -30,6 +32,7 @@ const GOOGLE_G = `<svg class="g" viewBox="0 0 256 262" aria-hidden="true">
 // GitHub and LinkedIn marks, as the web app's Nexus login uses them.
 const GITHUB_MARK = `<svg class="g" viewBox="0 0 24 24" fill="#24292F" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>`;
 const LINKEDIN_MARK = `<svg class="g" viewBox="0 0 17 16" fill="none" aria-hidden="true"><rect width="16" height="16" x=".5" fill="#1275B1" rx="8"/><path fill="#fff" d="M6.568 4.396c0 .534-.463.967-1.034.967S4.5 4.93 4.5 4.396s.463-.967 1.034-.967c.57 0 1.034.433 1.034.967ZM4.641 6.073H6.41v5.356H4.64V6.073Zm4.613 0H7.487v5.356h1.767v-2.74c0-.633.216-1.269 1.078-1.269.974 0 .968.828.964 1.47-.006.838.008 1.694.008 2.539h1.767V8.602c-.014-1.804-.485-2.636-2.032-2.636-.919 0-1.488.417-1.785.794v-.687Z"/></svg>`;
+const SSO_MARK = `<svg class="g" viewBox="0 0 24 24" fill="none" stroke="#280016" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`;
 const MAIL_MARK = `<svg class="g" viewBox="0 0 24 24" fill="none" stroke="#280016" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
 
 /** Social sign-in buttons: Cognito identity provider name, label, mark. */
@@ -55,6 +58,12 @@ export const PAGE_HEADERS = Object.freeze({
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
   "Cross-Origin-Resource-Policy": "same-origin",
+});
+
+/** The SSO page's form submits to the listener itself; nothing else changes. */
+export const SSO_PAGE_HEADERS = Object.freeze({
+  ...PAGE_HEADERS,
+  "Content-Security-Policy": PAGE_HEADERS["Content-Security-Policy"].replace("form-action 'none'", "form-action 'self'"),
 });
 
 const escapeHtml = (value) => String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -109,6 +118,11 @@ h1{margin:0;font-family:Georgia,serif;font-weight:400;font-size:28px;line-height
   border:1px solid #E2DDD8;border-radius:8px;font-size:14px}
 .dot{flex:none;width:8px;height:8px;border-radius:50%}
 .alt{display:inline-block;margin-top:20px;font-size:14px;color:#280016;text-underline-offset:3px}
+.sso{display:grid;gap:12px}
+.field{width:100%;height:42px;padding:0 12px;border:1px solid #E2DDD8;border-radius:8px;background:#FFFFFF;color:#280016;font:inherit;font-size:14px}
+.field:focus-visible{outline:2px solid #280016;outline-offset:2px}
+button.btn{font:inherit;font-size:14px;cursor:pointer}
+.err{margin:0;font-size:13px;line-height:1.4;color:#B3261E;text-align:left}
 .legal{margin:0;text-align:center;font-size:13px;line-height:1.4;color:#706666}
 .legal a{color:#280016;text-underline-offset:2px}
 @media(max-width:960px){
@@ -140,10 +154,11 @@ ${main}
  * URL plus identity_provider, so Cognito skips its own UI and goes straight to
  * that provider. Email opens Cognito's hosted UI (the authorize URL as
  * is), so the password goes straight to Cognito; account creation happens on
- * the web app.
+ * the web app. With `ssoHref`, a custom-SSO button leads to the account ID form.
  * @param {string} authorizeUrl
+ * @param {{ ssoHref?: string }} [options]
  */
-export function signInPage(authorizeUrl) {
+export function signInPage(authorizeUrl, { ssoHref = "" } = {}) {
   const buttons = PROVIDERS.map(([provider, label, mark]) => {
     const href = `${authorizeUrl}&${new URLSearchParams({ identity_provider: provider })}`;
     return `<a class="btn" href="${escapeHtml(href)}">${mark}<span>${label}</span></a>`;
@@ -157,34 +172,46 @@ export function signInPage(authorizeUrl) {
 ${buttons}
 </div>
 <div class="or">OR</div>
-<a class="btn" href="${escapeHtml(authorizeUrl)}">${MAIL_MARK}<span>Continue with email</span></a>
+<div class="providers">
+<a class="btn" href="${escapeHtml(authorizeUrl)}">${MAIL_MARK}<span>Continue with email</span></a>${ssoHref ? `
+<a class="btn" href="${escapeHtml(ssoHref)}">${SSO_MARK}<span>Sign in with SSO</span></a>` : ""}
+</div>
 <p class="new">New to Nexus?<a href="${WEB_SIGNUP_URL}" target="_blank" rel="noopener">Create an account</a></p>`,
   });
 }
 
 /**
- * A short holding page that reloads itself (the response's Refresh header):
- * for a second tab that opened the sign-in link before the first one's
- * cookie was stored. Carries no sign-in state.
+ * Custom SSO: the account ID picks the company's own sign-in, which the
+ * listener looks up and redirects to. A failed lookup comes back here with
+ * `error` and the ID as typed.
+ * @param {{ action: string, back: string, accountId?: string, error?: string }} page
  */
-/**
- * Served for a load of the sign-in page that carries no cookie at all, after
- * the one retry: a browser that blocks localhost cookies, a prerender or a
- * restored tab. It holds no state, and the first window can still finish.
- */
-export function firstWindowPage() {
+export function ssoPage({ action, back, accountId = "", error = "" }) {
   return shell({
-    title: "Sign-in already open | Nexus",
-    main: `<h1>Sign-in is already open</h1>
-<p class="sub">Finish signing in in the window that opened first, or run nexus login again.</p>`,
+    title: "Sign in with SSO | Nexus",
+    main: `<h1>Sign in with SSO</h1>
+<p class="sub">Enter your company's Fireworks account ID. Your admin can share it.</p>
+<form class="sso" method="get" action="${escapeHtml(action)}">
+<input class="field" name="account" value="${escapeHtml(accountId)}" placeholder="Account ID" aria-label="Account ID" autocapitalize="none" autocomplete="off" spellcheck="false" required autofocus>${error ? `
+<p class="err" role="alert">${escapeHtml(error)}</p>` : ""}
+<button class="btn" type="submit">Continue</button>
+</form>
+<a class="alt" href="${escapeHtml(back)}">Back to other sign-in options</a>`,
   });
 }
 
-export function openingPage() {
+/**
+ * After the SSO form finds the account: on to its hosted sign-in. The page
+ * navigates by its Refresh header, not a redirect, because a redirect from a
+ * form submission is held to the form's `form-action 'self'`.
+ * @param {string} url
+ */
+export function ssoContinuePage(url) {
   return shell({
-    title: "Opening sign-in | Nexus",
-    main: `<h1>Opening sign-in…</h1>
-<p class="sub">This page reloads in a moment.</p>`,
+    title: "Opening your company's sign-in | Nexus",
+    main: `<h1>Opening your company's sign-in…</h1>
+<p class="sub">If nothing happens, continue below.</p>
+<a class="btn" href="${escapeHtml(url)}">Continue to your company's sign-in</a>`,
   });
 }
 
@@ -194,19 +221,19 @@ export function openingPage() {
  * before the token exchange and key creation, so success reads as "finishing",
  * and the terminal or app reports the outcome.
  * @param {boolean} ok
- * @param {{ returnTo?: "terminal" | "app" }} [options]
+ * @param {{ returnTo?: "terminal" | "app", keysUrl?: string }} [options]
  */
-export function callbackPage(ok, { returnTo = "terminal" } = {}) {
+export function callbackPage(ok, { returnTo = "terminal", keysUrl = NEXUS_KEYS_URL } = {}) {
   const app = returnTo === "app";
   const where = app ? "the Nexus app" : "your terminal";
   // Pasting an API key is a CLI fallback; the app has its own retry.
   const fallback = ok || app
     ? ""
-    : `\n<a class="alt" href="https://app.fireworks.ai/settings/users/api-keys">Use an API key instead</a>`;
+    : `\n<a class="alt" href="${escapeHtml(keysUrl)}">Use an API key instead</a>`;
   return shell({
-    title: ok ? "Finishing sign-in | Nexus" : "Sign-in failed | Nexus",
-    main: `<h1>${ok ? "Finishing sign-in" : "Sign-in didn't finish"}</h1>
-<p class="sub">${ok ? "Nexus is completing your sign-in. You can close this tab." : "Nothing was saved."}</p>
+    title: ok ? "Almost done | Nexus" : "Sign-in didn't finish | Nexus",
+    main: `<h1>${ok ? "Almost done" : "Sign-in didn't finish"}</h1>
+<p class="sub">${ok ? `Nexus is finishing up in ${where}. You can close this tab.` : "Nothing was saved, so it's safe to try again."}</p>
 <div class="status"><span class="dot" style="background:${ok ? "#078E09" : "#E51D1D"}"></span>${ok ? `Return to ${where}.` : `Return to ${where} to try again.`}</div>${fallback}`,
   });
 }

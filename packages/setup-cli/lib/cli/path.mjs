@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { stableNodeExec } from "../system/node-exec.mjs";
 
 /**
  * Absolute path to the Nexus CLI entrypoint for apiKeyHelper / shell hooks.
@@ -34,7 +35,7 @@ export function keyExportCommand(home = process.env.HOME ?? "") {
   const cliPath = resolveCliPath(home);
   const homeFlag = home ? ` --home ${shellQuote(home)}` : "";
   if (cliPath.endsWith(".mjs")) {
-    return `${process.execPath} ${shellQuote(cliPath)}${homeFlag} key export --stored-only`;
+    return `${shellQuote(stableNodeExec(process.execPath))} ${shellQuote(cliPath)}${homeFlag} key export --stored-only`;
   }
   return `${shellQuote(cliPath)}${homeFlag} key export --stored-only`;
 }

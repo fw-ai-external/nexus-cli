@@ -15,7 +15,7 @@ import {
   prepareOutputDir, writeStreamLog, writeAppHtml, writeResultJson, writeCompareHtml,
   readBestHtmlFromDir,
 } from "../../lib/demo/output.mjs";
-import { setHarnessEnabled, writeGlobalConfig } from "../../lib/config/global-config.mjs";
+import { setHarnessEnabled } from "../../lib/config/global-config.mjs";
 import { USER_SETTINGS_RELATIVE_PATH } from "../../lib/harnesses/claude/core.mjs";
 
 // ── a capturing fake stdout for the TUI ──────────────────────────────────────

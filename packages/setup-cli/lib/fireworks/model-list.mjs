@@ -11,6 +11,7 @@ import {
   preferLatestAliases,
 } from "./models.mjs";
 import { stripViaFireworksSuffix } from "./label-suffix.mjs";
+import { isUltrafastEntry } from "./model-specs.mjs";
 import { refreshListPriceCache } from "../pricing/list-price-cache.mjs";
 import { KNOWN_AUTO_MODEL_IDS, isRetiredModelId } from "./model-id.mjs";
 import { autoTagline, firerouterTagline } from "../firerouter/core.mjs";
@@ -55,8 +56,9 @@ function isFastLatestRouter(entry) {
   // For now, the FAST section surfaces only the `-fast-latest` router aliases
   // (glm-fast-latest, kimi-fast-latest, …) — the versioned `-fast`/`-turbo`
   // models (kimi-k3-fast, glm-5p2-fast, …) collapse into those aliases via
-  // preferLatestAliases and shouldn't be listed separately here.
-  return entry.shortId?.endsWith("-fast-latest");
+  // preferLatestAliases and shouldn't be listed separately here. Ultra-fast
+  // routers have no such alias, so they list directly.
+  return entry.shortId?.endsWith("-fast-latest") || isUltrafastEntry(entry);
 }
 
 function isUsRouter(entry) {
@@ -83,7 +85,9 @@ export function organizeCatalogForDisplay(catalog) {
   ));
   const preferred = preferLatestAliases(nonSmart);
   const routers = preferred.filter((entry) => entry.id.includes("/routers/"));
-  const usRouters = routers.filter(isUsRouter);
+  // US routers have no -latest alias to collapse into, so every version is
+  // listed, as in INDIVIDUAL MODELS.
+  const usRouters = nonSmart.filter((entry) => entry.id.includes("/routers/") && isUsRouter(entry));
   const fastRouters = routers.filter(isFastLatestRouter);
   const latestRouters = routers.filter((entry) => (
     !isFastLatestRouter(entry)

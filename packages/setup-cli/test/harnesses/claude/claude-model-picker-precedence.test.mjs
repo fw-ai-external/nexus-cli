@@ -12,7 +12,7 @@ import { CLAUDE_LEGACY_ANTHROPIC_MODEL_WARNING } from "../../../lib/harnesses/cl
 import { FIREWORKS_BASE_URL } from "../../../lib/fireworks/model-id.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import { cacheServerlessCatalogSnapshot, setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
-import { mockServerlessModel, runFireconnect, withTempHome } from "../../helpers.mjs";
+import { mockServerlessModelRows, runFireconnect, withTempHome } from "../../helpers.mjs";
 
 const FIREWORKS_KEY = "fw_claude_matrix_key_000000000000";
 
@@ -22,7 +22,7 @@ function seedCatalogFor(home) {
   process.env.HOME = home;
   try {
     cacheServerlessCatalogSnapshot(buildServerlessCatalogSnapshot([
-      mockServerlessModel({
+      ...mockServerlessModelRows({
         name: "accounts/fireworks/models/kimi-k3",
         displayName: "Kimi K3",
         input_modalities: ["text", "image"],

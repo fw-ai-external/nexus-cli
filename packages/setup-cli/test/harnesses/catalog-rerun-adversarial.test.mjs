@@ -98,9 +98,9 @@ describe("catalog rerun adversarial scenarios", () => {
         assert.equal(rerun.code, 0, rerun.stderr);
 
         // The plain re-run drops any stored FireRouter usage to `auto`.
-        assert.match(await readFile(codexConfigPath(home), "utf8"), /^model = "auto"$/m);
+        assert.match(await readFile(codexConfigPath(home), "utf8"), /^model = "nexus\/auto"$/m);
         const slugs = JSON.parse(await readFile(catalogPath, "utf8")).models.map((row) => row.slug);
-        assert.ok(slugs.includes("auto"), `auto: ${slugs.join(",")}`);
+        assert.ok(slugs.includes("nexus/auto"), `auto: ${slugs.join(",")}`);
         assert.ok(!slugs.some((slug) => slug.startsWith("firerouter")), `no firerouter row: ${slugs.join(",")}`);
         assert.ok(slugs.includes("glm-latest"), "new v2 model is added");
         assert.ok(!slugs.includes("retired-user-model"), "row missing from serverless is dropped");
@@ -127,10 +127,10 @@ describe("catalog rerun adversarial scenarios", () => {
       assert.equal(rerun.code, 0, rerun.stderr);
 
       const config = await readFile(codexConfigPath(home), "utf8");
-      assert.match(config, /model = "auto"/);
+      assert.match(config, /model = "nexus\/auto"/);
       assert.match(config, /model_catalog_json/);
       const slugs = JSON.parse(await readFile(codexCatalogPath(home), "utf8")).models.map((row) => row.slug);
-      assert.ok(slugs.includes("auto"));
+      assert.ok(slugs.includes("nexus/auto"));
       assert.ok(!slugs.includes("firerouter/test-model"));
     });
   });
@@ -172,7 +172,7 @@ describe("catalog rerun adversarial scenarios", () => {
       clearCatalogCacheForHome(home);
       const rerun = await (await runFireconnect(["login", "--api-key", V1_KEY], { HOME: home, ...NO_ENV, NEXUS_TEST_PLAN_TIER: "PRO" }), await runFireconnect(["codex", "on", "--model", "auto"], { HOME: home, ...NO_ENV, NEXUS_TEST_PLAN_TIER: "PRO" }));
       assert.equal(rerun.code, 0, rerun.stderr);
-      assert.deepEqual(await fireworksSlugs(), ["auto"]);
+      assert.deepEqual(await fireworksSlugs(), ["nexus/auto"]);
     });
   });
 

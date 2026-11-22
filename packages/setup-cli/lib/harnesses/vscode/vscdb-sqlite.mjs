@@ -1,5 +1,6 @@
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync } from "node:fs";
 import path from "node:path";
+import process from "node:process";
 import { spawnSyncCommand } from "../../system/win-command.mjs";
 import { loadNodeSqlite, sqlText } from "../../io/sqlite.mjs";
 
@@ -22,6 +23,33 @@ import { loadNodeSqlite, sqlText } from "../../io/sqlite.mjs";
  */
 function isMissingTableError(error) {
   return /no such table/i.test(error?.message ?? "");
+}
+
+/** Restrict database files before writes without following links. */
+export function secureItemTableFiles(dbPath) {
+  if (process.platform === "win32") return;
+  const descriptors = [];
+  try {
+    for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`]) {
+      let fd;
+      try {
+        fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      descriptors.push(fd);
+      const info = fstatSync(fd);
+      if (!info.isFile() || info.uid !== process.getuid()) {
+        throw new Error("Unsafe database file");
+      }
+    }
+    for (const fd of descriptors) fchmodSync(fd, 0o600);
+  } catch {
+    throw new Error("Cannot secure IDE database files. Check ownership, permissions, and symlinks.");
+  } finally {
+    for (const fd of descriptors) closeSync(fd);
+  }
 }
 
 /**
@@ -103,6 +131,7 @@ export async function ensureItemTable(dbPath) {
       closeSync(fd);
     }
   }
+  secureItemTableFiles(dbPath);
   const ddl = "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);";
   const DatabaseSync = await loadNodeSqlite();
   if (DatabaseSync) {
@@ -132,6 +161,7 @@ export async function ensureItemTable(dbPath) {
  * @returns {Promise<void>}
  */
 export async function writeItemTableValue(dbPath, key, value) {
+  secureItemTableFiles(dbPath);
   const DatabaseSync = await loadNodeSqlite();
   if (DatabaseSync) {
     let db;
@@ -161,7 +191,9 @@ export async function writeItemTableValue(dbPath, key, value) {
  * @returns {Promise<void>}
  */
 export async function deleteItemTableValue(dbPath, key) {
-  if (!dbPath || !existsSync(dbPath)) {
+  if (!dbPath) return;
+  secureItemTableFiles(dbPath);
+  if (!existsSync(dbPath)) {
     return;
   }
   const DatabaseSync = await loadNodeSqlite();
@@ -197,6 +229,7 @@ export async function applyItemTableWrites(dbPath, mutations) {
   if (mutations.length === 0) {
     return;
   }
+  secureItemTableFiles(dbPath);
 
   const DatabaseSync = await loadNodeSqlite();
   if (DatabaseSync) {

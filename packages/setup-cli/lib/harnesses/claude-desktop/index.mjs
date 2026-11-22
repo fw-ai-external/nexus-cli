@@ -2,6 +2,13 @@ import { defineHarness } from "../../harness/types.mjs";
 import { resolveFireworksKeyWithSource } from "../../keys/api-key.mjs";
 import { printHarnessConnected, printModelsAdded, printCommandHint, printBody, printInfo, printNote } from "../../cli/messages.mjs";
 import { LIMITED_NOTE, WORKSPACE_NOTES } from "./core.mjs";
+import { printModelAccessNote } from "../../harness/status-display.mjs";
+import { harnessModelAccess } from "../../harness/engine.mjs";
+
+// `on` keeps saved custom models, so "rerun on" can't clear them; say what
+// actually happens instead.
+const DESKTOP_BLOCKED_ADVICE = "Claude Desktop stops listing it after the next catalog refresh (restart Desktop to see the change) "
+  + "and lists it again if your account can use it again.";
 
 const LABEL = "Claude Desktop";
 
@@ -28,7 +35,7 @@ const adapter = defineHarness({
     const { disableProfileLane, readProfileState } = await import("./profile-lane.mjs");
     const log = ctx.quiet ? () => {} : (line) => console.log(line);
     const touched = Boolean(await readProfileState(ctx.home));
-    if (touched) await disableProfileLane(ctx.home, { log });
+    await disableProfileLane(ctx.home, { log: touched ? log : () => {} });
     return touched ? "restored" : "none";
   },
   /**
@@ -84,6 +91,34 @@ const adapter = defineHarness({
     }
     console.log("Restart Claude Desktop to pick up the change.");
   },
+  async restart(ctx) {
+    if (!ctx.home) throw new Error("HOME is not set; pass --home.");
+    const { restartShim } = await import("./profile-lane.mjs");
+    await restartShim(ctx.home);
+    printBody("Claude Desktop's connection to Fireworks is running again.");
+  },
+  /**
+   * The models added with `on --model`: the rest of the line-up is rebuilt
+   * from the served catalog, so only these can name a model it doesn't list.
+   */
+  modelAccessAdvice: DESKTOP_BLOCKED_ADVICE,
+  async configuredModels(ctx) {
+    const { readProfileState, readManualModels } = await import("./profile-lane.mjs");
+    const state = await readProfileState(ctx.home);
+    if (state?.enabled !== true) return [];
+    return (await readManualModels(ctx.home))
+      .filter((m) => typeof m?.shortId === "string" && m.shortId)
+      .map((m) => ({ slot: "custom", model: m.shortId }));
+  },
+  /**
+   * Status's model-access check never reads the keychain. A literal key in
+   * the profile is used as is; a Desktop token stands for the stored key,
+   * which status can't read without a possible prompt, so it is unknown.
+   */
+  async modelAccessKeyInUse(ctx) {
+    const { readClaudeDesktopProfileLiteralKey } = await import("./profile-lane.mjs");
+    return readClaudeDesktopProfileLiteralKey(ctx.home);
+  },
   async keyInUse(ctx) {
     const { readClaudeDesktopProfileKey } = await import("./profile-lane.mjs");
     return readClaudeDesktopProfileKey(ctx.home);
@@ -96,11 +131,18 @@ const adapter = defineHarness({
       else console.log(`${LABEL}: not configured. Run \`nexus claude-desktop on\`.`);
       return;
     }
+    if (profile.state.enabled !== true) {
+      if (ctx.json === true) console.log(JSON.stringify({ enabled: false, lane: "profile", incomplete: true }, null, 2));
+      else console.log(`${LABEL}: setup did not finish. Run \`nexus claude-desktop on\` to finish it or \`nexus claude-desktop off\` to undo it.`);
+      return;
+    }
+    const modelAccess = await harnessModelAccess(adapter, ctx);
     if (ctx.json === true) {
       console.log(JSON.stringify({
         enabled: true, lane: "profile", port: profile.state.port,
         shimHealthy: profile.shimHealthy, shimUnverified: profile.shimUnverified, profileApplied: profile.appliedProfileIsOurs,
         connectors: profile.state.connectors ?? [],
+        modelAccess,
       }, null, 2));
       return;
     }
@@ -108,10 +150,11 @@ const adapter = defineHarness({
     const shim = profile.shimHealthy ? "healthy"
       : profile.shimUnverified ? `NOT VERIFIED — something answers on port ${profile.state.port} but isn't the Nexus shim, `
         + "and Claude Desktop sends your Fireworks key to that port. Quit Claude Desktop, then run `nexus claude-desktop on`"
-        : "NOT RESPONDING";
+        : "NOT RESPONDING — run `nexus claude-desktop restart`";
     console.log(`  Shim: ${shim}`);
     console.log(`  Profile applied: ${profile.appliedProfileIsOurs ? "yes" : "no — restart Claude Desktop or check Setup"}`);
     console.log(`  Connectors migrated: ${(profile.state.connectors ?? []).join(", ") || "none detected"}`);
+    printModelAccessNote("claude-desktop", modelAccess, { advice: adapter.modelAccessAdvice });
   },
 });
 

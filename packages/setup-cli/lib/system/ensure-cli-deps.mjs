@@ -26,14 +26,6 @@ export function dependencyInstalled(dep, setupDir = resolveSetupCliDir()) {
 
 /**
  * @param {string} [setupDir]
- * @returns {boolean}
- */
-export function crossKeychainInstalled(setupDir = resolveSetupCliDir()) {
-  return dependencyInstalled("cross-keychain", setupDir);
-}
-
-/**
- * @param {string} [setupDir]
  * @returns {string[] | null}
  */
 export function runtimeDependencyNames(setupDir = resolveSetupCliDir()) {

@@ -1,37 +1,13 @@
-import { isAutoModelId } from "./model-specs.mjs";
 import {
-  isAnthropicModelId,
-  isFirerouterRouteRef,
-  shortFireworksModelRef,
-} from "./model-id.mjs";
+  isModelAccessDenial,
+  isModelIdValidationApplicable,
+  isModelInCatalog,
+  modelNotAvailableMessage,
+} from "./model-access.mjs";
 import { loadServerlessCatalog } from "./models.mjs";
+import { fireworksInferenceUrl } from "./residency.mjs";
 
-// Custom (user-deployed) Fireworks models are served on the gateway but aren't
-// listed in the public serverless catalog, so the servability check must allow
-// them through.
-const CUSTOM_DEPLOYMENT_REF_RE = /^accounts\/[^/]+\/deployments\/[^/]+(\[1m\])?$/i;
-
-/**
- * Whether `--model` must resolve in the serverless catalog.
- * Gateway ids that are never catalog rows skip the check: rooted
- * `firerouter` routes, `auto` / `auto-*`, concrete Anthropic ids, and
- * private `accounts/…/deployments/…`. The Claude `claude-default` sentinel
- * is not one of those — only Claude Code understands it. Empty means the
- * harness default.
- * @param {string} modelId
- * @returns {boolean}
- */
-export function isModelIdValidationApplicable(modelId) {
-  if (!modelId) {
-    return false;
-  }
-  const ref = shortFireworksModelRef(modelId);
-  const servedOutsideCatalog = isFirerouterRouteRef(ref)
-    || isAutoModelId(ref)
-    || isAnthropicModelId(ref)
-    || CUSTOM_DEPLOYMENT_REF_RE.test(ref);
-  return !servedOutsideCatalog;
-}
+export { isModelIdValidationApplicable, modelNotAvailableMessage };
 
 /**
  * Throw if any provided model id isn't a real Fireworks serverless model.
@@ -55,19 +31,13 @@ export async function assertRequestedModelsServable(modelIds, { apiKey } = {}) {
     return; // offline / fetch failed — can't verify, don't block
   }
   if (!Array.isArray(catalog) || catalog.length === 0) return;
-  const known = new Set(catalog.flatMap((entry) => [entry?.shortId, entry?.id].filter(Boolean)));
   for (const id of applicable) {
     // Match the shortened ref, not its last segment. A last-segment hit would
     // admit `fireworks/kimi-k3` or `accounts/acme/models/kimi-k3` whenever the
     // public slug is listed.
-    const short = String(shortFireworksModelRef(id)).replace(/\[1m\]$/i, "");
-    if (known.has(short)) {
-      continue;
+    if (!isModelInCatalog(id, catalog)) {
+      throw new Error(modelNotAvailableMessage(id));
     }
-    throw new Error(
-      `Model "${shortFireworksModelRef(id)}" is not available on Fireworks. `
-      + `Run \`nexus model list --refresh\` to see serverless models.`,
-    );
   }
 }
 
@@ -79,8 +49,9 @@ export function assertRequestedModelServable(modelId, opts) {
  * Servability probe: catalog membership alone is not enough — the catalog
  * lists retired models (dated snapshots, superseded generations) with full
  * metadata and no flag, so the only retirement signal is a request: 404
- * "Model not found" at POST /inference/v1/messages. Anything else (2xx, 429,
- * other 4xx) means the model serves. 16-token probe; call from setup paths
+ * "Model not found" at POST /inference/v1/messages. A Model Access policy
+ * 403 means the account can't use it. Anything else (2xx, 429, other 4xx)
+ * means the model serves. 16-token probe; call from setup paths
  * only (never a hot path); NEXUS_TEST gates real calls.
  * @param {string} modelId
  * @param {string} apiKey
@@ -90,7 +61,7 @@ export function assertRequestedModelServable(modelId, opts) {
 export async function probeModelServable(modelId, apiKey, { timeoutMs = 8_000, fetchImpl = fetch } = {}) {
   if (process.env.NEXUS_TEST === "1") return true;
   try {
-    const res = await fetchImpl("https://api.fireworks.ai/inference/v1/messages", {
+    const res = await fetchImpl(fireworksInferenceUrl("https://api.fireworks.ai/inference/v1/messages"), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -100,6 +71,12 @@ export async function probeModelServable(modelId, apiKey, { timeoutMs = 8_000, f
       body: JSON.stringify({ model: modelId, max_tokens: 8, messages: [{ role: "user", content: "ok" }] }),
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (res.status === 403) {
+      // The account's Model Access policy refuses this model: it serves, but
+      // not for this account. Any other 403 is no verdict on the model.
+      const body = await res.text().catch(() => "");
+      return !isModelAccessDenial(res.status, body);
+    }
     return res.status !== 404;
   } catch {
     return true; // network trouble is not a verdict; keep the model

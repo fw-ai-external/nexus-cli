@@ -1,7 +1,9 @@
 import { Buffer } from "node:buffer";
+import { FIREWORKS_GATEWAY_FETCH_TIMEOUT_MS } from "../fireworks/gateway-fetch.mjs";
+import { warnInsecureUrlOverride } from "../system/url-override-warning.mjs";
 
 /**
- * Minimal gRPC-web client for the handful of control-plane calls the CLI
+ * Minimal gRPC-web client for the handful of Fireworks API calls the CLI
  * makes (mint/delete an API key after browser sign-in). Hand-rolled to
  * preserve the zero-dependency posture: the messages involved are a few
  * string and sub-message fields, which is the easy corner of protobuf.
@@ -122,12 +124,13 @@ export function pbStringAt(fields, field) {
  *   understands JWTs — so pass `{ apiKey }` for keys.
  *   `null`/"" sends no auth header (for unauthenticated RPCs like
  *   GetOAuthArguments).
- * @param {{ signal?: AbortSignal }} [options]
+ * @param {{ signal?: AbortSignal, timeoutMs?: number }} [options]  `timeoutMs` 0 means the default bound.
  *   `signal` aborts the request and its body read (an abort throws, like a
  *   network error).
  * @returns {Promise<GrpcWebResult>}
  */
-export async function grpcWebCall(baseUrl, method, requestBytes, auth, { signal } = {}) {
+export async function grpcWebCall(baseUrl, method, requestBytes, auth, { signal, timeoutMs = FIREWORKS_GATEWAY_FETCH_TIMEOUT_MS } = {}) {
+  warnInsecureUrlOverride(baseUrl, "NEXUS_GATEWAY_GRPC_WEB_URL");
   const authHeader = auth == null || auth === ""
     ? {}
     : typeof auth === "string"
@@ -143,7 +146,7 @@ export async function grpcWebCall(baseUrl, method, requestBytes, auth, { signal 
       ...authHeader,
     },
     body: Buffer.concat([header, requestBytes]),
-    signal,
+    signal: AbortSignal.any([AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : FIREWORKS_GATEWAY_FETCH_TIMEOUT_MS), ...(signal ? [signal] : [])]),
   });
 
   const body = Buffer.from(await response.arrayBuffer());

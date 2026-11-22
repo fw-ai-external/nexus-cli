@@ -38,6 +38,26 @@ export const FIREWORKS_MODEL_SPECS = {
     pricing: { input: 0.30, cachedInput: 0.006, output: 1.20 },
     capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000, vision: true, toolCalling: true },
   },
+  "deepseek-v4p1-flash-us": {
+    label: "DeepSeek V4.1 Flash (US)",
+    pricing: { input: 0.45, cachedInput: 0.009, output: 1.80 },
+    capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000, vision: true, toolCalling: true },
+  },
+  "deepseek-v4p1-flash-1017": {
+    label: "DeepSeek V4.1 Flash 1017",
+    pricing: { input: 0.30, cachedInput: 0.006, output: 1.20 },
+    capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000, vision: true, toolCalling: true },
+  },
+  "deepseek-v4p1-flash-1017-us": {
+    label: "DeepSeek V4.1 Flash 1017 (US)",
+    pricing: { input: 0.45, cachedInput: 0.009, output: 1.80 },
+    capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000, vision: true, toolCalling: true },
+  },
+  "deepseek-v4p1-flash-1017-ultrafast": {
+    label: "DeepSeek V4.1 Flash 1017 Ultra-fast",
+    pricing: { input: 1.20, cachedInput: 0.024, output: 4.80, tier: "ultrafast" },
+    capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000, vision: true, toolCalling: true },
+  },
   "glm-5p3": {
     label: "GLM 5.3",
     pricing: { input: 1.40, cachedInput: 0.26, output: 4.40 },
@@ -47,6 +67,11 @@ export const FIREWORKS_MODEL_SPECS = {
     label: "GLM 5.3 Flash",
     pricing: { input: 0.15, cachedInput: 0.03, output: 0.50 },
     capabilities: { contextWindow: 1_048_576, maxOutputTokens: 131_072, vision: true, toolCalling: true },
+  },
+  "glm-5p3-us": {
+    label: "GLM 5.3 (US)",
+    pricing: { input: 2.10, cachedInput: 0.39, output: 6.60 },
+    capabilities: { contextWindow: 1_048_576, maxOutputTokens: 131_072, vision: false, toolCalling: true },
   },
   "glm-5p3-flash-us": {
     label: "GLM 5.3 Flash (US)",
@@ -85,7 +110,7 @@ export const FIREWORKS_MODEL_SPECS = {
   },
   "kimi-k3-us": {
     label: "Kimi K3 (US)",
-    pricing: { input: 3.30, cachedInput: 0.33, output: 16.50 },
+    pricing: { input: 4.50, cachedInput: 0.45, output: 22.50 },
     capabilities: { contextWindow: 1_040_000, maxOutputTokens: 131_072, vision: true, toolCalling: true },
   },
   "kimi-k3-fast": {
@@ -191,6 +216,13 @@ export const FIREWORKS_MODEL_SPECS = {
  */
 export const AUTO_MODEL_ID = "auto";
 
+/**
+ * The `auto` mix as harnesses that can't use a bare `auto` name it (Cursor,
+ * Codex). The gateway serves it as the same mix, so every harness that sends
+ * it must use this one constant.
+ */
+export const NEXUS_AUTO_MODEL_ID = `nexus/${AUTO_MODEL_ID}`;
+
 /** Retired latency-first auto mix. Still recognized (labels, pricing, migration of stored selections); no longer supported as a selection. */
 export const AUTO_INSTANT_MODEL_ID = "auto-instant";
 
@@ -203,6 +235,7 @@ export const KNOWN_AUTO_MODEL_IDS = [AUTO_MODEL_ID];
 
 /** Cursor's built-in picker — not a Fireworks auto mix. */
 const NON_GATEWAY_AUTO_IDS = new Set(["auto-smart"]);
+export { NON_GATEWAY_AUTO_IDS };
 
 /**
  * Canonical short slug for an auto mix (`auto`, `auto-instant`). Empty when
@@ -250,18 +283,6 @@ export function isFirerouterModelPattern(model) {
     .some((part) => part.startsWith("firerouter"));
 }
 
-/** Router aliases used before the serverless catalog cache is warm. */
-export const KNOWN_LATEST_ROUTER_ALIASES = Object.freeze([
-  "deepseek-flash-latest",
-  "glm-fast-latest",
-  "glm-flash-latest",
-  "glm-latest",
-  "kimi-fast-latest",
-  "kimi-latest",
-  "minimax-latest",
-  "qwen-plus-latest",
-]);
-
 export const DEFAULT_MODEL_CAPABILITIES = {
   vision: false,
   toolCalling: true,
@@ -301,9 +322,53 @@ export function resolveLiveRouterBaseModelId(modelRef) {
   return null;
 }
 
-function appendFastTierLabel(label) {
+/** Append a serving-tier word ("Fast", "Ultra-fast") unless the label already ends with it. */
+function appendTierLabel(label, tier) {
   const trimmed = stripViaFireworksSuffix(label);
-  return / fast$/i.test(trimmed) ? trimmed : `${trimmed} Fast`;
+  return trimmed.toLowerCase().endsWith(` ${tier.toLowerCase()}`) ? trimmed : `${trimmed} ${tier}`;
+}
+
+/** Display word for each non-standard serving tier a router can have. */
+export const SERVING_TIER_LABELS = Object.freeze({ fast: "Fast", ultrafast: "Ultra-fast" });
+
+/** True for Ultra-fast mode router slugs (`*-ultrafast`). */
+export function isUltrafastShortId(shortId) {
+  return Boolean(shortId?.endsWith?.("-ultrafast"));
+}
+
+/**
+ * Whether a catalog entry is an Ultra-fast router: the row's own serving mode,
+ * or the `-ultrafast` slug when the entry carries no mode.
+ * @param {{ shortId?: string, serverlessMode?: string }} entry
+ */
+export function isUltrafastEntry(entry) {
+  return entry?.serverlessMode === "ultrafast" || isUltrafastShortId(entry?.shortId);
+}
+
+/**
+ * Whether `routerRef` is a serving-mode router (Fast, Ultra-fast, Turbo) of the
+ * model `servedRef` names: the same model at its own rates. Reads the catalog's
+ * router base model and pricing tier; a cold cache falls back to the slug
+ * (`<model>-fast`, `<model>-ultrafast`, `<model>-turbo`).
+ * @param {string} routerRef
+ * @param {string} servedRef
+ * @returns {boolean}
+ */
+export function isModeRouterOf(routerRef, servedRef) {
+  const served = specShortIdFromModelRef(servedRef);
+  const slugBase = specShortIdFromModelRef(routerRef).match(/^(.+)-(?:fast|ultrafast|turbo)$/)?.[1];
+  const baseModelId = resolveLiveRouterBaseModelId(routerRef);
+  if (!baseModelId) {
+    return slugBase === served;
+  }
+  if (specShortIdFromModelRef(baseModelId) !== served) {
+    return false;
+  }
+  // A router row without usable SKUs has no cached tier; its static spec or slug still names the mode.
+  const tier = routerCatalogIdCandidates(routerRef)
+    .map((routerId) => lookupCachedServerlessPricing(routerId)?.tier)
+    .find(Boolean) ?? lookupModelSpec(routerRef)?.pricing?.tier;
+  return Object.hasOwn(SERVING_TIER_LABELS, tier ?? "") || Boolean(slugBase);
 }
 
 /** True when the ref is a stable `-latest` router alias (incl. `-fast-latest`). */
@@ -333,11 +398,56 @@ export function resolveRouterEntryDisplayName(routerId, baseDisplayName, { prici
   if (shortId.endsWith("-turbo")) {
     return appendLatestRouterSuffix(routerId, label);
   }
+  if (isUltrafastShortId(shortId) || pricingTier === "ultrafast") {
+    return appendLatestRouterSuffix(routerId, appendTierLabel(label, SERVING_TIER_LABELS.ultrafast));
+  }
   const needsFastTier = shortId.endsWith("-fast-latest")
     || shortId.endsWith("-fast")
+    || shortId.endsWith("-fast-us")
     || pricingTier === "fast";
-  const withTier = needsFastTier ? appendFastTierLabel(label) : label;
-  return appendLatestRouterSuffix(routerId, withTier);
+  const withTier = needsFastTier ? appendTierLabel(label, SERVING_TIER_LABELS.fast) : label;
+  return appendLatestRouterSuffix(routerId, isUsRouterShortId(shortId) ? appendUsRegionLabel(withTier) : withTier);
+}
+
+/** True for a US-only router slug (`kimi-k3-us`, `glm-5p3-flash-us`). */
+function isUsRouterShortId(shortId) {
+  return String(shortId).endsWith("-us");
+}
+
+/**
+ * Whether a ref names a US-only router (`kimi-k3-us`, `glm-5.3-flash-us`, even
+ * spelled `accounts/fireworks/models/kimi-k3-us`), as opposed to a model whose
+ * own id ends in `-us`. A `-us` slug is a router when the path says so, a US
+ * spec names it, or the live catalog lists it as one.
+ */
+function isUsRouterRef(modelRef) {
+  const shortId = String(specShortIdFromModelRef(modelRef)).toLowerCase();
+  if (!isUsRouterShortId(shortId)) {
+    return false;
+  }
+  return String(modelRef ?? "").includes("/routers/")
+    || isRouterShortId(shortId)
+    || isRouterShortId(resolveSpecSlug(modelRef));
+}
+
+/**
+ * Whether a ref is a US router with no static spec of its own. US rates are
+ * set per model, so such a router has no known price: its base model's global
+ * rate never applies. Its base model's capabilities still do.
+ */
+function isUnpricedUsRouter(modelRef) {
+  return isUsRouterRef(modelRef) && !isUsRouterShortId(resolveSpecSlug(modelRef));
+}
+
+/** Static rates for a ref, or null (see isUnpricedUsRouter). */
+export function lookupSpecPricing(modelRef) {
+  return isUnpricedUsRouter(modelRef) ? null : lookupModelSpec(modelRef)?.pricing ?? null;
+}
+
+/** Append " (US)" unless the label already ends with it. */
+function appendUsRegionLabel(label) {
+  const trimmed = String(label).trim();
+  return / \(US\)$/i.test(trimmed) ? trimmed : `${trimmed} (US)`;
 }
 
 function fastSpecSlugForBase(baseSlug, routerShortId) {
@@ -387,7 +497,11 @@ export function resolveFireworksModelLabel(modelRef) {
     ?? FIREWORKS_MODEL_SPECS[specShortIdFromModelRef(baseModelId)]?.label
     ?? null;
   if (!label) {
-    return null;
+    // A model listed only through its router has no row of its own; the
+    // router's row already carries the router's display name.
+    return routerCatalogIdCandidates(modelRef)
+      .map((routerId) => lookupCatalogEntryById(routerId)?.displayName)
+      .find(Boolean) ?? null;
   }
 
   const routerPricing = routerCatalogIdCandidates(modelRef)
@@ -413,13 +527,14 @@ export function lookupModelSpec(modelRef) {
 
 /**
  * Whether a bare short slug is a router (not a model). Suffix-based so new
- * `*-fast` / `*-latest` / `*-turbo` router slugs are classified correctly
- * without needing a hand-maintained list — `fullFireworksResourceId` relies on
+ * `*-fast` / `*-ultrafast` / `*-latest` / `*-turbo` router slugs are classified
+ * correctly without needing a hand-maintained list — `fullFireworksResourceId` relies on
  * this to pick `routers/` vs `models/`, so a stale list would mis-expand a
  * real router id to a non-existent `accounts/fireworks/models/...` path.
  * US-only router slugs (`kimi-k3-us`) carry no router suffix, so a static spec
  * for the slug is treated as a router too — every other spec key names a model
  * with a `models/` path, while the US spec keys name documented US routers.
+ * So is a `-us` slug the live catalog lists as a router.
  * @param {string} shortId
  * @returns {boolean}
  */
@@ -430,8 +545,12 @@ export function isRouterShortId(shortId) {
   return shortId.startsWith("firerouter")
     || shortId.endsWith("-latest")
     || shortId.endsWith("-fast")
+    || isUltrafastShortId(shortId)
     || shortId.endsWith("-turbo")
-    || (shortId.endsWith("-us") && Boolean(FIREWORKS_MODEL_SPECS[shortId]));
+    || (isUsRouterShortId(shortId) && (
+      Boolean(FIREWORKS_MODEL_SPECS[shortId])
+      || Boolean(lookupCachedRouterBaseModel(`accounts/fireworks/routers/${shortId}`))
+    ));
 }
 
 function canonicalResourceIdForCache(modelRef) {
@@ -488,7 +607,9 @@ export function pricingMatchesModelRefTier(modelRef, pricing) {
 
 /** Usable live cache pricing for a ref; tier must match the ref's expectations. */
 export function isUsableCachedServerlessPricing(modelRef, pricing) {
-  if (!pricing || (pricing.input <= 0 && pricing.output <= 0)) {
+  // A US router is priced from its US spec only. The catalog never caches a
+  // rate for one, and a rate an older catalog cached was its global model's.
+  if (!pricing || (pricing.input <= 0 && pricing.output <= 0) || isUsRouterRef(modelRef)) {
     return false;
   }
   return pricingMatchesModelRefTier(modelRef, pricing);
@@ -596,7 +717,7 @@ function resolveFireworksCatalogCost(modelRef, specPricing) {
 /** Per-million-token cost block for Pi models.json `cost` fields. */
 export function lookupFireworksModelCost(modelRef) {
   const pricing = firstCachedServerlessPricing(modelRef)
-    ?? lookupModelSpec(modelRef)?.pricing;
+    ?? lookupSpecPricing(modelRef);
   if (!pricing) {
     return null;
   }
@@ -636,7 +757,7 @@ export function resolveFireworksCatalog(modelRef) {
   });
   return {
     limits,
-    cost: resolveFireworksCatalogCost(modelRef, spec?.pricing),
+    cost: resolveFireworksCatalogCost(modelRef, lookupSpecPricing(modelRef)),
     input: fireworksInputModalities(limits),
     toolCalling: cachedSupportsTools ?? spec?.capabilities?.toolCalling ?? null,
     cache: {

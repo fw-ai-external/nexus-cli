@@ -80,7 +80,7 @@ describe("claude usage display", () => {
     assert.match(text, /claude-opus-4-8/);
     assert.match(text, /2K cache read/);
     assert.match(text, /Fireworks-served model estimate per request: \(input \* input rate/);
-    assert.match(text, /Anthropic model usage is fetched from session logs; estimated cost is calculated from local rates/);
+    assert.match(text, /Anthropic and OpenAI model usage is fetched from session logs; estimated cost is calculated from local rates/);
     assert.match(text, /\*\*\*All pricing shown below are estimates based on token usage/);
     assert.match(text, /Use -v \/ --verbose for request and sub-agent details/);
     assert.doesNotMatch(text, /Parent\/Sub-agent ID/);
@@ -302,7 +302,7 @@ describe("claude usage display", () => {
     assert.match(collapsed, /nexus usage · last 2 sessions/);
     assert.match(collapsed, /Cost estimate:/);
     assert.match(collapsed, /Fireworks-served model estimate per request: \(input \* input rate/);
-    assert.match(collapsed, /Anthropic model usage is fetched from session logs; estimated cost is calculated from local rates/);
+    assert.match(collapsed, /Anthropic and OpenAI model usage is fetched from session logs; estimated cost is calculated from local rates/);
     assert.match(collapsed, /\*\*\*All pricing shown below are estimates based on token usage/);
     assert.match(collapsed, /▸ 33333333 Auth retry work/);
     assert.match(collapsed, /▸ 22222222 Quick follow-up/);

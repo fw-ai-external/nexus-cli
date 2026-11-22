@@ -1,11 +1,15 @@
+import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 import { COPILOT_FIREWORKS_BASE_URL } from "../copilot-shared.mjs";
+import { fullFireworksResourceId } from "../../fireworks/model-id.mjs";
+import { reasoningEffortNamesFor } from "../../fireworks/reasoning.mjs";
 import { readJsonIfExists } from "../../io/json.mjs";
 import { omitHeaders } from "../../firerouter/core.mjs";
+import { activeAccountResidency, fireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 /**
  * GitHub Copilot **CLI** (`@github/copilot`) BYOK configuration.
@@ -166,15 +170,9 @@ export function buildCliModels(models) {
     ...(model.maxPromptTokens ? { maxPromptTokens: model.maxPromptTokens } : {}),
     ...(model.maxPromptTokens ? { maxContextWindowTokens: model.maxPromptTokens } : {}),
     ...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
-    // `supports` is camelCase (the nested `limits` keys are snake_case).
-    // reasoningEffort is an on/off toggle here — the CLI derives the actual
-    // effort menu from catalog lookup — and every level we publish for the
-    // desktop app was verified against the gateway.
-    //
-    // vision comes from the catalog (see the note at the top of this file).
     capabilities: {
       supports: {
-        reasoningEffort: true,
+        reasoning_effort: reasoningEffortNamesFor(fullFireworksResourceId(model.id)),
         ...(model.vision ? { vision: true } : {}),
       },
       ...(model.vision
@@ -216,7 +214,7 @@ export async function enableCopilotCli({
   const backupPath = copilotProvidersBackupPath(dataDir, providersPath);
   const hasBackup = Object.keys(await readJsonIfExists(backupPath)).length > 0;
   if (!hasBackup && !hasManagedProviders(raw)) {
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+    ensurePrivateParent(backupPath);
     await writeFileAtomic(backupPath, `${JSON.stringify({ providersPath: path.resolve(providersPath), snapshot: { existed, raw } }, null, 2)}\n`, { mode: 0o600 });
     await chmod(backupPath, 0o600);
   }
@@ -245,7 +243,7 @@ export async function enableCopilotCli({
         name: COPILOT_CLI_PROVIDER_NAME,
         type: "openai",
         wireApi: "completions",
-        baseUrl: COPILOT_FIREWORKS_BASE_URL,
+        baseUrl: fireworksInferenceUrl(COPILOT_FIREWORKS_BASE_URL, activeAccountResidency("copilot-cli")),
         apiKey,
         ...(Object.keys(extraHeaders).length > 0 ? { headers: extraHeaders } : {}),
       },
@@ -389,7 +387,7 @@ export async function selectCopilotCliModel({ settingsPath, dataDir, selectionId
   const hasBackup = Object.keys(await readJsonIfExists(backupPath)).length > 0;
   // Same rule as providers.json: never snapshot Nexus's own selection.
   if (!hasBackup && !hasManagedSelection(raw)) {
-    await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+    ensurePrivateParent(backupPath);
     await writeFileAtomic(backupPath, `${JSON.stringify({ settingsPath: path.resolve(settingsPath), snapshot: { existed, raw } }, null, 2)}\n`, { mode: 0o600 });
     await chmod(backupPath, 0o600).catch(() => {});
   }

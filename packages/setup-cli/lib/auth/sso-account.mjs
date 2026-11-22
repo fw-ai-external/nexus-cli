@@ -67,22 +67,22 @@ export function normalizeCognitoDomain(domain) {
  * @param {{ baseUrl?: string }} [options]
  * @returns {Promise<OAuthArgsResult>}
  */
-export async function getOAuthArgumentsForAccount(accountId, { baseUrl = GATEWAY_GRPC_WEB_URL } = {}) {
+export async function getOAuthArgumentsForAccount(accountId, { baseUrl = GATEWAY_GRPC_WEB_URL, signal } = {}) {
   const id = accountId?.trim() ?? "";
   if (!id) {
     return failedArgs("No account ID given.");
   }
   let result;
   try {
-    result = await grpcWebCall(baseUrl, "GetOAuthArguments", pbString(1, id), "");
+    result = await grpcWebCall(baseUrl, "GetOAuthArguments", pbString(1, id), "", { signal });
   } catch (error) {
-    return failedArgs(`Couldn't reach the Fireworks control plane (${error?.message ?? "network error"}).`);
+    return failedArgs(`Couldn't reach the Fireworks API (${error?.message ?? "network error"}).`);
   }
   if (result.status !== 0 || !result.message) {
     // The server answers PERMISSION_DENIED for unknown accounts — don't
     // leak-guess; the recovery is the same either way.
     return failedArgs(
-      `Couldn't find SSO sign-in configuration for account "${id}". Check the account ID with your admin, or use nexus login --paste.`,
+      `Couldn't find SSO sign-in configuration for account "${id}". Check the account ID with your admin.`,
     );
   }
   const fields = pbDecode(result.message);
@@ -90,7 +90,7 @@ export async function getOAuthArgumentsForAccount(accountId, { baseUrl = GATEWAY
   const cognitoDomain = normalizeCognitoDomain(pbStringAt(fields, 3));
   if (!clientId || !cognitoDomain) {
     return failedArgs(
-      `Account "${id}" has no SSO sign-in configured. Check the account ID with your admin, or use nexus login --paste.`,
+      `Account "${id}" has no SSO sign-in configured. Check the account ID with your admin.`,
     );
   }
   return { ok: true, issuerUrl: pbStringAt(fields, 1), clientId, cognitoDomain, failure: "" };
@@ -116,7 +116,7 @@ export async function createUserJit(idToken, accountId, { baseUrl = GATEWAY_GRPC
   try {
     result = await grpcWebCall(baseUrl, "CreateUser", request, idToken);
   } catch (error) {
-    return { ok: false, failure: `Couldn't reach the Fireworks control plane (${error?.message ?? "network error"}).` };
+    return { ok: false, failure: `Couldn't reach the Fireworks API (${error?.message ?? "network error"}).` };
   }
   if (result.status === 0 || result.status === GRPC_ALREADY_EXISTS || result.status === GRPC_PERMISSION_DENIED) {
     return { ok: true, failure: "" };

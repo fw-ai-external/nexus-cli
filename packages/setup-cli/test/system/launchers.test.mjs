@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, lstat, mkdir, readdir, readFile, readlink, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, readlink, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, it } from "node:test";
 

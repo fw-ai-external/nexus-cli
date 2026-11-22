@@ -91,15 +91,16 @@ export async function prepareDemoRun({
       stdin,
       stdout,
     });
-    const wizardDefaults = await loadDemoWizardDefaults(home, readiness, cliOverrides(options));
-
     const fwKey = await resolveFireworksApiKey({ apiKey: ctx.apiKey, home });
     if (!fwKey) {
       throw new Error(formatReadinessError(await assessDemoReadiness({ home, apiKey: ctx.apiKey })));
     }
 
+    // Warm the catalog first: the wizard's defaults come from it, and a cold
+    // cache would otherwise leave them on `auto`.
     await warmServerlessPricingCache(fwKey);
     refreshDemoPickerFromServerlessCatalog();
+    const wizardDefaults = await loadDemoWizardDefaults(home, readiness, cliOverrides(options));
 
     let prompt = options.prompt || options.promptFile
       ? await resolvePrompt({ prompt: options.prompt, promptFile: options.promptFile })

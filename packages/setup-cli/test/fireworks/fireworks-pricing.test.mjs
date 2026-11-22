@@ -3,9 +3,7 @@ import assert from "node:assert/strict";
 import {
   attachPricing,
   formatAnthropicStylePerMtok,
-  formatPricingDescription,
   formatPricingInOut,
-  formatPricingLine,
   formatUsd,
   lookupFireworksPricing,
 } from "../../lib/fireworks/pricing.mjs";
@@ -118,8 +116,18 @@ describe("fireworks-pricing", () => {
     // the static specs rather than the global base model's.
     const kimiUs = lookupFireworksPricing("kimi-k3-us");
     assert.equal(kimiUs?.slug, "kimi-k3-us");
-    assert.equal(kimiUs?.input, 3.30);
-    assert.equal(kimiUs?.output, 16.50);
+    assert.equal(kimiUs?.input, 4.50);
+    assert.equal(kimiUs?.output, 22.50);
+
+    const glmUs = lookupFireworksPricing("glm-5p3-us");
+    assert.equal(glmUs?.slug, "glm-5p3-us");
+    assert.equal(glmUs?.input, 2.10);
+    assert.equal(glmUs?.output, 6.60);
+
+    const deepseekUs = lookupFireworksPricing("deepseek-v4p1-flash-1017-us");
+    assert.equal(deepseekUs?.slug, "deepseek-v4p1-flash-1017-us");
+    assert.equal(deepseekUs?.input, 0.45);
+    assert.equal(deepseekUs?.output, 1.80);
 
     const glmFlashUs = lookupFireworksPricing("glm-5p3-flash-us");
     assert.equal(glmFlashUs?.slug, "glm-5p3-flash-us");
@@ -147,11 +155,6 @@ describe("fireworks-pricing", () => {
     assert.equal(formatAnthropicStylePerMtok(null), null);
   });
 
-  it("formats a full pricing line for status output", () => {
-    const pricing = lookupFireworksPricing("accounts/fireworks/models/glm-5p2");
-    assert.match(formatPricingLine(pricing), /\$1\.4 in \/ \$0\.14 cached in \/ \$4\.4 out per Mtok/);
-  });
-
   it("returns null pricing metadata for unknown models", () => {
     assert.equal(lookupFireworksPricing("accounts/fireworks/models/unknown-model"), null);
     assert.equal(attachPricing("accounts/fireworks/models/unknown-model"), null);
@@ -161,13 +164,6 @@ describe("fireworks-pricing", () => {
     const pricing = lookupFireworksPricing("accounts/fireworks/models/glm-5p1");
     assert.equal(pricing?.label, "GLM 5.1");
     assert.equal(pricing?.input, 1.40);
-  });
-
-  it("falls back to docs link when pricing is unknown", () => {
-    assert.match(
-      formatPricingDescription(null),
-      /docs\.fireworks\.ai\/serverless\/pricing/,
-    );
   });
 
   it("falls back to static specs when cached pricing is all zero", () => {

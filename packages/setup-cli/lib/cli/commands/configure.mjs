@@ -45,8 +45,8 @@ export async function runConfigureCommand(ctx) {
   // `--api-key` here is the Azure endpoint key, not the Fireworks key.
   if (ctx.apiKeyFromFlag && provider !== "azure") {
     throw new Error(
-      "configure doesn't set the Fireworks API key — run `nexus login` "
-        + "(or `nexus login --with-token` for CI). In configure, --api-key is the "
+      "configure doesn't set the Fireworks API key — run `nexus login`. "
+        + "In configure, --api-key is the "
         + "Azure endpoint key and requires --provider azure.",
     );
   }

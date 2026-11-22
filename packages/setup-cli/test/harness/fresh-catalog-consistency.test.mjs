@@ -5,7 +5,6 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { codexCatalogPath, codexConfigPath } from "../../lib/harnesses/codex/core.mjs";
-import { parseToml } from "../../lib/harnesses/codex/toml.mjs";
 import { opencodeConfigPath } from "../../lib/harnesses/opencode/core.mjs";
 import { piModelsPath, piSettingsPath } from "../../lib/harnesses/pi/core.mjs";
 import { isFireconnectProvider } from "../../lib/harnesses/vscode/core.mjs";
@@ -19,6 +18,7 @@ import {
   cursorCurrentModelId,
 } from "../../lib/harnesses/cursor/core.mjs";
 import { shortFireworksModelRef } from "../../lib/fireworks/model-id.mjs";
+import { createCopilotDb } from "../fixtures/copilot-db.mjs";
 import {
   itIfSqlite,
   mockServerlessModel,
@@ -171,7 +171,7 @@ describe("fresh on --model seeds the full catalog in every harness", () => {
   itIfSqlite("copilot-app registers both routers", async () => {
     await withTempHome("fc-contract-copilot-", async (home) => {
       const dbPath = path.join(home, "data.db");
-      await mkdir(path.dirname(dbPath), { recursive: true });
+      createCopilotDb(dbPath);
       seedTwoRouterCatalog(home);
 
       const result = await freshOn(

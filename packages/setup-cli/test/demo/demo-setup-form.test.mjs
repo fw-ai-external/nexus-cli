@@ -5,7 +5,6 @@ import {
   createFormState,
   applyKey,
   formResult,
-  curatedChallengers,
   curatedDemoModels,
   renderFormLines,
   estimateRaceCost,
@@ -198,11 +197,6 @@ test("curatedDemoModels: includes Anthropic slots and latest Fireworks picks", (
   assert.ok(ids.includes("auto"));
   assert.ok(!ids.some((id) => id.startsWith("firerouter")));
   assert.ok(!ids.includes("glm-5p2-fast"));
-});
-
-test("curatedChallengers: excludes Anthropic subscription slots", () => {
-  const list = curatedChallengers();
-  assert.ok(!list.some((m) => m.id === "opus"));
 });
 
 test("applyKey: q quits from any step", () => {

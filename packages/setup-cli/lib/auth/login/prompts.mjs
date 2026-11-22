@@ -1,19 +1,28 @@
-import process, { stdin, stdout } from "node:process";
+import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { accent } from "../../ui/term.mjs";
 
 /**
- * @param {{ stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream }} [streams]
- * @returns {Promise<"browser" | "paste" | "sso" | null>}
+ * Which kind of account the user signs in with: it picks the browser sign-in
+ * (the Nexus page or the Fireworks Platform's) and the page an API key comes from.
+ * @param {{ stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream, browser?: boolean }} [options]  `browser: false` when login goes straight to key paste.
+ * @returns {Promise<"nexus" | "platform" | null>}
  */
-export async function promptSignInMethod({ stdin: in_ = stdin, stdout: out_ = stdout } = {}) {
+export async function promptAccountKind({ stdin: in_ = stdin, stdout: out_ = stdout, browser = true } = {}) {
   out_.write("\n");
-  out_.write("  Nexus CLI needs a Fireworks API key for this machine.\n");
-  out_.write(`  (Removable anytime with ${accent("nexus logout", out_)}.)\n`);
+  out_.write("  Let's sign you in to Nexus on this machine.\n");
   out_.write("\n");
-  out_.write(`    ${accent("1", out_)}) Create one for me — opens your browser to sign in or sign up\n`);
-  out_.write(`    ${accent("2", out_)}) I already have a key — paste it\n`);
-  out_.write(`    ${accent("3", out_)}) My company uses custom SSO — sign in through your identity provider\n`);
+  out_.write("  Which account do you use?\n");
+  out_.write("\n");
+  out_.write(`    ${accent("1", out_)}) Nexus account: Pro, Team, or Enterprise plan at nexus.fireworks.ai\n`);
+  out_.write(`    ${accent("2", out_)}) Fireworks Platform account: app.fireworks.ai\n`);
+  out_.write("\n");
+  if (browser) {
+    out_.write("  Your browser opens to sign in. Company SSO? Press q, then run nexus login --account <account-id>.\n");
+  } else {
+    out_.write("  This picks the page where you create an API key.\n");
+  }
+  out_.write(`  You can sign out anytime with ${accent("nexus logout", out_)}.\n`);
   out_.write("\n");
   const rl = createInterface({ input: in_, output: out_ });
   try {
@@ -22,51 +31,15 @@ export async function promptSignInMethod({ stdin: in_ = stdin, stdout: out_ = st
     for await (const line of rl) {
       const answer = line.trim().toLowerCase();
       if (answer === "" || answer === "1") {
-        return "browser";
+        return "nexus";
       }
       if (answer === "2") {
-        return "paste";
-      }
-      if (answer === "3") {
-        return "sso";
+        return "platform";
       }
       if (answer === "q" || answer === "quit") {
         return null;
       }
-      out_.write("  Enter 1, 2 or 3, or q to cancel.\n");
-      rl.prompt();
-    }
-    return null;
-  } finally {
-    rl.close();
-  }
-}
-
-/**
- * @param {string} remembered
- * @param {{ stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream }} [streams]
- * @returns {Promise<string | null>}
- */
-export async function promptAccountId(remembered = "", { stdin: in_ = stdin, stdout: out_ = stdout } = {}) {
-  out_.write("\n");
-  out_.write("  Which Fireworks account should this sign-in use?\n");
-  out_.write("  (The account ID your admin shared — the console's SSO login asks for the same one.)\n");
-  const rl = createInterface({ input: in_, output: out_ });
-  try {
-    rl.setPrompt(remembered ? `  Account ID [${remembered}]: ` : "  Account ID: ");
-    rl.prompt();
-    for await (const line of rl) {
-      const answer = line.trim();
-      if (answer.toLowerCase() === "q" || answer.toLowerCase() === "quit") {
-        return null;
-      }
-      if (answer) {
-        return answer;
-      }
-      if (remembered) {
-        return remembered;
-      }
-      out_.write("  Enter your account ID, or q to cancel.\n");
+      out_.write("  Please enter 1 or 2 (or q to cancel).\n");
       rl.prompt();
     }
     return null;
@@ -78,7 +51,7 @@ export async function promptAccountId(remembered = "", { stdin: in_ = stdin, std
 /**
  * @param {string} question
  * @param {{ stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream, defaultYes?: boolean }} [options]
- * @returns {Promise<boolean>}
+ * @returns {Promise<boolean|null>}  `null` when input closes (Ctrl-C, EOF) before an answer.
  */
 export async function promptYesNo(question, { stdin: in_ = stdin, stdout: out_ = stdout, defaultYes = true } = {}) {
   const rl = createInterface({ input: in_, output: out_ });
@@ -99,7 +72,7 @@ export async function promptYesNo(question, { stdin: in_ = stdin, stdout: out_ =
       out_.write("  Enter y or n.\n");
       rl.prompt();
     }
-    return false;
+    return null;
   } finally {
     rl.close();
   }

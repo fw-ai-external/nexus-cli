@@ -60,8 +60,3 @@ export function truecolorSupported(env = process.env) {
 export function isColorEnabled(stream = process.stdout) {
   return colorsEnabled(stream);
 }
-
-/** @deprecated Use {@link colorsEnabled} — alias kept for term.mjs callers. */
-export function isInteractiveColorEnabled(stream = process.stdout) {
-  return colorsEnabled(stream);
-}

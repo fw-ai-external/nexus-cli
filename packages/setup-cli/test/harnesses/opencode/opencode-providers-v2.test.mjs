@@ -14,6 +14,7 @@ import {
 } from "../../../lib/harnesses/opencode/core.mjs";
 import {
   dropOpencodeProvider,
+  isMirroredOpencodeV2Provider,
   mirrorOpencodeV2Providers,
   opencodeV2ProviderEntry,
 } from "../../../lib/harnesses/opencode/providers-v2.mjs";
@@ -178,7 +179,7 @@ describe("opencode v2 providers on enable", () => {
 describe("opencode v2 providers on disable", () => {
   it("strips the mirrored entries when no backup exists", async () => {
     const paths = await tempConfig({ providers: { anthropic: { settings: {} } } });
-    await enableAuto(paths);
+    await enableAuto(paths, { telemetryHeaders: { "HTTP-Referer": "nexus/v1.0.0" } });
     await unlink(opencodeBackupPath(paths.dataDir, paths.configPath));
 
     assert.equal(await disableOpencodeFireworks({ ...paths, wasEnabled: true }), "stripped");
@@ -192,14 +193,17 @@ describe("opencode v2 providers on disable", () => {
       providers: { "fireworks-ai": native },
     });
 
-    assert.equal(await disableOpencodeFireworks({ ...paths, wasEnabled: true }), "stripped");
-    assert.deepEqual(await readConfig(paths.configPath), { providers: { "fireworks-ai": native } });
+    assert.equal(await disableOpencodeFireworks({ ...paths, wasEnabled: true }), "unchanged");
+    assert.deepEqual(await readConfig(paths.configPath), {
+      model: "fireworks-ai/glm-latest",
+      providers: { "fireworks-ai": native },
+    });
   });
 
   it("drops an empty provider map like v1-only off does, but keeps an untouched empty providers map", async () => {
     const paths = await tempConfig({ provider: {}, providers: {}, model: "fireworks-ai/glm-latest" });
     assert.equal(await disableOpencodeFireworks({ ...paths, wasEnabled: true }), "stripped");
-    assert.deepEqual(await readConfig(paths.configPath), { providers: {} });
+    assert.deepEqual(await readConfig(paths.configPath), { providers: {}, model: "fireworks-ai/glm-latest" });
   });
 
   it("does not leak the mirror into the backup: off restores the original bytes", async () => {
@@ -235,6 +239,29 @@ describe("mirrorOpencodeV2Providers / dropOpencodeProvider", () => {
     assert.deepEqual(dropOpencodeProvider(config, "fireworks-ai"), { provider: {}, providers: { other: {} } });
     const nativeOnly = { providers: { "fireworks-ai": {} } };
     assert.equal(dropOpencodeProvider(nativeOnly, "fireworks-ai"), nativeOnly);
+  });
+});
+
+describe("isMirroredOpencodeV2Provider", () => {
+  const legacy = { options: { apiKey: KEY, headers: { "x-a": "1" } }, models: { m: { name: "M" } } };
+
+  it("holds when there is no v2 entry to disagree with", () => {
+    assert.equal(isMirroredOpencodeV2Provider({ provider: { "fireworks-ai": legacy } }, "fireworks-ai"), true);
+    assert.equal(isMirroredOpencodeV2Provider({ provider: { "fireworks-ai": legacy }, providers: {} }, "fireworks-ai"), true);
+    assert.equal(isMirroredOpencodeV2Provider({ provider: { "fireworks-ai": legacy }, providers: null }, "fireworks-ai"), true);
+  });
+
+  it("holds for the entry mirrorOpencodeV2Providers writes and fails once it is edited", () => {
+    const mirrored = mirrorOpencodeV2Providers({ provider: { "fireworks-ai": legacy }, providers: {} }, ["fireworks-ai"]);
+    assert.equal(isMirroredOpencodeV2Provider(mirrored, "fireworks-ai"), true);
+    const roundTripped = JSON.parse(JSON.stringify(mirrored));
+    assert.equal(isMirroredOpencodeV2Provider(roundTripped, "fireworks-ai"), true);
+    roundTripped.providers["fireworks-ai"].models.mine = { name: "Mine" };
+    assert.equal(isMirroredOpencodeV2Provider(roundTripped, "fireworks-ai"), false);
+  });
+
+  it("fails for a native-only v2 entry", () => {
+    assert.equal(isMirroredOpencodeV2Provider({ providers: { "fireworks-ai": { settings: {} } } }, "fireworks-ai"), false);
   });
 });
 

@@ -1,9 +1,11 @@
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { spawnSyncCommand } from "../../system/win-command.mjs";
 import { loadNodeSqlite, sqlText } from "../../io/sqlite.mjs";
 import { ensureIdeStopped, isIdeRunning, quitInstruction } from "../../io/ide-running.mjs";
+import { activeAccountResidency, fireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
 /* -------------------------------------------------------------------------- */
 /* GitHub Copilot desktop app SQLite access (`~/.copilot/data.db`).            */
@@ -51,11 +53,13 @@ export async function execCopilotSql(dbPath, statements) {
   if (statements.length === 0) {
     return;
   }
+  await requireCopilotDatabase(dbPath);
+  const databaseUri = `${pathToFileURL(path.resolve(dbPath)).href}?mode=rw`;
   const DatabaseSync = await loadNodeSqlite();
   if (DatabaseSync) {
     let db;
     try {
-      db = new DatabaseSync(dbPath);
+      db = new DatabaseSync(databaseUri);
       db.exec("BEGIN");
       try {
         for (const statement of statements) {
@@ -74,7 +78,7 @@ export async function execCopilotSql(dbPath, statements) {
   // sqlite3 auto-commits each statement by default, so an explicit
   // BEGIN/COMMIT is what makes the batch atomic — a mid-batch failure rolls
   // the whole set back, matching the node:sqlite path above.
-  const result = spawnSyncCommand("sqlite3", [dbPath], {
+  const result = spawnSyncCommand("sqlite3", ["-bail", databaseUri], {
     input: `BEGIN;\n${statements.join("\n")}\nCOMMIT;`,
     encoding: "utf8",
   });
@@ -113,7 +117,7 @@ export async function queryCopilotSql(dbPath, sql) {
       db?.close();
     }
   }
-  const result = spawnSyncCommand("sqlite3", [dbPath, sql], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const result = spawnSyncCommand("sqlite3", ["-readonly", dbPath, sql], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   if (result.error) {
     throw result.error;
   }
@@ -243,7 +247,6 @@ export async function upsertFireconnectProvider(dbPath, {
   models,
   extraHeaders = {},
 }) {
-  mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
   // The key rides as an Authorization header on the provider row rather than
   // in the OS keychain (`authKind: "apiKey"`).
   //
@@ -260,7 +263,7 @@ export async function upsertFireconnectProvider(dbPath, {
   // state in) instead of the encrypted keychain.
   const settings = JSON.stringify({
     authKind: "none",
-    baseUrl: COPILOT_FIREWORKS_BASE_URL,
+    baseUrl: fireworksInferenceUrl(COPILOT_FIREWORKS_BASE_URL, activeAccountResidency("copilot-app")),
     // Attribution headers ride alongside the credential in the same map.
     headersJson: JSON.stringify({ Authorization: `Bearer ${apiKey}`, ...extraHeaders }),
     wireApi: "completions",
@@ -275,13 +278,8 @@ export async function upsertFireconnectProvider(dbPath, {
     // and hide the corresponding UI.
     ...models.map((model) => providerModelInsertStatement(providerId, model)),
   ];
-  // Ensure the tables exist for a fresh (never-launched) install.
-  await ensureCopilotTables(dbPath);
   await execCopilotSql(dbPath, statements);
-  // The row holds the API key in a header, so the DB must be owner-only. The
-  // app creates it 0600 itself, but on a never-launched install WE create it —
-  // under the process umask, typically 0644. Applied after the write so the
-  // sqlite3 CLI fallback (which may recreate the file) can't widen it.
+  // The row holds the API key in a header, so the DB must be owner-only.
   restrictDbPermissions(dbPath);
 }
 
@@ -353,42 +351,118 @@ export async function removeFireconnectProvider(dbPath, providerId) {
 }
 
 /**
- * Create the BYOK tables if missing (fresh install / never launched). Matches
- * the schema observed in the live app (v1.1.17).
+ * Require the app-owned database and tables without initializing them.
  * @param {string} dbPath
  */
-export async function ensureCopilotTables(dbPath) {
-  mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-  await execCopilotSql(dbPath, [
-    // accounts is referenced (ON DELETE CASCADE) by model_providers.account_id;
-    // create it first so a fresh DB satisfies the FK even though we never
-    // write to it.
-    `CREATE TABLE IF NOT EXISTS "accounts" (id TEXT PRIMARY KEY NOT NULL);`,
-    `CREATE TABLE IF NOT EXISTS "model_providers" (
-      id TEXT PRIMARY KEY NOT NULL,
-      name TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      type TEXT NOT NULL DEFAULT 'openai',
-      settings_json TEXT NOT NULL DEFAULT '{}',
-      account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "provider_models" (
-      id TEXT PRIMARY KEY NOT NULL,
-      provider_id TEXT NOT NULL REFERENCES "model_providers"(id) ON DELETE CASCADE,
-      model_id TEXT NOT NULL,
-      wire_model TEXT,
-      display_name TEXT NOT NULL,
-      max_prompt_tokens INTEGER,
-      max_output_tokens INTEGER,
-      wire_api_override TEXT CHECK (wire_api_override IS NULL OR wire_api_override IN ('completions','responses')),
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      supported_reasoning_efforts TEXT,
-      UNIQUE (provider_id, model_id)
-    );`,
-    `CREATE INDEX IF NOT EXISTS idx_provider_models_provider ON provider_models(provider_id);`,
-  ]);
+export async function requireCopilotDatabase(dbPath, { recoverStub = false, force = false } = {}) {
+  if (recoverStub) {
+    await recoverCopilotStubDatabase(dbPath, { force });
+  }
+  const rows = await queryCopilotSql(dbPath,
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'model_providers', 'provider_models');");
+  if (rows.length !== 3) {
+    throw new Error("Could not find the Copilot app's initialized database. Open GitHub Copilot once (it creates this database on first launch) and retry `nexus copilot-app on`.");
+  }
+}
+
+const STUB_COLUMNS = {
+  accounts: ["id"],
+  model_providers: ["id", "name", "created_at", "updated_at", "type", "settings_json", "account_id"],
+  provider_models: ["id", "provider_id", "model_id", "wire_model", "display_name", "max_prompt_tokens", "max_output_tokens", "wire_api_override", "created_at", "updated_at", "supported_reasoning_efforts"],
+};
+
+async function isCopilotStubDatabase(dbPath) {
+  const dir = mkdtempSync(path.join(path.dirname(dbPath), ".nexus-stub-inspect-"));
+  const snapshot = path.join(dir, "data.db");
+  const signatures = new Map();
+  const signature = (file) => {
+    if (!existsSync(file)) return "";
+    const stat = lstatSync(file, { bigint: true });
+    if (!stat.isFile()) throw new Error("Copilot database recovery requires regular files.");
+    return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
+  };
+  try {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const source = `${dbPath}${suffix}`;
+      signatures.set(source, signature(source));
+      if (signatures.get(source)) {
+        copyFileSync(source, `${snapshot}${suffix}`);
+        chmodSync(`${snapshot}${suffix}`, 0o600);
+      }
+    }
+    // Even a read-only SQLite connection can rewrite shared-memory sidecars.
+    const matches = await hasCopilotStubSchema(snapshot);
+    if ([...signatures].some(([file, before]) => signature(file) !== before)) {
+      throw new Error("The Copilot database changed during inspection. Quit GitHub Copilot and retry.");
+    }
+    return matches;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function hasCopilotStubSchema(dbPath) {
+  const objects = await queryCopilotSql(dbPath, "SELECT type, name FROM sqlite_master ORDER BY name;");
+  const tables = objects.filter(([type]) => type === "table").map(([, name]) => name);
+  if (JSON.stringify(tables) !== JSON.stringify(Object.keys(STUB_COLUMNS).sort())) {
+    return false;
+  }
+  if (objects.some(([type, name]) => type !== "table" && !(type === "index" && (name === "idx_provider_models_provider" || /^sqlite_autoindex_(accounts|model_providers|provider_models)_\d+$/.test(name))))) {
+    return false;
+  }
+  for (const [table, expected] of Object.entries(STUB_COLUMNS)) {
+    const columns = await queryCopilotSql(dbPath, `PRAGMA table_info(${table});`);
+    if (JSON.stringify(columns.map((column) => column[1])) !== JSON.stringify(expected)) {
+      return false;
+    }
+  }
+  if ((await queryCopilotSql(dbPath, "SELECT 1 FROM accounts LIMIT 1;")).length > 0) {
+    return false;
+  }
+  return (await queryCopilotSql(dbPath, "SELECT 1 FROM model_providers WHERE id NOT GLOB 'fc-*' UNION ALL SELECT 1 FROM provider_models WHERE provider_id NOT GLOB 'fc-*' LIMIT 1;")).length === 0;
+}
+
+/** Preserve a never-initialized Nexus database so the app can create its own. */
+export async function recoverCopilotStubDatabase(dbPath, { force = false, move = renameSync } = {}) {
+  if (!dbPath || !existsSync(dbPath) || !lstatSync(dbPath).isFile()) {
+    return "";
+  }
+  if (["-wal", "-shm"].some((suffix) => existsSync(`${dbPath}${suffix}`) && !lstatSync(`${dbPath}${suffix}`).isFile())) {
+    return "";
+  }
+  if (!await isCopilotStubDatabase(dbPath)) {
+    return "";
+  }
+  await ensureCopilotStopped({ force });
+  if (!await isCopilotStubDatabase(dbPath)) {
+    return "";
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = `${dbPath}.nexus-stub-${stamp}-${randomUUID()}`;
+  const moved = [];
+  try {
+    for (const suffix of ["-wal", "-shm", ""]) {
+      const source = `${dbPath}${suffix}`;
+      if (suffix === "" || existsSync(source)) {
+        move(source, `${backup}${suffix}`);
+        moved.push(suffix);
+      }
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const suffix of moved.reverse()) {
+      try {
+        move(`${backup}${suffix}`, `${dbPath}${suffix}`);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError([error, ...rollbackErrors], `Could not restore the Copilot database from ${backup}.`);
+    }
+    throw error;
+  }
+  return backup;
 }
 
 function newProviderModelId() {
@@ -482,12 +556,12 @@ export const COPILOT_PROCESS_SPEC = {
   // does not.
   linuxPattern: "^([^ ]*/)?github( |$)|[/](github-copilot|GitHub Copilot)",
   // tasklist reports image names only (no paths), so this must enumerate the
-  // plausible desktop executables: a `github-copilot*`/`GitHub Copilot*` app
+  // desktop executables: `github.exe` (1.4.0), a `github-copilot*`/`GitHub Copilot*` app
   // and `copilotd.exe`, the daemon the app's own PowerShell strings reference.
   // The CLI installs as `copilot.exe`, which none of these match — `copilotd`
   // differs from `copilot` before the word boundary the caller anchors with.
   // Matching is case-insensitive (isIdeRunning compiles with "im").
-  windowsImage: "(github[- ]copilot[^ ]*|copilotd)\\.exe",
+  windowsImage: "(github|github[- ]copilot[^ ]*|copilotd)\\.exe",
 };
 
 const COPILOT_RUNNING_MESSAGE =
@@ -505,4 +579,3 @@ export function isCopilotRunning() {
 export async function ensureCopilotStopped({ force = false } = {}) {
   return ensureIdeStopped(COPILOT_PROCESS_SPEC, COPILOT_RUNNING_MESSAGE, { force, label: "GitHub Copilot" });
 }
-

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile, mkdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rename, symlink, writeFile, mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
@@ -56,6 +56,46 @@ async function withHome(fn) {
 }
 
 describe("opencode azure harness", () => {
+  it("on follows a symlinked config root without changing user directory permissions", { skip: process.platform === "win32" }, async () => {
+    await withHome(async (home) => {
+      const configRoot = path.join(home, ".config");
+      const dotfiles = path.join(home, "dotfiles");
+      await rename(configRoot, dotfiles);
+      await symlink(dotfiles, configRoot, "dir");
+      await chmod(home, 0o770);
+      await chmod(dotfiles, 0o775);
+      const configPath = path.join(configRoot, "opencode", "opencode.json");
+      await writeFile(configPath, JSON.stringify({ provider: {} }));
+      const env = { HOME: home, XDG_CONFIG_HOME: configRoot, XDG_DATA_HOME: path.join(home, "data") };
+      const result = await runFireconnect(
+        ["opencode", "on", "--azure", "--base-url", AZURE_ENDPOINT, "--api-key", AZURE_KEY], env,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.ok(JSON.parse(await readFile(configPath, "utf8")).provider[OPENCODE_AZURE_PROVIDER_ID]);
+      assert.equal((await stat(home)).mode & 0o777, 0o770);
+      assert.equal((await stat(dotfiles)).mode & 0o777, 0o775);
+    });
+  });
+
+  it("on refuses a symlinked Nexus backup directory before changing config", { skip: process.platform === "win32" }, async () => {
+    await withHome(async (home) => {
+      const configPath = opencodeConfigPath(home);
+      const original = JSON.stringify({ provider: {} });
+      await writeFile(configPath, original);
+      const outside = path.join(home, "outside");
+      await mkdir(outside);
+      await mkdir(path.join(home, ".nexus"), { recursive: true });
+      await symlink(outside, path.join(home, ".nexus", "opencode"), "dir");
+      const result = await runFireconnect(
+        ["opencode", "on", "--azure", "--base-url", AZURE_ENDPOINT, "--api-key", AZURE_KEY],
+        { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, "data") },
+      );
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /Cannot secure private files/);
+      assert.equal(await readFile(configPath, "utf8"), original);
+    });
+  });
+
   it("writes a Foundry provider block with a literal key (configured key)", async () => {
     await withHome(async (home) => {
       const configPath = opencodeConfigPath(home);
