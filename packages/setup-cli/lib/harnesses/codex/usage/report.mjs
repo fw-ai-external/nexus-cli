@@ -737,13 +737,25 @@ function servedLookupFor(session) {
   // response id are paired by order, so interleave parent and subagents by
   // when each call was logged, by instant (a timestamp may carry an offset).
   // Undated calls (old logs) follow, in log order.
+  // `notBefore`: when the nearest dated call before it in its own rollout
+  // completed (any model), or the rollout's start when none is. A rollout's
+  // calls run one after another, so the call started no earlier; the server
+  // records a call when it starts, Codex when it ends, so this bounds the
+  // lookup. With neither, it's "" and the lookup reads from the session start.
   const all = [session.main, ...session.subagents]
-    .flatMap(({ parsed }) => parsed.calls)
-    .filter(needsServedModel)
-    .map(({ key, responseId, signature, at }) => ({ key, responseId, signature, at, ms: Date.parse(at) }));
+    .flatMap(({ rollout, parsed }) => {
+      let lastDated = typeof rollout.meta?.timestamp === "string" ? rollout.meta.timestamp : "";
+      return parsed.calls.map((call) => {
+        const entry = { call, notBefore: lastDated };
+        if (call.at && Number.isFinite(Date.parse(call.at))) lastDated = call.at;
+        return entry;
+      });
+    })
+    .filter(({ call }) => needsServedModel(call))
+    .map(({ call: { key, responseId, signature, at }, notBefore }) => ({ key, responseId, signature, at, notBefore, ms: Date.parse(at) }));
   const dated = all.filter((call) => Number.isFinite(call.ms)).sort((a, b) => a.ms - b.ms);
   const calls = [...dated, ...all.filter((call) => !Number.isFinite(call.ms))]
-    .map(({ key, responseId, signature, at }) => ({ key, responseId, signature, at }));
+    .map(({ key, responseId, signature, at, notBefore }) => ({ key, responseId, signature, at, notBefore }));
   return {
     sessionId: safeId(meta?.session_id) || session.main.rollout.threadId,
     startedAt: typeof meta?.timestamp === "string" ? meta.timestamp : "",

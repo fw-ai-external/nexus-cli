@@ -9,6 +9,10 @@
     "running": { "frames": [56, 57, 58, 59], "fps": 4, "loop": true },
     "waiting": { "frames": [0] },
     "review": { "frames": [0] },
-    "failed": { "frames": [0] }
+    "failed": { "frames": [0] },
+    "running-right": { "frames": [0] },
+    "running-left": { "frames": [0] },
+    "waving": { "frames": [0] },
+    "jumping": { "frames": [0] }
   }
 }

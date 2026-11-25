@@ -1,0 +1,6 @@
+{
+  "name": "nexus-ultrafast",
+  "version": "0.1.0",
+  "description": "Prototype: Nexus Ultra-fast activation banner with fireworks in the band above the prompt",
+  "types": "./types/index.d.ts"
+}

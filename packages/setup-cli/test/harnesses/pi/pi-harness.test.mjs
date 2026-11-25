@@ -14,29 +14,6 @@ import { writeGlobalConfig } from "../../../lib/config/global-config.mjs";
 
 const AZURE_ENDPOINT = "https://example-resource.services.ai.azure.com";
 const AZURE_KEY = "azure-test-key-1234567890";
-const USER_FIREWORKS_MODEL = {
-  id: "accounts/fireworks/models/custom-user-model",
-  name: "Custom user model",
-};
-
-// A realistic cached serverless catalog (latest routers), used to seed the
-// on-disk cache so a spawned CLI's offline registration / `off` cleanup reads
-// it instead of a hand-maintained router list.
-const CACHED_ROUTER_ENTRIES = [
-  "glm-latest",
-  "glm-fast-latest",
-  "kimi-latest",
-  "kimi-fast-latest",
-  "deepseek-flash-latest",
-  "deepseek-pro-latest",
-  "minimax-latest",
-  "qwen-plus-latest",
-].map((slug, index) => ({
-  id: `accounts/fireworks/routers/${slug}`,
-  shortId: slug,
-  displayName: slug, // the picker name resolution isn't under test here
-  kind: "serverless",
-}));
 
 // Flat `/v1/serverless/models` rows pairing the `-latest` aliases with their
 // leaf bases so offline registration resolves the same limits/pricing the live

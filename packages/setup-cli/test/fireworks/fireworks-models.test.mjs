@@ -716,6 +716,86 @@ describe("fireworks-models serverless catalog", () => {  test("fetchServerlessCa
     }));
   });
 
+  async function withEnvVar(name, value, fn) {
+    const previous = process.env[name];
+    process.env[name] = value;
+    try {
+      return await fn();
+    } finally {
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    }
+  }
+
+  test("the catalog cache keeps a key's plan when only the plan lookup gets no answer", async () => {
+    const rows = mockServerlessModelRows();
+    const fetchImpl = async () => ({ ok: true, json: async () => ({ object: "list", data: rows }) });
+    await withEnvVar("NEXUS_PLAN_CATALOG_FILTER", "0", () => withSeededCatalogCache(fetchImpl, async () => {
+      await withPlanTier("PRO", () => loadServerlessCatalog({ apiKey: "fw_test_key", refresh: true }));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO");
+      await withPlanTier("UNAVAILABLE", () => loadServerlessCatalog({ apiKey: "fw_test_key", refresh: true }));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO", "a lookup with no answer keeps the known plan");
+      // Another key never inherits it.
+      await withPlanTier("UNAVAILABLE", () => loadServerlessCatalog({ apiKey: "fw_other_key", refresh: true }));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "");
+    }));
+  });
+
+  test("a catalog refresh gates by the catalog's plan and caches the plan in force", async () => {
+    // A pending Pro plan ahead of an active Enterprise plan: the gateway
+    // gates the catalog by the newer Pro plan; billing follows Enterprise.
+    const rows = mockServerlessModelRows();
+    const fetchImpl = async () => ({ ok: true, json: async () => ({ object: "list", data: rows }) });
+    await withEnvVar("NEXUS_TEST_PLAN_CATALOG_TIER", "PRO", () => withPlanTier("ENTERPRISE", () => withSeededCatalogCache(fetchImpl, async () => {
+      const loaded = await loadServerlessCatalog({ apiKey: "fw_test_key", refresh: true });
+      assert.deepEqual(loaded.catalog, [autoCatalogEntry()], "the catalog follows the catalog tier");
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "ENTERPRISE", "pricing reads the plan in force");
+    })));
+    // And the other way round: an Enterprise catalog with a Pro plan in force.
+    await withEnvVar("NEXUS_TEST_PLAN_CATALOG_TIER", "ENTERPRISE", () => withPlanTier("PRO", () => withSeededCatalogCache(fetchImpl, async () => {
+      const loaded = await loadServerlessCatalog({ apiKey: "fw_test_key", refresh: true });
+      assert.ok(loaded.catalog.some((entry) => entry.shortId === "glm-5p2"), "full catalog");
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO");
+    })));
+  });
+
+  test("with both plan features off, a catalog fetch leaves another key's cached plan alone", async () => {
+    const rows = mockServerlessModelRows();
+    let offline = false;
+    const fetchImpl = async () => {
+      if (offline) throw new Error("network unreachable");
+      return { ok: true, json: async () => ({ object: "list", data: rows }) };
+    };
+    await withSeededCatalogCache(fetchImpl, async () => {
+      await withEnvVar("NEXUS_PLAN_CATALOG_FILTER", "0", () => withPlanTier("PRO", () => loadServerlessCatalog({ apiKey: "fw_first_key", refresh: true })));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO");
+      offline = true;
+      await withEnvVar("NEXUS_PLAN_CATALOG_FILTER", "0", () => withEnvVar("NEXUS_ULTRAFAST_STANDARD_PRICING", "0", () => loadServerlessCatalog({ apiKey: "fw_second_key", refresh: true })));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO", "nothing was written");
+      // A successful refresh for the same key with both off keeps its plan.
+      offline = false;
+      await withEnvVar("NEXUS_PLAN_CATALOG_FILTER", "0", () => withEnvVar("NEXUS_ULTRAFAST_STANDARD_PRICING", "0", () => loadServerlessCatalog({ apiKey: "fw_first_key", refresh: true })));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO", "the skipped lookup keeps the known plan");
+    });
+  });
+
+  test("a key switch whose catalog fetch fails forgets the previous key's plan", async () => {
+    const rows = mockServerlessModelRows();
+    let offline = false;
+    const fetchImpl = async () => {
+      if (offline) throw new Error("network unreachable");
+      return { ok: true, json: async () => ({ object: "list", data: rows }) };
+    };
+    await withSeededCatalogCache(fetchImpl, async () => {
+      await withEnvVar("NEXUS_PLAN_CATALOG_FILTER", "0", () => withPlanTier("PRO", () => loadServerlessCatalog({ apiKey: "fw_first_key", refresh: true })));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "PRO");
+      offline = true;
+      await withPlanTier("PRO", () => loadServerlessCatalog({ apiKey: "fw_second_key", refresh: true }));
+      assert.equal(readCatalogCache()?.snapshot?.planTier, "", "the previous key's plan no longer prices this key");
+      assert.equal(readCatalogCache()?.keyFingerprint, catalogKeyFingerprint("fw_first_key"), "the rest of the cache stays");
+    });
+  });
+
   test("loadServerlessCatalog keeps the cached catalog when the plan lookup fails", async () => {
     const rows = mockServerlessModelRows();
     const fetchImpl = async () => ({ ok: true, json: async () => ({ object: "list", data: rows }) });

@@ -8,7 +8,6 @@ import {
 } from "../../../lib/harnesses/claude/model-profile.mjs";
 import {
   CLAUDE_NATIVE_MODEL_ID,
-  CLAUDE_NATIVE_SLOT_ALIAS,
   isAnthropicModelId,
   isClaudeNativeModel,
   normalizeModelId,

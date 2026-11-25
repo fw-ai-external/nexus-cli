@@ -50,6 +50,7 @@ import {
   resolveClaudeModelMapping,
 } from "./model-profile.mjs";
 import { stripClaudeStatusLine, withClaudeStatusLine } from "./statusline.mjs";
+import { stripClaudeMods, withClaudeMods } from "./mods.mjs";
 import {
   buildFireconnectModelPickerOptions,
   isFireconnectModelPicker,
@@ -471,6 +472,7 @@ export function stripFireconnectManagedClaudeSettings(settings, state = {}) {
   let nextSettings = { ...settings, env: nextEnv };
   nextSettings = clearFireworksTopLevelWithoutBackup(nextSettings);
   nextSettings = stripClaudeStatusLine(nextSettings).settings;
+  nextSettings = stripClaudeMods(nextSettings).settings;
   ({ settings: nextSettings } = stripFireconnectModelPicker(nextSettings));
   return stripManagedApiKeyHelper(nextSettings, state).settings;
 }
@@ -938,6 +940,7 @@ export function resolveClaudeDefaultModel({
  *   selectedPickerModel?: string,
  *   firerouterHeaders?: boolean,
  *   catalogServed?: boolean,
+ *   claudeMods?: boolean,
  * }} [opts]
  * @returns {{ settings: Record<string, unknown>, token: string }}
  */
@@ -955,6 +958,7 @@ export function buildFireworksSettings(settings, {
   selectedPickerModel = "",
   firerouterHeaders = false,
   catalogServed = false,
+  claudeMods = false,
 } = {}) {
   const env = settings.env ?? {};
   const token = apiKey || claudeFireworksKeyFrom({ env }) || "";
@@ -1016,7 +1020,9 @@ export function buildFireworksSettings(settings, {
     // Claude Code prices the routed model against Anthropic's list, so its own
     // status line reports a cost the user is never billed. Ours reads the
     // transcript at Fireworks rates. A user's existing statusLine is left as-is.
-    return { settings: withClaudeStatusLine(next), token };
+    // The Ultra-fast banner mod draws above the prompt on Claude Code
+    // releases that load mods; `claudeMods` is false on older ones.
+    return { settings: withClaudeMods(withClaudeStatusLine(next), { enabled: claudeMods }), token };
   }
   return { settings: next, token };
 }
@@ -1038,6 +1044,7 @@ export async function enableFireworksProvider({
   selectedPickerModel = "",
   firerouterHeaders = false,
   catalogServed = false,
+  claudeMods = false,
 }) {
  const backupPath = providerBackupPath(dataDir);
  const settings = await readJsonIfExists(settingsPath);
@@ -1073,6 +1080,7 @@ export async function enableFireworksProvider({
     selectedPickerModel,
     firerouterHeaders,
     catalogServed,
+    claudeMods,
   });
   const token = built.token;
   const routed = nativeApiKeyHelper === null
@@ -1167,6 +1175,7 @@ export async function disableFireworksProvider({ settingsPath, dataDir, wasEnabl
     // it cannot restore their absence — strip them explicitly (a user's own
     // statusLine / modelPicker is untouched).
     nextSettings = stripClaudeStatusLine(nextSettings).settings;
+    nextSettings = stripClaudeMods(nextSettings).settings;
     nextSettings = stripFireconnectModelPicker(nextSettings).settings;
 
     await writeJson(settingsPath, nextSettings);
@@ -1193,10 +1202,12 @@ export async function disableFireworksProvider({ settingsPath, dataDir, wasEnabl
 
   const { settings: withoutStatusLine, changed: statusLineChanged } = stripClaudeStatusLine(nextSettings);
   nextSettings = withoutStatusLine;
+  const { settings: withoutMods, changed: modsChanged } = stripClaudeMods(nextSettings);
+  nextSettings = withoutMods;
   const { settings: withoutPicker, changed: pickerChanged } = stripFireconnectModelPicker(nextSettings);
   nextSettings = withoutPicker;
 
-  if (envChanged || clearedTopLevel || helperChanged || statusLineChanged || pickerChanged) {
+  if (envChanged || clearedTopLevel || helperChanged || statusLineChanged || modsChanged || pickerChanged) {
     await writeJson(settingsPath, nextSettings);
   }
 

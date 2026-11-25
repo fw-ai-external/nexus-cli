@@ -45,6 +45,7 @@ import { truecolor } from "../../ui/palette.mjs";
 import { terminalTheme } from "../../ui/color.mjs";
 import { CLI_COLORS, DATA_COLORS } from "../../ui/tokens.mjs";
 import { UNPRICED_TEXT, addUsage } from "./usage/cost.mjs";
+import { readUltrafastBadge } from "./ultrafast-badge.mjs";
 import {
   formatUsageCost,
   formatUsageCachePct,
@@ -490,7 +491,7 @@ function formatTimeLeft(ms) {
  * @param {number} [now]
  * @returns {Promise<string>}
  */
-export async function claudeStatusLineKeyExpiry(home, now = Date.now()) {
+export async function claudeStatusLineKeyExpiry(home, now = Date.now(), { short = false } = {}) {
   try {
     const minted = home ? await readMintedKeyState(home) : null;
     const expiresAt = minted?.keyFingerprint ? minted.expiresAt : "";
@@ -499,10 +500,66 @@ export async function claudeStatusLineKeyExpiry(home, now = Date.now()) {
     }
     const left = Date.parse(expiresAt) - now;
     const text = left > 0 ? `key expires in ${formatTimeLeft(left)}` : "key expired";
+    if (short) return paint("accent", `⚠ ${text}`);
     return `${paint("accent", `⚠ ${text}`)} ${paint("secondary", "· run")} ${paint("primary", "nexus login")}`;
   } catch {
     return "";
   }
+}
+
+// Claude Code pads the status line by two columns each side, and the logo
+// plus its gap takes nine more. Without COLUMNS, assume a common width.
+const STATUS_LINE_INSET = 2 + 2 + [...LOGO_CELLS_STATUS_LINE[0]].length + 1;
+const DEFAULT_STATUS_LINE_COLUMNS = 100;
+
+/** Columns the status line's rows can use, from the COLUMNS Claude Code passes. */
+export function claudeStatusLineWidth(env = process.env) {
+  const columns = Number.parseInt(env.COLUMNS ?? "", 10);
+  return (Number.isFinite(columns) && columns > 0 ? columns : DEFAULT_STATUS_LINE_COLUMNS) - STATUS_LINE_INSET;
+}
+
+// eslint-disable-next-line no-control-regex
+const SGR = /\x1b\[[0-9;]*m/g;
+
+function visibleWidth(text) {
+  return [...String(text).replace(SGR, "")].length;
+}
+
+/**
+ * The two rows, fitted to `width`: the Ultra-fast badge and the key-expiry
+ * warning lead the first row while they fit. When they don't, the warning
+ * moves to the front of the second row (shortened to "⚠ key expires in 14h"
+ * if that row would overflow), and then the badge drops its percentage.
+ * Claude Code cuts what still doesn't fit with "…".
+ * @param {{ badge: { share: string, left: string } | null, keyExpiry: string, shortKeyExpiry: string, usage: string[], legend: string[], width: number }} parts
+ * @returns {[string, string]}
+ */
+export function fitClaudeStatusLineRows({ badge, keyExpiry, shortKeyExpiry, usage, legend, width }) {
+  const fits = (text) => visibleWidth(text) <= width;
+  let compact = false;
+  let warningBelow = "";
+  const rows = () => [
+    joinParts([claudeStatusLineUltrafastBadge(badge, { compact }), warningBelow ? "" : keyExpiry, ...usage]),
+    joinParts([warningBelow, ...legend]),
+  ];
+  if (!fits(rows()[0]) && keyExpiry) {
+    warningBelow = keyExpiry;
+    if (!fits(rows()[1])) warningBelow = shortKeyExpiry || keyExpiry;
+  }
+  if (!fits(rows()[0]) && badge) compact = true;
+  return rows();
+}
+
+/**
+ * "ϟ Ultra-fast 100%, 5h 00m left": the boost's name in orange, the share of
+ * its window left in bold, then the time left. "" when no boost is on.
+ * @param {{ share: string, left: string } | null} badge
+ */
+export function claudeStatusLineUltrafastBadge(badge, { compact = false } = {}) {
+  if (!badge) return "";
+  const name = COLOR ? `${COLOR.bold}${truecolor("#F2A866")}ϟ Ultra-fast\x1b[0m` : "ϟ Ultra-fast";
+  const share = badge.share && !compact ? `${COLOR ? COLOR.bold : ""}${paint("primary", badge.share)}${COLOR ? "\x1b[0m" : ""}, ` : "";
+  return `${name} ${share}${paint("primary", `${badge.left} left`)}`;
 }
 
 /**
@@ -594,17 +651,17 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
   const tps = rate
     ? `${rateBar(usage.tps)} ${paintRate(usage.tps, rate)} ${paint("primary", "TPS")}`
     : "";
-  const keyExpiry = await claudeStatusLineKeyExpiry(home);
-  const line1 = joinParts([
-    // First, so a narrow terminal never cuts it off.
-    keyExpiry,
+  const now = Date.now();
+  const keyExpiry = await claudeStatusLineKeyExpiry(home, now);
+  const shortKeyExpiry = keyExpiry ? await claudeStatusLineKeyExpiry(home, now, { short: true }) : "";
+  const usageParts = [
     bar || paint("secondary", slotLabel),
     usage && (usage.cost == null
       ? paint("secondary", `cost ${UNPRICED_TEXT}`)
       : `${usage.estimated ? "~" : ""}${COLOR ? COLOR.bold : ""}${paint("primary", formatUsageCost(usage.cost))}`),
     tps,
     routedModel,
-  ]);
+  ];
 
   const legend = usage?.models.map((m, index) => {
     const label = labels[index];
@@ -614,7 +671,17 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
       : `${label}${cache}`;
     return `${paintSeries(index, BAR_MARK)} ${paint("primary", text)}`;
   }) ?? [];
-  const line2 = joinParts(legend);
+  // The badge (while the account's Ultra-fast boost is on, recorded by the
+  // banner mod) and the key-expiry warning lead, fitted to the terminal.
+  const [line1, line2] = fitClaudeStatusLineRows({
+    // HOME, or USERPROFILE where HOME isn't set (Windows), as the mod writes it.
+    badge: await readUltrafastBadge(home || process.env.USERPROFILE || "", now),
+    keyExpiry,
+    shortKeyExpiry,
+    usage: usageParts,
+    legend,
+    width: claudeStatusLineWidth(),
+  });
 
   return withStatusLineLogo([line1, line2].filter(Boolean)).join("\n");
 }

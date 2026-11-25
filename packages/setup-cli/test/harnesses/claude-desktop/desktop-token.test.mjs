@@ -7,9 +7,9 @@ import { promisify } from "node:util";
 import http from "node:http";
 import path from "node:path";
 import os from "node:os";
-import { createDesktopToken, ensureDesktopToken, desktopTokenPath, isDesktopToken, readDesktopToken } from "../../../lib/harnesses/claude-desktop/desktop-token.mjs";
+import { claimDesktopToken, createDesktopToken, ensureDesktopToken, desktopTokenPath, isDesktopToken, readDesktopToken } from "../../../lib/harnesses/claude-desktop/desktop-token.mjs";
 import { createStoredGatewayKeyLoader, readServiceGatewayKey, selectDesktopCredential, shimKeyEnvironment } from "../../../lib/harnesses/claude-desktop/gateway-key.mjs";
-import { createGatewayKeyLoader, createShimServer } from "../../../lib/harnesses/claude-desktop/shim.mjs";
+import { createGatewayKeyLoader, createShimServer, createTokenFingerprintLoader } from "../../../lib/harnesses/claude-desktop/shim.mjs";
 import { claudeDesktopProfileUsesToken, disableProfileLane, enableProfileLane, readClaudeDesktopProfileKey, readProfileState, refreshClaudeDesktopGatewayKey } from "../../../lib/harnesses/claude-desktop/profile-lane.mjs";
 import { thirdPartyDir } from "../../../lib/harnesses/claude-desktop/lineup.mjs";
 import desktop from "../../../lib/harnesses/claude-desktop/index.mjs";
@@ -733,5 +733,101 @@ test("a failed Desktop on puts back the residency the running shim was started w
       else process.env.NEXUS_TEST_RESIDENCY = priorResidency;
       forgetAccountResidency();
     }
+  });
+});
+
+test("a Desktop token from before an account switch is refused until it is rotated for the new key", async () => {
+  await fixture(async (home, dataDir) => {
+    await seedKeychainConfig(home, key);
+    let currentKey = key;
+    const seen = [];
+    const upstream = http.createServer((req, res) => { seen.push(req.headers.authorization); req.resume(); res.end("{}"); });
+    await listen(upstream);
+    const shim = createShimServer({
+      upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, catalogDir: home, log: () => {},
+      gatewayKeyLoader: createGatewayKeyLoader({ dataDir }), storedGatewayKeyLoader: async () => currentKey,
+      tokenFingerprintLoader: createTokenFingerprintLoader({ dataDir }),
+    });
+    await listen(shim);
+    const post = (token) => fetch(`http://127.0.0.1:${shim.address().port}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "x-api-key": token }, body: "{}",
+    });
+    try {
+      await withoutEnvFireworksKey(async () => {
+        await enableProfileLane(home, { allowSystemChanges: false, log: () => {}, readServiceKey: async () => currentKey });
+        const before = await readDesktopToken(dataDir);
+        assert.equal((await post(before)).status, 200);
+        // An account switch stores the new key first and rotates Desktop's
+        // token after. In between, the old token must not reach the new key.
+        const { setSecret } = await import("../../../lib/keys/secret-store.mjs");
+        currentKey = "fw_example_other_account_key";
+        await setSecret(currentKey, home);
+        const between = await post(before);
+        assert.equal(between.status, 401);
+        assert.match((await between.json()).error.message, /issued for a different Fireworks key/);
+        assert.equal(await refreshClaudeDesktopGatewayKey({ home, fireworksKey: currentKey, readServiceKey: async () => currentKey }), true);
+        const after = await readDesktopToken(dataDir);
+        assert.notEqual(after, before);
+        assert.equal((await post(before)).status, 401);
+        assert.equal((await post(after)).status, 200);
+        assert.deepEqual(seen, [`Bearer ${key}`, `Bearer ${currentKey}`]);
+      });
+    } finally {
+      await close(shim);
+      await close(upstream);
+    }
+  });
+});
+
+test("a Desktop token without its key fingerprint is refused", async () => {
+  await fixture(async (home, dataDir) => {
+    const token = await ensureDesktopToken(dataDir);
+    let forwarded = 0;
+    const upstream = http.createServer((req, res) => { forwarded++; req.resume(); res.end("{}"); });
+    await listen(upstream);
+    const shim = createShimServer({
+      upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, catalogDir: home, log: () => {},
+      gatewayKeyLoader: createGatewayKeyLoader({ dataDir }), storedGatewayKeyLoader: async () => key,
+      tokenFingerprintLoader: createTokenFingerprintLoader({ dataDir }),
+    });
+    await listen(shim);
+    try {
+      const result = await fetch(`http://127.0.0.1:${shim.address().port}/v1/messages`, {
+        method: "POST", headers: { "content-type": "application/json", "x-api-key": token }, body: "{}",
+      });
+      assert.equal(result.status, 401);
+      assert.match((await result.json()).error.message, /no saved key binding/);
+      assert.equal(forwarded, 0);
+      await writeFile(path.join(dataDir, "claude-desktop-key-fingerprint"), `${createHmac("sha256", token).update(key).digest("hex")}\n`, { mode: 0o600 });
+      const bound = await fetch(`http://127.0.0.1:${shim.address().port}/v1/messages`, {
+        method: "POST", headers: { "content-type": "application/json", "x-api-key": token }, body: "{}",
+      });
+      assert.equal(bound.status, 200);
+      assert.equal(forwarded, 1);
+    } finally {
+      await close(shim);
+      await close(upstream);
+    }
+  });
+});
+
+test("claimDesktopToken says whether this call created the token", async () => {
+  await fixture(async (_home, dataDir) => {
+    const first = await claimDesktopToken(dataDir);
+    assert.equal(first.created, true);
+    const second = await claimDesktopToken(dataDir);
+    assert.deepEqual(second, { token: first.token, created: false });
+  });
+});
+
+test("a fingerprint read that fails while the file exists is retried, not cached", async () => {
+  await fixture(async (_home, dataDir) => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(path.join(dataDir, "claude-desktop-key-fingerprint"), `${"a".repeat(64)}\n`, { mode: 0o600 });
+    let fail = true;
+    const loader = createTokenFingerprintLoader({ dataDir, read: async () => (fail ? null : "a".repeat(64)) });
+    assert.equal(await loader(), "");
+    fail = false;
+    assert.equal(await loader(), "a".repeat(64));
   });
 });

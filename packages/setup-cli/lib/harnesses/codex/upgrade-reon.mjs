@@ -21,6 +21,8 @@ import {
   fireconnectManagedVariant,
   readCodexTomlIfExists,
 } from "./core.mjs";
+import { codexUltrafastInstall } from "./ultrafast.mjs";
+import { canPatchCodexUltrafast, configuredCodexUltrafastServer, stripCodexUltrafastRaw } from "./ultrafast-patch.mjs";
 
 export const CODEX_SIGN_IN_UPGRADE_NOTE =
   "Switched Codex to its own sign-in: config.toml now sets requires_openai_auth = true and sends "
@@ -63,6 +65,13 @@ export const CODEX_AUTO_SLUG_NOTE =
 export const CODEX_UPGRADE_REON_FAILURE =
   "Couldn't update Codex's Fireworks settings. Run nexus codex on.";
 
+export const CODEX_ULTRAFAST_NOTE =
+  "Added Fireworks Ultra-fast to Codex's footer: it shows when a boost is on and how long it lasts. "
+  + "Set NEXUS_CODEX_ULTRAFAST=0 and run nexus codex on to turn it off. Restart Codex to pick it up.";
+
+export const CODEX_ULTRAFAST_MOVED_NOTE =
+  "Pointed Codex's Ultra-fast footer at the updated Nexus. Restart Codex to pick it up.";
+
 export const CODEX_IMAGE_GENERATION_NOTE =
   "Disabled Codex image generation unless you already set a preference. Restart Codex to pick it up.";
 
@@ -94,7 +103,7 @@ function modelsAddedNote(ids) {
  * @returns {Promise<string>}
  */
 async function codexReonReason(home) {
-  const { doc, repaired } = await readCodexTomlIfExists(codexConfigPath(home));
+  const { doc, raw = "", repaired } = await readCodexTomlIfExists(codexConfigPath(home));
   if (repaired) {
     return CODEX_DUPLICATE_KEY_REPAIR_NOTE;
   }
@@ -121,6 +130,10 @@ async function codexReonReason(home) {
   if (isLegacyCodexAutoSlug(doc.root.model)) {
     return CODEX_AUTO_SLUG_NOTE;
   }
+  const ultrafast = await codexUltrafastReonReason(raw, home);
+  if (ultrafast) {
+    return ultrafast;
+  }
   if (!doc.root.model_catalog_json) {
     return "";
   }
@@ -143,6 +156,23 @@ async function codexReonReason(home) {
     return CODEX_AUTO_EFFORT_NOTE;
   }
   return models.some(isStaleCodexOpenaiFallbackLadder) ? CODEX_GPT_EFFORT_NOTE : "";
+}
+
+/**
+ * The Ultra-fast footer after an upgrade: re-point it when the server script
+ * moved (a reinstall changes the package folder, and Codex would report the
+ * status line unavailable), or add it for a Codex that supports it and whose
+ * config allows it. "" otherwise, so `on` isn't re-run for nothing.
+ * @param {string} raw the config text
+ * @param {string} home
+ */
+export async function codexUltrafastReonReason(raw, home) {
+  const install = await codexUltrafastInstall({ home });
+  const configured = configuredCodexUltrafastServer(raw);
+  if (configured) {
+    return install && configured !== install.serverPath ? CODEX_ULTRAFAST_MOVED_NOTE : "";
+  }
+  return install && canPatchCodexUltrafast(stripCodexUltrafastRaw(raw)) ? CODEX_ULTRAFAST_NOTE : "";
 }
 
 /**

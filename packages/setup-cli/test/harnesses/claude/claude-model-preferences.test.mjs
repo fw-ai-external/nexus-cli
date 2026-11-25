@@ -84,23 +84,6 @@ async function activeMapping(home) {
   return mappingFromSettings(settings);
 }
 
-async function hideManagedKeyMetadata(home) {
-  const settingsPath = userSettingsPath(home);
-  const settings = await readJsonIfExists(settingsPath);
-  delete settings.env.ANTHROPIC_AUTH_TOKEN;
-  delete settings.env.ANTHROPIC_API_KEY;
-  settings.env.ANTHROPIC_CUSTOM_HEADERS = settings.env.ANTHROPIC_CUSTOM_HEADERS
-    .split("\n")
-    .filter((line) => !/^X-Fireworks-Api-Key:/i.test(line))
-    .join("\n");
-  await writeJson(settingsPath, settings);
-
-  const statePath = providerStatePath(path.join(home, ".nexus/claude"));
-  const state = await readJsonIfExists(statePath);
-  delete state.keyType;
-  await writeJson(statePath, state);
-}
-
 describe("Claude model preferences", () => {
   it("merges stored profiles, keeps native tiers, and survives off/on", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "fc-claude-model-prefs-"));

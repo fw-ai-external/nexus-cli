@@ -83,6 +83,8 @@ export const NEXUS_OWNED_FILENAMES = Object.freeze([
   "cli",
   "claude-desktop",
   "statusline-refresh",
+  // The Claude Code banner mod's boost record, read by the status line badge.
+  "ultrafast-boost.json",
   SET_ASIDE_RECORD_FILENAME,
   MERGE_CLAIM_MARKER,
 ]);

@@ -40,7 +40,10 @@ import { SHIM_HEALTH_PATH, ensureShimSecret, readShimSecret, shimHealthDigest } 
 import { timingSafeEqual } from "node:crypto";
 import { loopbackHostHeaders } from "../../system/loopback.mjs";
 import { buildFireconnectTelemetryHeaders } from "../../telemetry/request-headers.mjs";
-import { CLAUDE_DESKTOP_TOKEN_PREFIX, desktopTokenPath, isDesktopToken, readDesktopToken } from "./desktop-token.mjs";
+import {
+  CLAUDE_DESKTOP_TOKEN_PREFIX, desktopTokenFingerprint, desktopTokenFingerprintPath, desktopTokenPath, isDesktopToken,
+  readDesktopToken, readDesktopTokenFingerprint,
+} from "./desktop-token.mjs";
 import { createStoredGatewayKeyLoader } from "./gateway-key.mjs";
 import { activeAccountResidency, fireworksInferenceUrl } from "../../fireworks/residency.mjs";
 
@@ -48,6 +51,20 @@ const UPSTREAM = "https://api.fireworks.ai/inference";
 const UPSTREAM_TIMEOUT_MS = 300_000; // long prefills (800k+ tokens) legitimately take minutes
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_BUFFERED_BODY_BYTES = 64 * 1024 * 1024;
+// Requests that don't carry the applied profile's credential share this
+// smaller slice of the buffer, so they can never crowd out Desktop's own.
+const MAX_UNVERIFIED_BUFFERED_BODY_BYTES = 16 * 1024 * 1024;
+// A loopback upload of the largest allowed body takes milliseconds; one that
+// hasn't finished this long after it arrived is stalled, and its reservation
+// is released.
+const BODY_TIMEOUT_MS = 30_000;
+// The longest the shim waits on any one credential file read: a stalled read
+// counts as no credential instead of holding a request (and its reservation).
+const CREDENTIAL_TIMEOUT_MS = 5_000;
+// Before refusing a request that carries a Desktop token for lack of buffer,
+// the shim waits this long at most for a fresh credential snapshot (the
+// token may have been rotated since the last one).
+const ADMISSION_RECHECK_MS = 100;
 const MAX_TELEMETRY_LINE_CHARS = 1024 * 1024;
 const EST_CHARS_PER_TOKEN = 4;
 
@@ -123,14 +140,17 @@ export function mapModel(name, modelMap) {
   return name;
 }
 
-async function readBody(req) {
+async function readBody(req, timeoutMs = BODY_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     let settled = false;
+    const timer = setTimeout(() => fail(Object.assign(new Error("Request body timed out."), { status: 408 })), Math.max(0, timeoutMs));
+    timer.unref();
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       chunks.length = 0;
       req.off("data", onData);
       req.resume();
@@ -148,12 +168,15 @@ async function readBody(req) {
     req.once("end", () => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       const body = Buffer.concat(chunks);
       chunks.length = 0;
       resolve(body);
     });
     req.once("error", fail);
     req.once("aborted", () => fail(new Error("Client disconnected.")));
+    // A client that left while its credentials were checked won't send "aborted" again.
+    if (req.destroyed) fail(new Error("Client disconnected."));
   });
 }
 
@@ -276,6 +299,29 @@ export function createAutoKeysLoader({ configPath }) {
 }
 
 /**
+ * The `nexus auto` scope and the keys it allows, from one read of the global
+ * config: `{ providers, anthropicKey, openaiKey }`, so the scope sent and the
+ * keys sent always come from the same version of the file. Memoized on the
+ * config file's mtime. A missing config reads as no scope and no keys; an
+ * unreadable one throws, so the caller can refuse rather than drop the scope.
+ * @param {{ configPath: string }} opts
+ */
+export function createAutoSettingsLoader({ configPath }) {
+  let memo = null;
+  return async function currentAutoSettings() {
+    const mtime = await stat(configPath).then((s) => s.mtimeMs, (error) => { if (error.code === "ENOENT") return 0; throw error; });
+    if (memo?.mtime === mtime) return memo.value;
+    const config = mtime ? JSON.parse(await readFile(configPath, "utf8")) : null;
+    const value = {
+      providers: formatAutoProviders(normalizeAutoProviders(config?.auto?.providers)),
+      ...autoProviderKeysInScope(config),
+    };
+    memo = { mtime, value };
+    return value;
+  };
+}
+
+/**
  * Live gateway key from the profile Desktop has applied (the key it sends
  * the shim): "" when there is none. The shim compares it with the key on
  * each request before attaching anything that belongs to the user. Reads
@@ -316,7 +362,28 @@ export function createGatewayKeyLoader({ dataDir }) {
       const stamp = info ? `${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${info.size}` : "";
       if (memo?.stamp === stamp) return memo.value;
       const value = await readDesktopToken(dataDir) ?? "";
-      memo = { stamp, value };
+      // A read that failed while the file exists (a transient error) is retried next time.
+      if (value || !info) memo = { stamp, value };
+      return value;
+    } catch { return ""; }
+  };
+}
+
+/**
+ * The fingerprint saved with the Desktop token ("" when missing). Memoized
+ * on the file's identity like the token loader; never throws.
+ * @param {{ dataDir: string }} opts
+ */
+export function createTokenFingerprintLoader({ dataDir, read = readDesktopTokenFingerprint }) {
+  let memo;
+  return async () => {
+    try {
+      const info = await stat(desktopTokenFingerprintPath(dataDir)).catch(() => null);
+      const stamp = info ? `${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${info.size}` : "";
+      if (memo?.stamp === stamp) return memo.value;
+      const value = await read(dataDir) ?? "";
+      // A read that failed while the file exists (a transient error) is retried next time.
+      if (value || !info) memo = { stamp, value };
       return value;
     } catch { return ""; }
   };
@@ -369,6 +436,16 @@ function reply(res, status, payload, headers = {}) {
 // The body itself always streams through whole.
 const MAX_DENIAL_SNIFF_BYTES = 64 * 1024;
 
+const BUSY = "Too many buffered requests. Try again shortly.";
+const OUTDATED_TOKEN = "Claude Desktop sent an outdated or invalid Nexus token. Quit and reopen Claude Desktop; if that doesn't help, run nexus claude-desktop on.";
+const NO_STORED_KEY = "No stored Fireworks key is available to the Desktop shim. Sign in again.";
+const SWITCHED_KEY = "Claude Desktop's Nexus token was issued for a different Fireworks key. Quit and reopen Claude Desktop; if that doesn't help, run nexus claude-desktop on.";
+const AUTO_UNAVAILABLE = "Couldn't read your nexus auto settings (~/.nexus/config.json), so this Auto turn wasn't sent. Try again; if it keeps happening, check that file.";
+const CREDENTIALS_UNREADABLE = "Couldn't read Claude Desktop's Nexus credentials in time. Try again shortly.";
+const TIMED_OUT = Symbol("credential read timed out");
+const AUTO_UNREADABLE = Symbol("auto settings unreadable");
+const NO_BINDING = "Claude Desktop's Nexus token has no saved key binding. Run nexus claude-desktop on, then quit and reopen Claude Desktop.";
+
 export function createShimServer({
   modelMap, catalogDir, upstreamOrigin = fireworksInferenceUrl(UPSTREAM, activeAccountResidency("claude-desktop")), log = console.log,
   // When provided, requests resolve the model map and discovery list from
@@ -381,6 +458,9 @@ export function createShimServer({
   // When provided, resolves the keys saved with `nexus auto`. Sent only for
   // turns routed to an auto model.
   autoKeysLoader = null,
+  // When provided, resolves the scope and keys together from one read
+  // (createAutoSettingsLoader) and takes the place of the two loaders above.
+  autoSettingsLoader = null,
   // When provided, resolves the per-install secret the health path proves
   // knowledge of (see shim-auth.mjs). Unset or null: the path answers 503.
   secretLoader = null,
@@ -390,7 +470,15 @@ export function createShimServer({
   gatewayKeyLoader = null,
   legacyGatewayKeyLoader = null,
   storedGatewayKeyLoader = null,
+  // Resolves the fingerprint saved with the Desktop token (see
+  // desktop-token.mjs). When provided, a token is honored only while it was
+  // issued for the stored key, so a token from before an account switch is
+  // never paired with the new account's key.
+  tokenFingerprintLoader = null,
   maxBufferedBodyBytes = MAX_BUFFERED_BODY_BYTES,
+  maxUnverifiedBufferedBodyBytes = MAX_UNVERIFIED_BUFFERED_BODY_BYTES,
+  bodyTimeoutMs = BODY_TIMEOUT_MS,
+  credentialTimeoutMs = CREDENTIAL_TIMEOUT_MS,
   maxTelemetryLineChars = MAX_TELEMETRY_LINE_CHARS,
   upstreamTimeoutMs = UPSTREAM_TIMEOUT_MS,
   upstreamIdleTimeoutMs = UPSTREAM_TIMEOUT_MS,
@@ -401,6 +489,82 @@ export function createShimServer({
   onModelAccessDenied = null,
 }) {
   let bufferedBodyBytes = 0;
+  let unverifiedBufferedBodyBytes = 0;
+  // Read with a deadline; the read itself keeps going and heals the loader's memo.
+  // `timedOut` (default: the fallback) is what a read that runs out of time gives.
+  const bounded = (loader, fallback, timedOut = fallback) => {
+    if (!loader) return Promise.resolve(fallback);
+    let timeout;
+    return Promise.race([
+      Promise.resolve().then(() => loader()).catch(() => fallback),
+      new Promise((resolve) => { timeout = setTimeout(() => resolve(timedOut), credentialTimeoutMs); timeout.unref?.(); }),
+    ]).finally(() => clearTimeout(timeout));
+  };
+  // Which share of the buffer a request may use is decided from a snapshot
+  // of the credentials. A request with no current credential is admitted at
+  // once; one that would get the protected share, or that carries a
+  // credential and would otherwise be refused, first waits (at most
+  // ADMISSION_RECHECK_MS) for a snapshot read after it arrived. The snapshot
+  // only picks the pool; every forwarded request is authorized against
+  // fresh reads once its body is in.
+  // A token only counts while it is bound to the stored key (see
+  // `bindingFailure` below), so a token from before an account switch
+  // never gets the protected share.
+  // A read that times out counts as unbound (the request is admitted as
+  // unverified); `onTimeout` records it so the shim can log it.
+  const isBound = async (token, onTimeout) => {
+    if (!tokenFingerprintLoader) return true;
+    const [storedKey, saved] = await Promise.all([
+      bounded(storedGatewayKeyLoader, "", TIMED_OUT), bounded(tokenFingerprintLoader, null, TIMED_OUT),
+    ]);
+    if (storedKey === TIMED_OUT || saved === TIMED_OUT) { onTimeout(); return false; }
+    return typeof storedKey === "string" && Boolean(storedKey) && typeof saved === "string"
+      && sameSecret(saved, desktopTokenFingerprint(token, storedKey));
+  };
+  let admission = { token: "", legacyKey: "" };
+  let refreshing = null;
+  let queued = null;
+  let snapshotTimedOut = false;
+  const startRefresh = () => {
+    let timedOut = false;
+    const onTimeout = () => { timedOut = true; };
+    refreshing = Promise.all([bounded(gatewayKeyLoader, "", TIMED_OUT), bounded(legacyGatewayKeyLoader, "", TIMED_OUT)])
+      .then(async ([token, legacyKey]) => {
+        if (token === TIMED_OUT || legacyKey === TIMED_OUT) onTimeout();
+        const current = isDesktopToken(token) && await isBound(token, onTimeout) ? token : "";
+        admission = { token: current, legacyKey: typeof legacyKey === "string" ? legacyKey : "" };
+        // Logged when reads start timing out, not on every refresh; names the condition only.
+        if (timedOut && !snapshotTimedOut) log("[nexus-shim] credential snapshot read timed out; admitting requests as unverified until it succeeds");
+        snapshotTimedOut = timedOut;
+      })
+      .catch(() => {})
+      .finally(() => { refreshing = null; });
+    return refreshing;
+  };
+  // A snapshot read entirely after this call: joins a queued refresh, or
+  // queues one behind a refresh already running (which may predate the call).
+  const freshAdmission = () => {
+    if (!refreshing) return startRefresh();
+    queued ??= refreshing.then(() => { queued = null; return startRefresh(); });
+    return queued;
+  };
+  freshAdmission();
+  // Resolves true once a snapshot read after this call is in, false if that
+  // takes longer than ADMISSION_RECHECK_MS.
+  const admissionWithin = () => {
+    let wait;
+    return Promise.race([
+      freshAdmission().then(() => true),
+      new Promise((resolve) => { wait = setTimeout(() => resolve(false), ADMISSION_RECHECK_MS); wait.unref?.(); }),
+    ]).finally(() => clearTimeout(wait));
+  };
+  const readAutoSettings = autoSettingsLoader ?? (autoProvidersLoader || autoKeysLoader ? async () => {
+    const [providers, keys] = await Promise.all([
+      autoProvidersLoader ? autoProvidersLoader() : "",
+      autoKeysLoader ? autoKeysLoader() : {},
+    ]);
+    return { providers, ...keys };
+  } : null);
   const currentModelMap = async () => (lineupLoader ? (await lineupLoader()).modelMap : modelMap) ?? modelMap;
   // The Nexus attribution every other harness puts on its gateway traffic.
   // Desktop's own `on` is bespoke, so the shim is where these are added.
@@ -410,6 +574,7 @@ export function createShimServer({
     let timer;
     let nodeStream;
     let reservedBytes = 0;
+    let unverifiedReservedBytes = 0;
     const cleanup = () => {
       clearTimeout(timer);
       req.off("aborted", disconnect);
@@ -445,15 +610,86 @@ export function createShimServer({
         req.resume();
         return reply(res, 413, { error: { message: "Request body too large." } }, { connection: "close" });
       }
-      if (bufferedBodyBytes + bodyBytes > maxBufferedBodyBytes) {
+
+      // The user's own client sends the profile's credential (the Desktop
+      // token, or a legacy profile's key), as JSON, to a loopback name (a web
+      // page that rebinds its own hostname to 127.0.0.1 still sends that name).
+      // Anything else is still forwarded, just without the saved keys, and
+      // buffered only within the smaller unverified share.
+      const refuse = (status, message) => {
         req.resume();
-        return reply(res, 503, { error: { message: "Too many buffered requests. Try again shortly." } }, { connection: "close" });
+        return reply(res, status, { error: { message } }, { connection: "close" });
+      };
+      const callerKey = inboundKey(req.headers);
+      const bearer = typeof req.headers.authorization === "string" && /^bearer /i.test(req.headers.authorization)
+        ? req.headers.authorization.slice(7).trim() : "";
+      const credentials = [req.headers["x-api-key"], bearer].filter((value) => typeof value === "string");
+      const tokens = credentials.filter((value) => value.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX));
+      const matchesToken = (token) => isDesktopToken(token) && tokens.length > 0 && tokens.every((value) => sameSecret(value, token));
+      // Whether `token` was issued for `key`: the fingerprint saved with it
+      // must be the key's HMAC under the token. null when it was.
+      const bindingFailure = async (token, key) => {
+        if (!tokenFingerprintLoader) return null;
+        const saved = await bounded(tokenFingerprintLoader, null, TIMED_OUT);
+        if (saved === TIMED_OUT) return { status: 503, message: CREDENTIALS_UNREADABLE };
+        if (!saved) return { status: 401, message: NO_BINDING };
+        return sameSecret(saved, desktopTokenFingerprint(token, key)) ? null : { status: 401, message: SWITCHED_KEY };
+      };
+      // Fresh reads of every credential the request is checked against.
+      // A read that runs out of time is reported as such (503, try again),
+      // never as a missing or outdated credential.
+      const unreadable = { status: 503, message: CREDENTIALS_UNREADABLE };
+      const authorize = async () => {
+        const [token, legacyKey] = await Promise.all([
+          bounded(gatewayKeyLoader, "", TIMED_OUT), bounded(legacyGatewayKeyLoader, "", TIMED_OUT),
+        ]);
+        let tokenClient = matchesToken(token);
+        let storedKey = "";
+        let failure = null;
+        // A profile key couldn't be checked: retry rather than forward the
+        // request as unverified (without the user's saved keys).
+        if (!tokens.length && callerKey && legacyKey === TIMED_OUT) failure = unreadable;
+        if (tokens.length) {
+          if (token === TIMED_OUT) failure = unreadable;
+          else if (!tokenClient) failure = { status: 401, message: OUTDATED_TOKEN };
+          else {
+            storedKey = await bounded(storedGatewayKeyLoader, "", TIMED_OUT);
+            if (storedKey === TIMED_OUT) failure = unreadable;
+            else if (typeof storedKey !== "string" || !storedKey || storedKey.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX)) {
+              failure = { status: 401, message: NO_STORED_KEY };
+            } else failure = await bindingFailure(token, storedKey);
+          }
+          if (failure) tokenClient = false;
+        }
+        return { tokenClient, storedKey, failure, verified: tokenClient || sameSecret(callerKey, legacyKey) };
+      };
+      const presumed = () => matchesToken(admission.token) || sameSecret(callerKey, admission.legacyKey);
+      const fits = (verified) => bufferedBodyBytes + bodyBytes <= maxBufferedBodyBytes
+        && (verified || unverifiedBufferedBodyBytes + bodyBytes <= maxUnverifiedBufferedBodyBytes);
+      // The protected share is granted only on a snapshot read after this
+      // request arrived (a credential changed a moment ago no longer counts),
+      // and only if that read takes at most ADMISSION_RECHECK_MS; otherwise
+      // the request counts as unverified. A request with no current
+      // credential waits only when it carries one and would otherwise be
+      // refused (a rotated token or a refreshed profile key may be newer than
+      // the snapshot).
+      let presumedVerified = false;
+      if (presumed() || ((tokens.length || callerKey) && !fits(false))) {
+        const fresh = await admissionWithin();
+        if (controller.signal.aborted || req.destroyed) return;
+        presumedVerified = fresh && presumed();
       }
+      if (!fits(presumedVerified)) return refuse(503, BUSY);
       reservedBytes = bodyBytes;
       bufferedBodyBytes += reservedBytes;
-      const body = await readBody(req);
+      if (!presumedVerified) {
+        unverifiedReservedBytes = bodyBytes;
+        unverifiedBufferedBodyBytes += unverifiedReservedBytes;
+      }
+      const body = await readBody(req, bodyTimeoutMs);
 
-      // Health probe: count_tokens — estimate locally (~4 chars/token).
+      // Health probe: count_tokens — estimate locally (~4 chars/token),
+      // whatever credential it carries.
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
         let parsed = {};
         try { parsed = JSON.parse(body.toString("utf8") || "{}"); } catch { /* estimate from raw */ }
@@ -470,7 +706,7 @@ export function createShimServer({
         try {
           const parsed = JSON.parse(body.toString("utf8"));
           if (parsed.model) {
-            const liveMap = await currentModelMap();
+            const liveMap = await bounded(currentModelMap, modelMap);
             const mapped = mapModel(parsed.model, liveMap);
             routedModel = mapped;
             if (mapped !== parsed.model) parsed.model = mapped;
@@ -487,32 +723,31 @@ export function createShimServer({
           outBody = Buffer.from(JSON.stringify(parsed));
         } catch { /* pass through verbatim */ }
       }
-
-      // Decided before the headers are rewritten: the user's own client
-      // sends the profile's key, as JSON, to a loopback name (a web page
-      // that rebinds its own hostname to 127.0.0.1 still sends that name).
-      // Anything else is still forwarded, just without the saved keys.
-      const callerKey = inboundKey(req.headers);
-      const bearer = typeof req.headers.authorization === "string" && /^bearer /i.test(req.headers.authorization)
-        ? req.headers.authorization.slice(7).trim() : "";
-      const credentials = [req.headers["x-api-key"], bearer].filter((value) => typeof value === "string");
-      const tokens = credentials.filter((value) => value.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX));
-      const token = gatewayKeyLoader ? await gatewayKeyLoader().catch(() => "") : "";
-      const tokenClient = isDesktopToken(token) && tokens.some((value) => sameSecret(value, token));
-      let storedKey = "";
-      if (tokens.length) {
-        if (!tokenClient || tokens.some((value) => !sameSecret(value, token))) {
-          return reply(res, 401, { error: { message: "Claude Desktop sent an outdated or invalid Nexus token. Quit and reopen Claude Desktop; if that doesn't help, run nexus claude-desktop on." } });
-        }
-        storedKey = storedGatewayKeyLoader ? await storedGatewayKeyLoader().catch(() => "") : "";
-        if (!storedKey || storedKey.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX)) {
-          return reply(res, 401, { error: { message: "No stored Fireworks key is available to the Desktop shim. Sign in again." } });
-        }
+      const autoTurn = typeof routedModel === "string"
+        && (routedModel === "auto" || routedModel.startsWith("auto-"));
+      // The `nexus auto` scope and the keys it allows, from one read so they
+      // always agree. The keys are only sent to the user's own client. A
+      // scope that can't be read refuses the turn rather than sending it
+      // without its provider restriction.
+      let autoSettings = null;
+      if (readAutoSettings && autoTurn) {
+        autoSettings = await bounded(readAutoSettings, AUTO_UNREADABLE);
+        if (autoSettings === AUTO_UNREADABLE) return refuse(503, AUTO_UNAVAILABLE);
       }
-      const legacyKey = legacyGatewayKeyLoader ? await legacyGatewayKeyLoader().catch(() => "") : "";
+      const providers = typeof autoSettings?.providers === "string" ? autoSettings.providers : "";
+      const autoKeys = autoSettings ?? {};
+
+      // Authorized against fresh reads as the last thing awaited before the
+      // upstream call: a token rotated (for example by an account switch) at
+      // any point before now is refused, never forwarded with a key it wasn't
+      // issued for.
+      const auth = await authorize();
+      if (controller.signal.aborted || res.destroyed) return;
+      if (auth.failure) return refuse(auth.failure.status, auth.failure.message);
+      const { tokenClient, storedKey } = auth;
       const ownClient = hostAllowed(req.headers.host, req.socket.localPort)
         && isJsonContentType(req.headers["content-type"])
-        && (tokenClient || sameSecret(callerKey, legacyKey));
+        && auth.verified;
 
       const headers = {};
       const hop = hopHeaders(req.headers.connection);
@@ -541,13 +776,9 @@ export function createShimServer({
       delete headers[NEXUS_PROVIDERS_HEADER];
       delete headers[AUTO_PROVIDER_KEY_HEADERS.anthropic];
       delete headers[AUTO_PROVIDER_KEY_HEADERS.openai];
-      const autoTurn = typeof routedModel === "string"
-        && (routedModel === "auto" || routedModel.startsWith("auto-"));
-      if (autoProvidersLoader && autoTurn) {
-        const providers = await autoProvidersLoader().catch(() => "");
-        if (providers) headers[NEXUS_PROVIDERS_HEADER] = providers;
-      }
-      if (autoKeysLoader && autoTurn && !ownClient) {
+      if (providers) headers[NEXUS_PROVIDERS_HEADER] = providers;
+      const autoKeysConfigured = Boolean(autoSettingsLoader || autoKeysLoader);
+      if (autoKeysConfigured && autoTurn && !ownClient) {
         // Names the failed condition only; never a key or header value.
         const why = !gatewayKeyLoader && !legacyGatewayKeyLoader ? "no gateway key loader"
           : !hostAllowed(req.headers.host, req.socket.localPort) ? "Host is not a loopback name"
@@ -555,8 +786,8 @@ export function createShimServer({
               : "request key does not match the applied profile's key (restart Claude Desktop after a key change)";
         log(`[nexus-shim] saved provider keys not sent for this auto turn: ${why}`);
       }
-      if (autoKeysLoader && autoTurn && ownClient) {
-        const { anthropicKey, openaiKey } = await autoKeysLoader().catch(() => ({}));
+      if (autoKeysConfigured && autoTurn && ownClient) {
+        const { anthropicKey, openaiKey } = autoKeys;
         if (anthropicKey) headers[AUTO_PROVIDER_KEY_HEADERS.anthropic] = anthropicKey;
         if (openaiKey) headers[AUTO_PROVIDER_KEY_HEADERS.openai] = openaiKey;
         // Which providers got a key, never the key itself.
@@ -580,15 +811,17 @@ export function createShimServer({
         });
         upstream = await forward();
         if (upstream.status === 401 && tokenClient) {
+          // Fireworks refused the key: read it again and, if it changed,
+          // retry once under the same checks as the first attempt.
           storedGatewayKeyLoader.invalidate?.(storedKey);
-          const refreshedKey = await storedGatewayKeyLoader().catch(() => "");
-          if (!refreshedKey || refreshedKey.startsWith(CLAUDE_DESKTOP_TOKEN_PREFIX)) {
+          const retry = await authorize();
+          if (retry.failure) {
             await upstream.body?.cancel().catch(() => {});
-            return reply(res, 401, { error: { message: "No stored Fireworks key is available to the Desktop shim. Sign in again." } });
+            return reply(res, retry.failure.status, { error: { message: retry.failure.message } });
           }
-          if (refreshedKey !== storedKey) {
+          if (retry.storedKey !== storedKey) {
             await upstream.body?.cancel().catch(() => {});
-            if (!hop.has("authorization")) headers.authorization = `Bearer ${refreshedKey}`;
+            if (!hop.has("authorization")) headers.authorization = `Bearer ${retry.storedKey}`;
             upstream = await forward();
           }
         }
@@ -683,10 +916,15 @@ export function createShimServer({
       } else res.end();
     } catch (error) {
       if (res.destroyed) return;
-      if (!res.headersSent) reply(res, error?.status === 413 ? 413 : 502, { error: { message: String(error?.message ?? error) } });
+      if (!res.headersSent) {
+        const status = [408, 413].includes(error?.status) ? error.status : 502;
+        // A stalled client is not drained: close its connection.
+        reply(res, status, { error: { message: String(error?.message ?? error) } }, status === 408 ? { connection: "close" } : {});
+      }
       else res.destroy();
     } finally {
       bufferedBodyBytes -= reservedBytes;
+      unverifiedBufferedBodyBytes -= unverifiedReservedBytes;
     }
   });
 }
@@ -744,16 +982,14 @@ async function main() {
     modelMap: state.modelMap,
     catalogDir,
     lineupLoader,
-    autoProvidersLoader: createAutoProvidersLoader({
-      configPath: path.join(home, ".nexus", "config.json"),
-    }),
-    autoKeysLoader: createAutoKeysLoader({
+    autoSettingsLoader: createAutoSettingsLoader({
       configPath: path.join(home, ".nexus", "config.json"),
     }),
     secretLoader: () => readShimSecret(dataDir),
     gatewayKeyLoader: createGatewayKeyLoader({ home, dataDir }),
     legacyGatewayKeyLoader: createLegacyGatewayKeyLoader({ home, dataDir }),
     storedGatewayKeyLoader: createStoredGatewayKeyLoader({ home }),
+    tokenFingerprintLoader: createTokenFingerprintLoader({ dataDir }),
     onModelAccessDenied: createModelAccessRefresher(),
     // The harness matrix's CI loopback; never honored outside tests, so a
     // stray variable can't send a real key elsewhere.

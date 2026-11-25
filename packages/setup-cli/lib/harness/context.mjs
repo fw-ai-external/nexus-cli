@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   resolveDataDir,
   userSettingsPath,
@@ -160,6 +161,61 @@ const HOME_VALIDATION = {
   deepseek: { fields: ["configPath"], flag: "--config-path" },
   hermes: { fields: ["configPath"], flag: "--config-path" },
 };
+
+/** The flag that sets each path-override field, for "re-run" hints. */
+const PATH_OVERRIDE_FLAGS = {
+  configPath: "--config-path",
+  settingsPath: "--settings-path",
+  dbPath: "--db-path",
+  providersPath: "--providers-path",
+  vscodePath: "--vscode-path",
+  dataDir: "--data-dir",
+};
+
+/**
+ * The file-path overrides `ctx` sets for `harnessId` (`--config-path` and
+ * friends), as absolute paths; empty when the harness uses its defaults.
+ * @param {Partial<HarnessContext>} ctx
+ * @param {string} harnessId
+ * @returns {Record<string, string>}
+ */
+export function harnessPathOverrides(ctx, harnessId) {
+  const fields = HOME_VALIDATION[harnessId]?.fields ?? [];
+  const set = (field) => typeof ctx[field] === "string" && ctx[field];
+  const overrides = fields.filter(set);
+  // `--data-dir` goes with the file it backs up (a key refresh may update
+  // the backup there), but alone it doesn't make a separate config.
+  if (overrides.length && set("dataDir")) overrides.push("dataDir");
+  return Object.fromEntries(overrides.map((field) => [field, path.resolve(ctx[field])]));
+}
+
+/**
+ * `ctx` with every path override for `harnessId` cleared: its default config.
+ * @template {Partial<HarnessContext>} T
+ * @param {T} ctx
+ * @param {string} harnessId
+ * @returns {T}
+ */
+export function withoutPathOverrides(ctx, harnessId) {
+  const fields = [...(HOME_VALIDATION[harnessId]?.fields ?? []), "dataDir"];
+  return { ...ctx, ...Object.fromEntries(fields.map((field) => [field, ""])) };
+}
+
+/** Shell-quote a path for a copy-paste hint: single quotes, so nothing in it expands. */
+function shellQuote(value) {
+  return /^[\w@%+=:,./~-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The flags that reproduce `overrides`, e.g. `--config-path /work/config.toml`.
+ * @param {Record<string, string>} overrides
+ */
+export function pathOverrideFlags(overrides) {
+  return Object.entries(overrides)
+    .filter(([field]) => PATH_OVERRIDE_FLAGS[field])
+    .map(([field, value]) => `${PATH_OVERRIDE_FLAGS[field]} ${shellQuote(value)}`)
+    .join(" ");
+}
 
 /**
  * @param {HarnessContext} ctx

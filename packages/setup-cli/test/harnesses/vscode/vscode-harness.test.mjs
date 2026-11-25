@@ -12,7 +12,6 @@ import {
   buildModelEntry,
   computeVscodeModels,
   buildAzureModelEntry,
-  fireconnectRegisteredModels,
   fireconnectSecretId,
   fireconnectSecretIds,
   fireworksProviderStatus,

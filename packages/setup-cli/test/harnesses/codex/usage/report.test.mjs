@@ -272,6 +272,46 @@ describe("codex usage", () => {
     });
   });
 
+  it("bounds each lookup call by the call before it in its own rollout, not a subagent's", async () => {
+    await withCodexHome(async (home, codexHome) => {
+      const { readCodexSessionTree, codexServedLookup } = await import("../../../../lib/harnesses/codex/usage/report.mjs");
+      const at = (iso, turnId, id) => ({ type: "token_usage_record", timestamp: iso, payload: { turn_id: turnId, response_id: id, usage: usage(10, 0, 1) } });
+      const parentPath = await writeRollout(codexHome, "01", PARENT, [
+        meta(PARENT, { timestamp: "2026-11-01T13:00:00Z" }),
+        ...turn("t1", MODEL), at("2026-11-01T13:01:00Z", "t1", "r_priced"),
+        ...turn("t2", "auto"), at("2026-11-01T13:10:00Z", "t2", "r_parent"),
+      ]);
+      // A subagent whose long call overlaps the parent's: it ends after the
+      // parent's call but started before it.
+      await writeRollout(codexHome, "01", CHILD, [
+        meta(CHILD, { parent_thread_id: PARENT, timestamp: "2026-11-01T13:02:00Z" }),
+        ...turn("c1", "auto"), at("2026-11-01T13:12:00Z", "c1", "r_child"),
+      ]);
+      const lookup = codexServedLookup(await readCodexSessionTree({ codexHome, sessionPath: parentPath }));
+      assert.deepEqual(lookup.calls.map(({ key, notBefore }) => [key, notBefore]), [
+        // The priced call before it in the parent's rollout bounds r_parent.
+        ["r_parent", "2026-11-01T13:01:00Z"],
+        // The subagent's first call: its own rollout's start, not r_parent's end.
+        ["r_child", "2026-11-01T13:02:00Z"],
+      ]);
+    });
+  });
+
+  it("bounds a lookup call by the nearest dated call before it, past an undated one", async () => {
+    await withCodexHome(async (home, codexHome) => {
+      const { readCodexSessionTree, codexServedLookup } = await import("../../../../lib/harnesses/codex/usage/report.mjs");
+      const at = (iso, turnId, id) => ({ type: "token_usage_record", ...(iso ? { timestamp: iso } : {}), payload: { turn_id: turnId, response_id: id, usage: usage(10, 0, 1) } });
+      const parentPath = await writeRollout(codexHome, "01", PARENT, [
+        meta(PARENT, { timestamp: "2026-11-01T13:00:00Z" }),
+        ...turn("t1", MODEL), at("2026-11-01T13:01:00Z", "t1", "r_dated"),
+        ...turn("t2", MODEL), at(undefined, "t2", "r_undated"),
+        ...turn("t3", "auto"), at("2026-11-01T13:10:00Z", "t3", "r_auto"),
+      ]);
+      const lookup = codexServedLookup(await readCodexSessionTree({ codexHome, sessionPath: parentPath }));
+      assert.deepEqual(lookup.calls.map(({ key, notBefore }) => [key, notBefore]), [["r_auto", "2026-11-01T13:01:00Z"]]);
+    });
+  });
+
   it("puts undated calls after the dated ones in a session's lookup, without unsorting the rest", async () => {
     await withCodexHome(async (home, codexHome) => {
       const { readCodexSessionTree, codexServedLookup } = await import("../../../../lib/harnesses/codex/usage/report.mjs");

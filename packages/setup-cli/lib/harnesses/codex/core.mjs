@@ -56,7 +56,8 @@ import {
   withoutHeaders,
 } from "../../firerouter/core.mjs";
 import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
-import { canInstallCodexPet, installCodexPet, removeCodexPet, selectsCodexPet } from "./pet-patch.mjs";
+import { canInstallCodexPet, codexPetDir, installCodexPet, removeCodexPet, selectsCodexPet } from "./pet-patch.mjs";
+import { applyCachedBoostToPet } from "./ultrafast.mjs";
 export { printCodexRestartHint } from "../../cli/messages.mjs";
 
 export const CODEX_CONFIG_RELATIVE_PATH = ".codex/config.toml";
@@ -546,6 +547,7 @@ export async function enableCodexFireworks({
   catalogAvailable = false,
   telemetryHeaders = {},
   anthropicKey = "",
+  ultrafast = null,
 }) {
   const resolvedEffective = effectiveApiKey
     || (apiKey === CODEX_API_KEY_ENV_REF ? "" : apiKey);
@@ -601,6 +603,11 @@ export async function enableCodexFireworks({
     envHttpHeaders: withoutHeaders(providerTable.env_http_headers, CODEX_REBUILT_HEADERS),
     pet: canInstallCodexPet(configPath),
   };
+  // The Ultra-fast footer (ultrafast-patch.mjs); the server picks the pet's
+  // animations only when the pet is Nexus's.
+  routing.ultrafast = ultrafast
+    ? { ...ultrafast, configPath, petDir: routing.pet ? codexPetDir(configPath) : "" }
+    : null;
   // Refuse before the backup or catalog is touched, so a refused `on` leaves
   // nothing behind for `off` to restore.
   assertCodexConfigWritable(
@@ -708,6 +715,9 @@ export async function enableCodexFireworks({
   // the user chose their own pet).
   if (selectsCodexPet(nextRaw)) {
     await installCodexPet(configPath);
+    // During a boost, the next Codex shows the boost pet, not the plain one
+    // just reinstalled (Codex reads the pet only when it starts).
+    if (routing.ultrafast) await applyCachedBoostToPet(codexPetDir(configPath), resolvedEffective);
   }
 
   return {
@@ -860,5 +870,5 @@ export async function readCodexTomlIfExists(configPath) {
     return { existed: false, doc: emptyTomlDoc(), repaired: false };
   }
   const { raw, doc } = readCodexConfigDoc(configPath, snapshot.raw);
-  return { existed: true, doc, repaired: raw !== snapshot.raw };
+  return { existed: true, doc, raw, repaired: raw !== snapshot.raw };
 }

@@ -12,7 +12,11 @@ import {
   isClaudeModelAlias,
   shortFireworksModelRef,
 } from "../../../fireworks/model-id.mjs";
-import { lookupFireworksPricing } from "../../../fireworks/pricing.mjs";
+import {
+  lookupFireworksPricing,
+  standardPricingForUltrafast,
+  ultrafastPricedAtStandard,
+} from "../../../fireworks/pricing.mjs";
 
 const WEB_SEARCH_PER_1K = 10;
 const US_INFERENCE_GEO_MULTIPLIER = 1.1;
@@ -27,12 +31,20 @@ function fireworksPriceFor(model) {
   if (!pricing) {
     return null;
   }
+  // Ultra-fast calls on a Pro plan are billed at the standard model's rates;
+  // the label stays Ultra-fast. With no standard price known, the row keeps
+  // the Ultra-fast rate: an upper bound, but a real published rate, which the
+  // live meter and reports keep (an "estimated" row reads as unpriced there).
+  const standard = pricing.tier === "ultrafast" && ultrafastPricedAtStandard()
+    ? standardPricingForUltrafast(model)
+    : null;
+  const rates = standard ?? pricing;
   return {
-    inputPerMillion: pricing.input,
+    inputPerMillion: rates.input,
     cacheWrite5mPerMillion: 0,
     cacheWrite1hPerMillion: 0,
-    cacheReadPerMillion: pricing.cachedInput,
-    outputPerMillion: pricing.output,
+    cacheReadPerMillion: rates.cachedInput,
+    outputPerMillion: rates.output,
     label: pricing.label,
     source: pricing.source,
     estimated: false,

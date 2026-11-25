@@ -6,7 +6,6 @@ import { withTempHome } from "../helpers.mjs";
 import { readGlobalConfig } from "../../lib/config/global-config.mjs";
 import { persistApiKeyToKeychain, persistApiKeyFromFlag, keysUrlForHome, NEXUS_KEYS_URL, FIREWORKS_KEYS_URL } from "../../lib/keys/api-key.mjs";
 import { getSecret, resetSecretStoreForTests } from "../../lib/keys/secret-store.mjs";
-import { secretsFilePath } from "../../lib/keys/builtin-file-secret-store.mjs";
 import { readMintedKeyState, writeMintedKeyState } from "../../lib/keys/mint-api-key.mjs";
 import { storeApiKey } from "../../lib/auth/login/output.mjs";
 

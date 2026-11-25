@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import {
   printAzureConnected,
   printNote,
@@ -26,13 +28,15 @@ import { resolveAutoProviderKeyHeaders } from "../firerouter/flag.mjs";
 import {
   isHarnessEnabled,
   readGlobalConfig,
+  hasHarnessCustomPath,
   readProviderSettings,
+  recordHarnessCustomPath,
   setHarnessEnabled,
 } from "../config/global-config.mjs";
 import { autoHarnessSupported, nexusProvidersHeaders } from "../config/auto-providers.mjs";
 import { reconcileShellEnvHook } from "../io/shell-env-hook.mjs";
 import { resolveHarnessResidency } from "../fireworks/residency.mjs";
-import { ensureHomeForHarness } from "./context.mjs";
+import { ensureHomeForHarness, harnessPathOverrides, withoutPathOverrides } from "./context.mjs";
 import { defineHarness } from "./types.mjs";
 import { buildFireconnectTelemetryHeaders } from "../telemetry/request-headers.mjs";
 
@@ -147,17 +151,33 @@ export async function engineOn(profile, ctx) {
   const autoHeaders = nexusProvidersHeaders(
     (await readGlobalConfig(ctx.home)).auto.providers,
   );
-  const result = await profile.enable({
-    ctx,
-    paths,
-    apiKeyRef,
-    effectiveKey,
-    modelId,
-    byokHeaders: { ...byokHeaders, ...autoHeaders },
-    telemetryHeaders: profile.telemetryHeaders
-      ? { ...buildFireconnectTelemetryHeaders(profile.id), ...autoHeaders }
-      : {},
-  });
+  // A config at a custom path holds its own copy of the key: remember it
+  // before writing it, so a key rotation re-points (or keeps the key for)
+  // that copy too, even if this run dies mid-write.
+  const overrides = customPathOverrides(profile, ctx);
+  const recordedBefore = await hasHarnessCustomPath(ctx.home, profile.id, overrides);
+  await recordHarnessCustomPath(ctx.home, profile.id, overrides, true);
+  let result;
+  try {
+    result = await profile.enable({
+      ctx,
+      paths,
+      apiKeyRef,
+      effectiveKey,
+      modelId,
+      byokHeaders: { ...byokHeaders, ...autoHeaders },
+      telemetryHeaders: profile.telemetryHeaders
+        ? { ...buildFireconnectTelemetryHeaders(profile.id), ...autoHeaders }
+        : {},
+    });
+  } catch (error) {
+    // Nothing routed there after all: drop the new record, or every later
+    // rotation would keep the old key for a config that never held it.
+    if (!recordedBefore && !await isHarnessRouted(profile, ctx).catch(() => true)) {
+      await recordHarnessCustomPath(ctx.home, profile.id, overrides, false).catch(() => {});
+    }
+    throw error;
+  }
 
   await setHarnessEnabled(ctx.home, profile.id, true, "fireworks", residencyState);
   if (profile.envHookOn) {
@@ -326,6 +346,8 @@ export async function engineAzureOn(profile, ctx, azureConfig) {
   const result = await profile.azure.enable({ ctx, paths, apiKey, apiKeyFromFlag, baseUrl });
 
   await setHarnessEnabled(ctx.home, profile.id, true, "azure");
+  // That config no longer holds the Fireworks key.
+  await recordHarnessCustomPath(ctx.home, profile.id, harnessPathOverrides(ctx, profile.id), false);
   await reconcileShellEnvHook(ctx.home);
 
   printAzureConnected({
@@ -409,6 +431,32 @@ export async function isHarnessRouted(target, ctx) {
 }
 
 /**
+ * The path overrides `ctx` sets for `profile`, or none when they name its
+ * default files anyway (`--config-path ~/.codex/config.toml`), so a plain
+ * `off` doesn't leave a record behind.
+ * @param {HarnessProfile} profile
+ * @param {import("./types.mjs").HarnessContext} ctx
+ */
+function customPathOverrides(profile, ctx) {
+  const overrides = harnessPathOverrides(ctx, profile.id);
+  if (Object.keys(overrides).length === 0) return overrides;
+  const files = (c) => JSON.stringify(Object.entries(profile.paths(c))
+    .filter(([key, value]) => key !== "dataDir" && typeof value === "string")
+    .map(([key, value]) => [key, path.resolve(value)]));
+  return files(ctx) === files(withoutPathOverrides(ctx, profile.id)) ? {} : overrides;
+}
+
+/** Whether any file in `paths` exists but is neither a file nor a directory (a named pipe). */
+async function hasSpecialFile(paths) {
+  for (const [key, file] of Object.entries(paths)) {
+    if (key === "dataDir" || typeof file !== "string" || !file) continue;
+    const info = await stat(file).catch(() => null);
+    if (info && !info.isFile() && !info.isDirectory()) return true;
+  }
+  return false;
+}
+
+/**
  * Generic `<harness> off`: back out the provider config via the profile's
  * `disable` hook (which returns an outcome), flip the enabled flag, remove the
  * shell env hook (unless the harness opts out), and print restored/unchanged.
@@ -430,7 +478,22 @@ export async function engineOff(profile, ctx) {
     await profile.prepareOff(ctx);
   }
   const outcome = await profile.disable({ ctx, paths, wasEnabled });
-  await setHarnessEnabled(ctx.home, profile.id, false);
+  const overrides = customPathOverrides(profile, ctx);
+  await recordHarnessCustomPath(ctx.home, profile.id, overrides, false);
+  // `off` at a custom path leaves the default config alone: while that one
+  // is still routed, the harness stays enabled so a key rotation still
+  // re-points it. A default file that isn't a regular file (a named pipe)
+  // isn't read; the harness stays enabled, the safe side for key sync.
+  const defaultCtx = withoutPathOverrides(ctx, profile.id);
+  const custom = Object.keys(overrides).length > 0;
+  const defaultUnreadable = custom && await hasSpecialFile(profile.paths(defaultCtx));
+  const defaultStillRouted = custom && (defaultUnreadable || await isHarnessRouted(profile, defaultCtx));
+  // A Fireworks default stays marked Fireworks (an Azure custom path turned
+  // off mustn't leave it marked Azure, which key sync skips). Azure is never
+  // set here: Pi, for one, keeps the Fireworks key next to Azure settings.
+  const defaultOnFireworks = defaultStillRouted && !defaultUnreadable && typeof profile.providerStatus === "function"
+    && await Promise.resolve().then(() => profile.providerStatus(defaultCtx)).catch(() => "") === "fireworks";
+  await setHarnessEnabled(ctx.home, profile.id, defaultStillRouted, defaultOnFireworks ? "fireworks" : "");
   if (profile.envHookOff !== false) {
     await reconcileShellEnvHook(ctx.home);
   }

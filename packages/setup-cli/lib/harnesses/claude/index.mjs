@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import process from "node:process";
 
 import {
@@ -85,10 +87,14 @@ import { defineHarnessProfile, harnessModelAccess, servedCatalogForOn } from "..
 import {
   claudePathsFor,
   ensureHomeForHarness,
+  harnessPathOverrides,
+  withoutPathOverrides,
 } from "../../harness/context.mjs";
 import {
   isHarnessEnabled,
+  hasHarnessCustomPath,
   readGlobalConfig,
+  recordHarnessCustomPath,
   setHarnessEnabled,
   setHarnessState,
 } from "../../config/global-config.mjs";
@@ -140,6 +146,8 @@ import {
   claudeCodeShowsModelPicker,
   installedClaudeCodeVersion,
 } from "./claude-code-version.mjs";
+import { claudeModsEnabled } from "./mods.mjs";
+import { clearUltrafastBadge } from "./ultrafast-badge.mjs";
 import { activeAccountResidency, fireworksInferenceUrl, resolveHarnessResidency } from "../../fireworks/residency.mjs";
 
 const CLAUDE_FIREROUTER = Object.freeze({
@@ -194,6 +202,42 @@ export function resolveClaudeAuthState(settings, state = {}) {
  * Fireworks key from active Claude Code settings when Fireconnect is on.
  * @param {import("../../harness/types.mjs").HarnessContext} ctx
  */
+/**
+ * `ctx`'s `--settings-path` override, or none when it names the default
+ * settings file anyway (so a plain `off` doesn't leave a record behind).
+ * @param {import("../../harness/types.mjs").HarnessContext} ctx
+ */
+function claudeCustomPathOverrides(ctx) {
+  const overrides = harnessPathOverrides(ctx, HARNESS.CLAUDE);
+  const same = path.resolve(claudePathsFor(ctx).settingsPath)
+    === path.resolve(claudePathsFor(withoutPathOverrides(ctx, HARNESS.CLAUDE)).settingsPath);
+  return same ? {} : overrides;
+}
+
+/**
+ * Whether the settings `ctx` points at are still routed through Fireworks by
+ * Nexus. Unreadable, or not a regular file (a named pipe isn't read), counts
+ * as routed, so the harness stays enabled: the safe side for key sync.
+ * @param {import("../../harness/types.mjs").HarnessContext} ctx
+ */
+async function claudeSettingsRouted(ctx) {
+  try {
+    const { settingsPath, dataDir } = claudePathsFor(ctx);
+    for (const file of [settingsPath, providerBackupPath(dataDir), providerStatePath(dataDir)]) {
+      const info = await stat(file).catch(() => null);
+      if (info && !info.isFile()) return true;
+    }
+    const [settings, backup, state] = await Promise.all([
+      readJsonIfExists(settingsPath),
+      readJsonIfExists(providerBackupPath(dataDir)),
+      readJsonIfExists(providerStatePath(dataDir)),
+    ]);
+    return Boolean(claudeFireconnectIntent(settings, { backup, state }));
+  } catch {
+    return true;
+  }
+}
+
 async function claudeResolveKey(ctx) {
   const { settingsPath, dataDir } = claudePathsFor(ctx);
   const settings = await readJsonIfExists(settingsPath);
@@ -602,6 +646,14 @@ export default defineHarnessProfile({
     const nexusProviders = formatAutoProviders(
       (await readGlobalConfig(ctx.home)).auto.providers,
     );
+    // Probed before the write so `on` installs the Ultra-fast banner mod only
+    // on Claude Code releases that load mods.
+    const claudeCodeVersion = installedClaudeCodeVersion({ home: ctx.home });
+    const claudeMods = claudeModsEnabled(claudeCodeVersion);
+    // Recorded before the write; see engineOn.
+    const overrides = claudeCustomPathOverrides(ctx);
+    const recordedBefore = await hasHarnessCustomPath(ctx.home, HARNESS.CLAUDE, overrides);
+    await recordHarnessCustomPath(ctx.home, HARNESS.CLAUDE, overrides, true);
     const { settings: enabledSettings } = await enableFireworksProvider({
       settingsPath,
       dataDir,
@@ -618,7 +670,17 @@ export default defineHarnessProfile({
       selectedPickerModel: extraPickerModel ?? "",
       firerouterHeaders: bareFirerouter,
       catalogServed,
+      claudeMods,
+    }).catch(async (error) => {
+      // Nothing routed there after all: drop the new record; see engineOn.
+      if (!recordedBefore && !await claudeSettingsRouted(ctx)) {
+        await recordHarnessCustomPath(ctx.home, HARNESS.CLAUDE, overrides, false).catch(() => {});
+      }
+      throw error;
     });
+    // The key Claude Code uses may have changed: the banner mod records the
+    // boost again for the new one, so another account's never shows.
+    await clearUltrafastBadge(ctx.home);
     await setHarnessState(ctx.home, HARNESS.CLAUDE, {
       enabled: true,
       provider: "fireworks",
@@ -645,7 +707,6 @@ export default defineHarnessProfile({
     if (replacedDefault) {
       footnotes.push(() => printNote(replacedDefault));
     }
-    const claudeCodeVersion = installedClaudeCodeVersion({ home: ctx.home });
     const pickerVersionNote = claudeCodeModelPickerNote(claudeCodeVersion);
     if (pickerVersionNote) {
       footnotes.push(() => printNote(pickerVersionNote));
@@ -693,7 +754,12 @@ export default defineHarnessProfile({
       dataDir,
       wasEnabled: connected,
     });
-    await setHarnessEnabled(ctx.home, HARNESS.CLAUDE, false);
+    await clearUltrafastBadge(ctx.home);
+    const overrides = claudeCustomPathOverrides(ctx);
+    await recordHarnessCustomPath(ctx.home, HARNESS.CLAUDE, overrides, false);
+    // `off` at a custom path leaves the default settings alone; see engineOff.
+    await setHarnessEnabled(ctx.home, HARNESS.CLAUDE,
+      Object.keys(overrides).length > 0 && await claudeSettingsRouted(withoutPathOverrides(ctx, HARNESS.CLAUDE)));
     await disableWebsearchMcp(ctx.home);
     await removeDesktopGuardHook(settingsPath);
     // `ctx.quiet` (uninstall) silences the per-harness narration so the
