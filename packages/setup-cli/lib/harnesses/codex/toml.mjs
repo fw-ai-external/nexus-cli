@@ -63,3 +63,15 @@ export function parseToml(text) {
   }
   return { root, tables };
 }
+
+const TOML_ESCAPES = { "\\": "\\\\", "\"": "\\\"", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r" };
+
+/**
+ * A TOML basic string. Every value Nexus writes goes through here: quotes,
+ * backslashes and all control characters are escaped, so a value can only
+ * ever set its own key.
+ */
+export function tomlString(value) {
+  return `"${String(value).replace(/[\\"\u0000-\u001f\u007f]/g, (c) =>
+    TOML_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)}"`;
+}

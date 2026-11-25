@@ -269,6 +269,7 @@ describe("migrateLegacyDataDir", () => {
         "demo.json",
         ".api-key",
         ".secret-memory",
+        "ultrafast-boost.json",
         "set-aside.json",
         "rename-merging",
       ];

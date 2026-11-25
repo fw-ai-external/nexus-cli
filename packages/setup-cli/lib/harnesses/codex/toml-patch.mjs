@@ -1,5 +1,10 @@
 import { patchCodexImageGenerationRaw, stripCodexImageGenerationRaw } from "./feature-patch.mjs";
 import { patchCodexPetRaw, stripCodexPetRaw } from "./pet-patch.mjs";
+import { patchCodexUltrafastRaw, stripCodexUltrafastRaw } from "./ultrafast-patch.mjs";
+import { tomlString } from "./toml.mjs";
+
+// Re-exported for callers that already import it from here.
+export { tomlString };
 
 /**
  * Surgical edits to Codex config.toml — only touches Nexus-owned keys/tables
@@ -30,18 +35,6 @@ const CODEX_ENV_AUTH_LINE = /^env_key\s*=.+$/;
 // `http_headers = {…}` or a dotted `http_headers.<name> = …` entry.
 const CODEX_HTTP_HEADERS_LINE = /^(?:http_headers|"http_headers"|'http_headers')\s*[=.]/;
 const CODEX_HEADERS_TABLE_PATH = [...CODEX_PROVIDER_TABLE_PATH, "http_headers"];
-
-const TOML_ESCAPES = { "\\": "\\\\", "\"": "\\\"", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r" };
-
-/**
- * A TOML basic string. Every value Nexus writes goes through here: quotes,
- * backslashes and all control characters are escaped, so a value can only
- * ever set its own key.
- */
-export function tomlString(value) {
-  return `"${String(value).replace(/[\\"\u0000-\u001f\u007f]/g, (c) =>
-    TOML_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)}"`;
-}
 
 function inlineTableLine(key, entries) {
   return `${key} = { ${Object.entries(entries)
@@ -245,7 +238,9 @@ export function stripFireconnectRoutingRaw(raw, { stripRootRouting = false } = {
     out.push(line);
   }
 
-  return ensureTrailingNewline(stripCodexPetRaw(stripCodexImageGenerationRaw(out.join("\n"))).replace(/\n+$/, "\n"));
+  return ensureTrailingNewline(
+    stripCodexPetRaw(stripCodexImageGenerationRaw(stripCodexUltrafastRaw(out.join("\n")))).replace(/\n+$/, "\n"),
+  );
 }
 
 /**
@@ -264,8 +259,10 @@ export function stripFireconnectRoutingRaw(raw, { stripRootRouting = false } = {
  *   envHttpHeaders?: Record<string, string>,
  *   chatgptLogin?: boolean,
  *   pet?: boolean,
+ *   ultrafast?: { nodePath: string, serverPath: string, configPath: string, petDir?: string } | null,
  * }} routing `pet` selects the Fireworks terminal pet (pet-patch.mjs)
- *   unless the user already chose one.
+ *   unless the user already chose one. `ultrafast` adds the Ultra-fast footer
+ *   (ultrafast-patch.mjs) unless the user's config rules it out.
  */
 export function patchFireconnectRoutingRaw(raw, {
   providerId,
@@ -281,13 +278,15 @@ export function patchFireconnectRoutingRaw(raw, {
   envHttpHeaders = {},
   chatgptLogin = false,
   pet = false,
+  ultrafast = null,
 }) {
   // Leading blank lines are the separator a previous patch wrote after the
   // routing block; keeping them would add one more on every re-`on`.
   const withFeatures = patchCodexImageGenerationRaw(
     stripFireconnectRoutingRaw(raw, { stripRootRouting: true }).replace(/^(?:[ \t]*\r?\n)+/, ""),
   );
-  const base = pet ? patchCodexPetRaw(withFeatures) : withFeatures;
+  const withPet = pet ? patchCodexPetRaw(withFeatures) : withFeatures;
+  const base = ultrafast ? patchCodexUltrafastRaw(withPet, ultrafast) : withPet;
   const routingBlock = [
     `model_provider = ${tomlString(providerId)}`,
     ...(catalogPath ? [`model_catalog_json = ${tomlString(catalogPath)}`] : []),

@@ -7,7 +7,7 @@ import path from "node:path";
 
 /** @typedef {{ slug: string, label: string, input: number, cachedInput: number, output: number, tier: string, source: string }} ServerlessPricing */
 
-/** @typedef {{ entries: import("./models.mjs").CatalogEntry[], pricingById: Map<string, ServerlessPricing>, inputModalitiesById: Map<string, string[]>, routerBaseModelById: Map<string, string>, contextLengthById: Map<string, number>, supportsToolsById: Map<string, boolean> }} ServerlessCatalogSnapshot */
+/** @typedef {{ entries: import("./models.mjs").CatalogEntry[], pricingById: Map<string, ServerlessPricing>, inputModalitiesById: Map<string, string[]>, routerBaseModelById: Map<string, string>, contextLengthById: Map<string, number>, supportsToolsById: Map<string, boolean>, planTier?: string, planState?: string }} ServerlessCatalogSnapshot */
 
 /** @type {ServerlessCatalogSnapshot | null} */
 let activeSnapshot = null;
@@ -69,6 +69,7 @@ function serializeSnapshot(snapshot) {
     routerBaseModelById: pairs(snapshot.routerBaseModelById),
     contextLengthById: pairs(snapshot.contextLengthById),
     supportsToolsById: pairs(snapshot.supportsToolsById),
+    ...(snapshot.planTier ? { planTier: snapshot.planTier, planState: snapshot.planState ?? "" } : {}),
   };
 }
 
@@ -83,6 +84,8 @@ function deserializeSnapshot(value) {
     routerBaseModelById: toMap(value.routerBaseModelById),
     contextLengthById: toMap(value.contextLengthById),
     supportsToolsById: toMap(value.supportsToolsById),
+    planTier: typeof value.planTier === "string" ? value.planTier : "",
+    planState: typeof value.planState === "string" ? value.planState : "",
   };
 }
 
@@ -190,6 +193,44 @@ export function cacheServerlessCatalogSnapshot(snapshot, { apiKey = "" } = {}) {
  */
 export function catalogKeyFingerprint(apiKey) {
   return createHash("sha256").update(String(apiKey).trim()).digest("hex").slice(0, 16);
+}
+
+/**
+ * The Nexus plan the cached catalog was fetched under: its tier ("PRO",
+ * "TEAMS", ...) and state ("ACTIVE", "ENDED", ...), both "" when unknown (no
+ * plan, an older cache, or no cache).
+ * @returns {{ tier: string, state: string }}
+ */
+export function cachedNexusPlan() {
+  const snapshot = getServerlessCatalogSnapshot();
+  return { tier: snapshot?.planTier ?? "", state: snapshot?.planState ?? "" };
+}
+
+/**
+ * Forget the cached plan when the cache was fetched with another key (or none
+ * recorded), so a key switch whose catalog refresh then fails doesn't keep
+ * pricing by the previous account's plan. Keeps the rest of the cache and its
+ * age. Best effort; never throws.
+ * @param {string} apiKey
+ */
+export function forgetCachedPlanForOtherKey(apiKey) {
+  try {
+    const cache = readCatalogCache();
+    if (!cache?.snapshot?.planTier) return;
+    if (apiKey && cache.keyFingerprint === catalogKeyFingerprint(apiKey)) return;
+    const file = cacheFilePath();
+    // Refuses a symlinked cache directory, as every other cache write does.
+    ensureCacheParent(file);
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    if (value?.snapshot && typeof value.snapshot === "object") {
+      delete value.snapshot.planTier;
+      delete value.snapshot.planState;
+      writeFileAtomicSync(file, JSON.stringify(value), { mode: 0o600 });
+    }
+    if (activeSnapshot) activeSnapshot = { ...activeSnapshot, planTier: "", planState: "" };
+  } catch {
+    // Best effort: pricing falls back to the Ultra-fast rate on the next refresh.
+  }
 }
 
 export function getServerlessCatalogSnapshot() {

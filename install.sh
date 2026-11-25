@@ -701,7 +701,7 @@ const OWNED = [
   "catalog-cache.json", "list-price-cache.json", "codex-stock-models.json",
   "update-check.json", "update-check.lock", "release-notes.json", "minted-key.json",
   "demo.json", ".api-key", ".secret-memory",
-  "cli", "claude-desktop", "statusline-refresh", "set-aside.json", "rename-merging",
+  "cli", "claude-desktop", "statusline-refresh", "ultrafast-boost.json", "set-aside.json", "rename-merging",
 ];
 const STRONG = [
   "key-storage.json", "secret-backend.json", "rename-complete", "rename-announced",

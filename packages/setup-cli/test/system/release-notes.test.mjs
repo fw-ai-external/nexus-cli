@@ -114,11 +114,33 @@ describe("release notes", () => {
     assert.doesNotMatch(formatted, /\u2014/);
   });
 
+  it("formats the v0.12.1 user-facing summary", async () => {
+    const releases = await readReleaseNotes();
+    const release = releases.find((candidate) => candidate.version === "0.12.1");
+    assert.ok(release);
+    assert.equal(releases[0].version, "0.12.1");
+
+    const formatted = formatReleaseNotes(release);
+    assert.match(formatted, /What's new in Nexus CLI v0\.12\.1/);
+    assert.equal(release.highlights.length, 3);
+    assert.equal(release.improvements.length, 0);
+    assert.match(formatted, /`nexus login --force` also updates harness configs Nexus knows about at custom paths/);
+    assert.match(formatted, /`nexus codex usage` prices Nexus Auto calls that ran longer than a minute/);
+    assert.match(formatted, /Nexus refuses chat requests with an outdated Claude Desktop token/);
+    assert.match(formatted, /restart your harnesses to load the updated settings/);
+    assert.deepEqual(releaseNotesForRange(releases, "0.12.0", "0.12.1").map((entry) => entry.version), ["0.12.1"]);
+    // Only what public docs cover: no Ultra-fast boost UI or plan pricing.
+    assert.doesNotMatch(formatted, /boost|Pro plan|Ultra-fast/i);
+    // Keep the notes simple: no placeholder harness commands or internals.
+    assert.doesNotMatch(formatted, /<harness>/);
+    assert.doesNotMatch(formatted, /\u2014/);
+    assert.doesNotMatch(formatted, /shim|https?:\/\/|\$\.http/i);
+  });
+
   it("formats the v0.12.0 user-facing summary", async () => {
     const releases = await readReleaseNotes();
     const release = releases.find((candidate) => candidate.version === "0.12.0");
     assert.ok(release);
-    assert.equal(releases[0].version, "0.12.0");
 
     const formatted = formatReleaseNotes(release);
     assert.match(formatted, /What's new in Nexus CLI v0\.12\.0/);
@@ -134,7 +156,8 @@ describe("release notes", () => {
     assert.match(formatted, /Fireworks symbol in the Claude Code status line/);
     assert.match(formatted, /tokens per second \(TPS\)/);
     assert.match(formatted, /`us\.api\.fireworks\.ai`/);
-    assert.match(formatted, /DeepSeek V4\.1 Flash 1017 Ultra-fast/);
+    assert.match(formatted, /`nexus hermes` connects Hermes Agent with Nexus Auto as the default/);
+    assert.doesNotMatch(formatted, /Ultra-fast/i);
     assert.match(formatted, /Codex: image generation is off by default/);
     assert.match(formatted, /Better Windows support/);
     assert.match(formatted, /`nexus uninstall` finishes removing Nexus after the CLI exits/);

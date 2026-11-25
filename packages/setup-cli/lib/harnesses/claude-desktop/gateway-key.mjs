@@ -3,9 +3,11 @@ import { promisify } from "node:util";
 import path from "node:path";
 import os from "node:os";
 import { readFile, rm, stat } from "node:fs/promises";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { shimTrustOptions } from "./platform.mjs";
-import { createDesktopToken, desktopTokenPath, ensureDesktopToken, readDesktopToken, rotateDesktopToken } from "./desktop-token.mjs";
+import {
+  claimDesktopToken, createDesktopToken, desktopTokenFingerprint, desktopTokenFingerprintPath, readDesktopToken, rotateDesktopToken, desktopTokenPath,
+} from "./desktop-token.mjs";
 import { ensurePrivateParent } from "../../io/private-files.mjs";
 import { writeFileAtomic } from "../../io/atomic-write.mjs";
 
@@ -15,7 +17,7 @@ const credentialUpdates = new Map();
 
 export async function removeDesktopCredential(dataDir) {
   await rm(desktopTokenPath(dataDir), { force: true });
-  await rm(path.join(dataDir, "claude-desktop-key-fingerprint"), { force: true });
+  await rm(desktopTokenFingerprintPath(dataDir), { force: true });
 }
 
 export function shimKeyEnvironment(home, { env = process.env, platform = process.platform, realHome = os.homedir() } = {}) {
@@ -52,11 +54,16 @@ export function selectDesktopCredential({ home, dataDir, key, rotate = false, wr
     const actual = Buffer.from(available);
     if (actual.length && actual.length === expected.length && timingSafeEqual(actual, expected)) {
       const previous = await readDesktopToken(dataDir);
-      let token = previous ?? await ensureDesktopToken(dataDir);
-      const fingerprintPath = path.join(dataDir, "claude-desktop-key-fingerprint");
-      const fingerprint = (value) => createHmac("sha256", value).update(key).digest("hex");
+      // A token another process created between the read above and this
+      // claim is treated like one that was already there: its fingerprint
+      // decides whether it may be kept for this key.
+      const claimed = previous ? null : await claimDesktopToken(dataDir);
+      const existing = previous ?? (claimed.created ? null : claimed.token);
+      let token = existing ?? claimed.token;
+      const fingerprintPath = desktopTokenFingerprintPath(dataDir);
+      const fingerprint = (value) => desktopTokenFingerprint(value, key);
       const priorFingerprint = await readFile(fingerprintPath, "utf8").catch((error) => { if (error.code === "ENOENT") return null; throw error; });
-      const rotating = previous && (rotate || priorFingerprint?.trim() !== fingerprint(token));
+      const rotating = Boolean(existing) && (rotate || priorFingerprint?.trim() !== fingerprint(token));
       if (rotating) token = createDesktopToken();
       const rollback = await writeProfile?.(token);
       let fingerprintWritten = false;

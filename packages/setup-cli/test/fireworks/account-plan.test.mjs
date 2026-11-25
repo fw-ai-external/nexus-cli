@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { planLimitsCatalogToAuto } from "../../lib/fireworks/account-plan.mjs";
+import { fetchNexusPlan, planLimitsCatalogToAuto } from "../../lib/fireworks/account-plan.mjs";
 
 /** Run `fn` with the real lookup (NEXUS_TEST off) against a stubbed gateway. */
 async function withGateway({ plans, plansStatus = 200, verifyStatus = 200, onRequest }, fn) {
@@ -91,6 +91,33 @@ describe("planLimitsCatalogToAuto", () => {
       Date.now = previousNow;
       AbortSignal.timeout = previousTimeout;
     }
+  });
+
+  test("fetchNexusPlan answers the catalog's plan tier and the plan in force", async () => {
+    for (const [plans, plan] of [
+      [[{ tier: "PRO", state: "ACTIVE" }], { catalogTier: "PRO", tier: "PRO", state: "ACTIVE" }],
+      [[{ tier: "TEAMS", state: "PENDING_PAYMENT" }], { catalogTier: "TEAMS", tier: "TEAMS", state: "PENDING_PAYMENT" }],
+      [[{ tier: "PRO", state: "ENDED" }], { catalogTier: "PRO", tier: "PRO", state: "ENDED" }],
+      [[{ tier: "PRO", state: "ENDED" }, { tier: "ENTERPRISE", state: "ACTIVE" }], { catalogTier: "ENTERPRISE", tier: "ENTERPRISE", state: "ACTIVE" }],
+      // A newer replacement waiting for payment: the catalog follows it, as
+      // the gateway does; billing follows the active plan.
+      [[{ tier: "TEAMS", state: "PENDING_PAYMENT" }, { tier: "PRO", state: "ACTIVE" }], { catalogTier: "TEAMS", tier: "PRO", state: "ACTIVE" }],
+      [[{ tier: "PRO", state: "PENDING_PAYMENT" }, { tier: "ENTERPRISE", state: "ACTIVE" }], { catalogTier: "PRO", tier: "ENTERPRISE", state: "ACTIVE" }],
+      [[], { catalogTier: "", tier: "", state: "" }],
+    ]) {
+      await withGateway({ plans }, async () => {
+        assert.deepEqual(await fetchNexusPlan("fw_test_key"), plan, JSON.stringify(plans));
+      });
+    }
+    await withGateway({ plans: [{ tier: "PRO", state: "PENDING_PAYMENT" }, { tier: "ENTERPRISE", state: "ACTIVE" }] }, async () => {
+      assert.equal(await planLimitsCatalogToAuto("fw_test_key"), true, "the catalog still follows the newest plan");
+    });
+    await withGateway({ plans: [{ tier: "PRO", state: "ACTIVE" }], plansStatus: 403 }, async () => {
+      assert.deepEqual(await fetchNexusPlan("fw_test_key"), { catalogTier: "", tier: "", state: "" });
+    });
+    await withGateway({ plans: [{ tier: "PRO", state: "ACTIVE" }], plansStatus: 503 }, async () => {
+      assert.equal(await fetchNexusPlan("fw_test_key"), null);
+    });
   });
 
   test("NEXUS_PLAN_CATALOG_FILTER=0 turns the check off", async () => {

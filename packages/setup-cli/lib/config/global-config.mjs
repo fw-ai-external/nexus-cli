@@ -39,7 +39,12 @@ export function isEnabledFireworksHarness(harnesses, harnessId) {
  *   provider?: "fireworks"|"azure",
  *   profiles?: Record<string, unknown>,
  *   residency?: "US",
+ *   customPaths?: Record<string, string>[],
  * }} HarnessConfigEntry */
+/** `customPaths`: the file-path overrides (`{ configPath }` for
+ * `--config-path`, ...) of each non-default config `on` wrote and `off`
+ * hasn't undone, so a key rotation can re-point (or keep the key for) every
+ * copy, not just the default one. */
 /** @typedef {Record<string, HarnessConfigEntry>} HarnessConfigMap */
 
 export function globalConfigPath(home) {
@@ -112,6 +117,61 @@ export function listEnabledHarnesses(harnesses) {
     .map(([id]) => id);
 }
 
+const PATH_OVERRIDE_FIELDS = new Set(["configPath", "settingsPath", "dbPath", "providersPath", "vscodePath", "dataDir"]);
+
+/** One override set's fields, sorted, so equal sets compare equal. */
+function customPathKey(overrides) {
+  return JSON.stringify(Object.entries(overrides).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
+/**
+ * @param {unknown} value
+ * @returns {Record<string, string>[] | undefined}
+ */
+function normalizeCustomPaths(value) {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const overrides = Object.fromEntries(Object.entries(item)
+      .filter(([field, file]) => PATH_OVERRIDE_FIELDS.has(field) && typeof file === "string" && path.isAbsolute(file)));
+    const key = customPathKey(overrides);
+    if (Object.keys(overrides).length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(overrides);
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * Whether a harness already has a record of the config `overrides` names.
+ * @param {string} home
+ * @param {string} harnessId
+ * @param {Record<string, string>} overrides
+ */
+export async function hasHarnessCustomPath(home, harnessId, overrides) {
+  const key = customPathKey(overrides);
+  return ((await readGlobalConfig(home)).harnesses[harnessId]?.customPaths ?? [])
+    .some((item) => customPathKey(item) === key);
+}
+
+/**
+ * Remember (`connected`) or forget the non-default config a harness's
+ * `on`/`off` just wrote, identified by its path overrides. No-op for none.
+ * @param {string} home
+ * @param {string} harnessId
+ * @param {Record<string, string>} overrides absolute paths, from `harnessPathOverrides`
+ * @param {boolean} connected
+ */
+export async function recordHarnessCustomPath(home, harnessId, overrides, connected) {
+  if (Object.keys(overrides).length === 0) return;
+  const config = await readGlobalConfig(home);
+  const key = customPathKey(overrides);
+  const others = (config.harnesses[harnessId]?.customPaths ?? []).filter((item) => customPathKey(item) !== key);
+  await setHarnessState(home, harnessId, { customPaths: connected ? [...others, overrides] : others });
+}
+
 /**
  * @param {unknown} entry
  * @returns {HarnessConfigEntry}
@@ -128,11 +188,13 @@ function normalizeHarnessEntry(entry) {
     // The account residency the harness's endpoint was last written for;
     // absent means the global endpoint.
     const residency = supportedResidency(entry.residency) || undefined;
+    const customPaths = normalizeCustomPaths(entry.customPaths);
     return {
       enabled: entry.enabled === true,
       ...(provider ? { provider } : {}),
       ...(profiles ? { profiles } : {}),
       ...(residency ? { residency } : {}),
+      ...(customPaths ? { customPaths } : {}),
     };
   }
   return { enabled: false };

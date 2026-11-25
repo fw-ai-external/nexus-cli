@@ -110,6 +110,22 @@ function readCodexVersion(bin) {
 }
 
 /**
+ * The installed `codex` command's version core ("0.171.0"), or "" when there
+ * is none or it can't be read in time. Never rejects. Under NEXUS_TEST=1 it
+ * reads NEXUS_TEST_CODEX_VERSION instead of running anything.
+ * @param {{ env?: NodeJS.ProcessEnv, home?: string, resolverOptions?: object, version?: (bin: string) => Promise<string> }} [options]
+ */
+export async function installedCodexVersion({ env = process.env, home = os.homedir(), resolverOptions, version = readCodexVersion } = {}) {
+  if (env.NEXUS_TEST === "1") return codexVersionCore(env.NEXUS_TEST_CODEX_VERSION);
+  try {
+    const cli = await resolveHarnessCommandAsync("codex", home, resolverOptions);
+    return cli ? codexVersionCore(await version(cli)) : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Which codex to read the model list with: the newer of the `codex` command
  * and the ChatGPT app's own. OpenAI leaves its newest models out of the list
  * it sends an older Codex, so the older binary would hide them. A tie, or a

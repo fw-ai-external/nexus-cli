@@ -25,7 +25,6 @@ import {
 import {
   FIRECONNECT_REFERER,
   GLM_FAST_LATEST,
-  mockServerlessModel,
   mockServerlessModelRows,
 } from "../../helpers.mjs";
 import { harnessTestArgs, isolatedChildHome, seedOnCommandCatalog } from "../../helpers.mjs";

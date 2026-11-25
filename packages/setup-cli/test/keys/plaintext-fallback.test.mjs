@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -19,21 +18,6 @@ import {
   REPROBE_KEY_STORAGE_ENV,
 } from "../../lib/keys/storage-cache.mjs";
 import { plaintextSecretPath, readPlaintextSecret, writePlaintextSecret } from "../../lib/keys/plaintext-secret-store.mjs";
-import { globalConfigPath } from "../../lib/config/global-config.mjs";
-
-const CLI = path.resolve("bin/nexus.mjs");
-
-function runCli(args, env) {
-  const childEnv = { ...process.env, ...env };
-  delete childEnv.NEXUS_SECRET_STORE;
-  delete childEnv.FIREWORKS_API_KEY;
-  const res = spawnSync(process.execPath, [CLI, ...args], {
-    env: childEnv,
-    encoding: "utf8",
-    timeout: 30000,
-  });
-  return { code: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
-}
 
 /** Force the encrypted-file backend to fail without disabling plaintext fallback. */
 async function blockSecureKeyStorage(home) {

@@ -10,7 +10,6 @@ import {
   FIREWORKS_INFERENCE_URL,
   FPK_KEY,
   FW_CLAUDE_KEY,
-  GLM_FAST_LATEST,
   NO_ENV_KEY,
   readClaudeSettings,
   readOpencodeConfig,
@@ -106,10 +105,6 @@ function startKeyRecordingGateway() {
   });
 }
 
-const CLAUDE_STORED_FABLE_MODEL = "glm-flash-latest[1m]";
-const CLAUDE_STORED_GLM_MODEL = `${GLM_FAST_LATEST}[1m]`;
-const CLAUDE_STORED_DS_FLASH_MODEL = "deepseek-flash-latest[1m]";
-const CLAUDE_STORED_FIREROUTER_MODEL = "firerouter[1m]";
 const packageJsonPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../package.json",

@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ensurePrivateParent } from "../../io/private-files.mjs";
@@ -8,6 +8,26 @@ import { writeFileAtomic } from "../../io/atomic-write.mjs";
 
 export const CLAUDE_DESKTOP_TOKEN_PREFIX = "nexus-claude-desktop-";
 export function desktopTokenPath(dataDir) { return path.join(dataDir, "claude-desktop-token"); }
+export function desktopTokenFingerprintPath(dataDir) { return path.join(dataDir, "claude-desktop-key-fingerprint"); }
+
+/** Binds a Desktop token to the Fireworks key it was issued for (HMAC of the key under the token). */
+export function desktopTokenFingerprint(token, key) {
+  return createHmac("sha256", token).update(key).digest("hex");
+}
+
+/** The saved fingerprint (64 hex chars), or null when it is missing or not a private regular file. */
+export async function readDesktopTokenFingerprint(dataDir) {
+  try {
+    const handle = await open(desktopTokenFingerprintPath(dataDir), constants.O_RDONLY
+      | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW | constants.O_NONBLOCK));
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > 128 || (process.platform !== "win32" && info.uid !== process.getuid())) return null;
+      const value = (await handle.readFile("utf8")).trim();
+      return /^[0-9a-f]{64}$/.test(value) ? value : null;
+    } finally { await handle.close(); }
+  } catch { return null; }
+}
 export function isDesktopToken(value) {
   return typeof value === "string" && value.length === CLAUDE_DESKTOP_TOKEN_PREFIX.length + 64
     && /^nexus-claude-desktop-[0-9a-f]{64}$/.test(value);
@@ -40,6 +60,16 @@ export async function rotateDesktopToken(dataDir, token = createDesktopToken()) 
 }
 
 export async function ensureDesktopToken(dataDir) {
+  return (await claimDesktopToken(dataDir)).token;
+}
+
+/**
+ * {@link ensureDesktopToken}, also saying whether this call created the
+ * token (`created: false` when another caller's token was already there).
+ * @param {string} dataDir
+ * @returns {Promise<{ token: string, created: boolean }>}
+ */
+export async function claimDesktopToken(dataDir) {
   ensurePrivateParent(desktopTokenPath(dataDir));
   let handle;
   try {
@@ -47,7 +77,7 @@ export async function ensureDesktopToken(dataDir) {
       | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW), 0o600);
     const token = createDesktopToken();
     await handle.writeFile(`${token}\n`);
-    return token;
+    return { token, created: true };
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
   } finally { await handle?.close(); }
@@ -61,12 +91,12 @@ export async function ensureDesktopToken(dataDir) {
         if (!info.isFile() || (process.platform !== "win32" && info.uid !== process.getuid())) break;
         await existing.chmod(0o600);
       } finally { await existing.close(); }
-      return token;
+      return { token, created: false };
     }
     await delay(5);
   }
   // A create that died before its write leaves an empty file; anything else stays the user's.
-  if (await isEmptyTokenFile(dataDir)) return rotateDesktopToken(dataDir);
+  if (await isEmptyTokenFile(dataDir)) return { token: await rotateDesktopToken(dataDir), created: true };
   throw new Error("Desktop token file is invalid. Remove it and run nexus claude-desktop on again.");
 }
 

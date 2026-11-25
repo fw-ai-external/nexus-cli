@@ -536,7 +536,7 @@ export function deepseekHomePatchPath(settingsPath) {
  * @param {string} settingsPath
  * @returns {Promise<string[]>}
  */
-async function deepseekPatchPaths(settingsPath) {
+export async function deepseekPatchPaths(settingsPath) {
   const profilePatches = (await listDeepseekProfileDirs(settingsPath))
     .map((dir) => path.join(dir, DEEPSEEK_PROFILE_PATCH_FILENAME));
   return [deepseekHomePatchPath(settingsPath), ...profilePatches];

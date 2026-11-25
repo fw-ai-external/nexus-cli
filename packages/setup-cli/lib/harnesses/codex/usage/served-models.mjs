@@ -26,7 +26,12 @@ export const SESSION_CALLS_BASE_URL = "https://api.fireworks.ai/inference/v1/nex
 export const SESSION_CALLS_TIMEOUT_MS = 1500;
 const PAGE_LIMIT = 500;
 const MAX_PAGES = 4;
-/** Codex logs a call when it completes; the route records it when it starts. */
+/**
+ * Codex logs a call when it completes; the route records it when it starts,
+ * which can be minutes earlier. A lookup therefore starts at each call's
+ * `notBefore` (when the call before it in its own rollout completed), backed
+ * off by this margin for clock skew between the two clocks.
+ */
 const SINCE_MARGIN_MS = 60_000;
 const CACHE_FILE = "codex-served-models.json";
 /** How long a "tracing is off" answer stands before the session is asked again. */
@@ -284,27 +289,27 @@ function backOff(iso) {
 }
 
 /**
- * Where a lookup starts paging: just before the earliest call that still
- * needs a model, so a long session's lookup moves forward as calls resolve
- * instead of re-reading from the session's start. An undated call (old logs)
- * falls back to the session's start.
+ * Where a lookup starts paging: the earliest `notBefore` among the calls
+ * still needing a model (when the call before each, in its own rollout,
+ * completed: it started no earlier). A long session's lookup still moves
+ * forward as calls resolve. A call without one (old logs, or a rollout with
+ * no start time) falls back to the session's start.
  *
- * @param {{ at?: string }[]} missing
+ * @param {{ notBefore?: string }[]} missing
  * @param {string} [startedAt]
  */
 function lookupSince(missing, startedAt) {
-  if (missing.length === 0 || missing.some((call) => !call.at)) return backOff(startedAt);
   // Compare instants, not text: a log timestamp may carry an offset.
-  const times = missing.map((call) => Date.parse(call.at));
-  if (times.some((ms) => !Number.isFinite(ms))) return backOff(startedAt);
-  return backOff(new Date(Math.min(...times)).toISOString()) || backOff(startedAt);
+  const bounds = missing.map((call) => Date.parse(call.notBefore ?? ""));
+  if (missing.length === 0 || bounds.some((ms) => !Number.isFinite(ms))) return backOff(startedAt);
+  return backOff(new Date(Math.min(...bounds)).toISOString()) || backOff(startedAt);
 }
 
 /**
  * Served models for the calls that need one, keyed by the call's `key`.
  *
  * @param {{
- *   sessions: { sessionId: string, startedAt?: string, calls: { key: string, responseId?: string, signature: string }[] }[],
+ *   sessions: { sessionId: string, startedAt?: string, calls: { key: string, responseId?: string, signature: string, at?: string, notBefore?: string }[] }[],
  *   apiKey: string,
  *   home: string,
  *   env?: NodeJS.ProcessEnv,

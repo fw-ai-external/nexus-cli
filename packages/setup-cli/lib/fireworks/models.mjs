@@ -6,7 +6,7 @@ import {
   canonicalAutoModelId,
 } from "./model-id.mjs";
 import { MISSING_FIREWORKS_API_KEY_MESSAGE } from "../keys/key-type.mjs";
-import { planLimitsCatalogToAuto } from "./account-plan.mjs";
+import { fetchNexusPlan, planTierLimitsCatalogToAuto } from "./account-plan.mjs";
 import {
   FIREWORKS_PRICING_DOCS_URL,
   isUltrafastEntry,
@@ -19,6 +19,7 @@ import {
 import {
   cacheServerlessCatalogSnapshot,
   catalogKeyFingerprint,
+  forgetCachedPlanForOtherKey,
   getServerlessCatalogSnapshot,
   isCatalogCacheFresh,
   readCatalogCache,
@@ -704,10 +705,26 @@ function hasUsableCatalogCache(cache) {
 export async function fetchServerlessCatalog(apiKey, { cacheAvailable } = {}) {
   const bounded = cacheAvailable ?? hasUsableCatalogCache(readCatalogCache());
   const signal = bounded ? AbortSignal.timeout(cachedCatalogFetchTimeoutMs()) : undefined;
-  const [models, autoOnly] = await Promise.all([
+  // The plan is only needed for the auto-only catalog and for Ultra-fast
+  // pricing; with both switched off, skip the lookup and leave the cache alone.
+  const planNeeded = process.env.NEXUS_PLAN_CATALOG_FILTER !== "0" || process.env.NEXUS_ULTRAFAST_STANDARD_PRICING !== "0";
+  if (planNeeded) {
+    // Another key than the cache's: its plan no longer applies, even if this
+    // fetch fails.
+    forgetCachedPlanForOtherKey(apiKey);
+  }
+  // The plan this key already has cached, kept if the lookup gets no answer.
+  const previous = readCatalogCache();
+  const previousPlan = previous?.keyFingerprint === catalogKeyFingerprint(apiKey)
+    ? { tier: previous.snapshot?.planTier ?? "", state: previous.snapshot?.planState ?? "" }
+    : { tier: "", state: "" };
+  const [models, plan] = await Promise.all([
     fetchServerlessCatalogRaw(apiKey, { signal }),
-    planLimitsCatalogToAuto(apiKey, { timeoutMs: bounded ? cachedCatalogFetchTimeoutMs() : 0 }),
+    planNeeded
+      ? fetchNexusPlan(apiKey, { timeoutMs: bounded ? cachedCatalogFetchTimeoutMs() : 0 })
+      : Promise.resolve({ catalogTier: "", tier: "", state: "" }),
   ]);
+  const autoOnly = planTierLimitsCatalogToAuto(plan ? plan.catalogTier : null);
   const built = buildServerlessCatalogSnapshot(models);
   if (autoOnly === null) {
     // A failed plan lookup must not cache the full catalog for a plan limited
@@ -719,7 +736,15 @@ export async function fetchServerlessCatalog(apiKey, { cacheAvailable } = {}) {
     setServerlessCatalogSnapshot(built);
     return { catalog: built.entries, rawModels: models, routersUnavailable: false, updatedAt: null };
   }
-  const snapshot = autoOnly ? autoOnlySnapshot(built) : built;
+  // The plan tier rides along: usage pricing reads it (ultrafastPricedAtStandard).
+  const snapshot = {
+    ...(autoOnly ? autoOnlySnapshot(built) : built),
+    // Keep the plan this key had when the lookup was skipped (both switches
+    // off) or got no answer (only reachable with the catalog filter off),
+    // rather than cache none.
+    planTier: (planNeeded ? plan ?? previousPlan : previousPlan).tier,
+    planState: (planNeeded ? plan ?? previousPlan : previousPlan).state,
+  };
   const updatedAt = cacheServerlessCatalogSnapshot(snapshot, { apiKey });
   return {
     catalog: snapshot.entries,

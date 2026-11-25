@@ -52,6 +52,7 @@ import {
 } from "./catalog.mjs";
 import { ensureChatGptStopped, ensureCodexSessionsClosed, isCodexSessionRunning } from "./ide-running.mjs";
 import { refreshCodexStockModels } from "./stock-models.mjs";
+import { codexUltrafastInstall } from "./ultrafast.mjs";
 import { HARNESS } from "../../harness/id.mjs";
 import { harnessStatusKeySource, resolveFireworksKeyWithSource } from "../../keys/api-key.mjs";
 import { existsSync } from "node:fs";
@@ -238,6 +239,7 @@ export default defineHarnessProfile({
       catalogAvailable,
       telemetryHeaders,
       anthropicKey,
+      ultrafast: await codexUltrafastInstall({ home: ctx.home }),
     });
   },
   envHookOn: (ctx) => finishEnvHarnessOn(ctx.home, { harnessId: "codex" }),

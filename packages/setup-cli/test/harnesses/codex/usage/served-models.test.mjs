@@ -224,19 +224,45 @@ describe("codex served-model lookup", () => {
     assert.deepEqual(warnings.filter((w) => /NEXUS_SESSION_CALLS_BASE_URL/.test(w)).length, 1);
   });
 
-  it("pages from just before the earliest unresolved call, not the session start", async () => {
+  it("pages from the earliest unresolved call's notBefore, not the session start", async () => {
     await withHome(async (home) => {
-      const done = { key: "r1", responseId: "r1", signature: usageSignature(1, 0, 1), at: "2026-11-01T10:00:00Z" };
-      const later = { key: "r2", responseId: "r2", signature: usageSignature(2, 0, 1), at: "2026-11-01T12:00:00Z" };
+      const done = { key: "r1", responseId: "r1", signature: usageSignature(1, 0, 1), at: "2026-11-01T10:00:00Z", notBefore: "2026-11-01T09:00:00Z" };
+      const later = { key: "r2", responseId: "r2", signature: usageSignature(2, 0, 1), at: "2026-11-01T12:00:00Z", notBefore: "2026-11-01T10:00:00Z" };
       const sessions = (calls) => [{ sessionId: ROOT, startedAt: "2026-11-01T09:00:00Z", calls }];
       const first = pagedFetch([{ calls: [remote({ responseId: "r1", input: 1, cached: 0, output: 1 })], next_since: null }]);
       await resolveServedModels({ sessions: sessions([done]), apiKey: KEY, home, env: ENABLED_ENV, fetchImpl: first.fetchImpl });
-      assert.equal(first.urls[0].searchParams.get("since"), "2026-11-01T09:59:00.000Z");
+      // r1's notBefore (its rollout's start), less a minute.
+      assert.equal(first.urls[0].searchParams.get("since"), "2026-11-01T08:59:00.000Z");
       const second = pagedFetch([{ calls: [remote({ responseId: "r2", input: 2, cached: 0, output: 1 })], next_since: null }]);
       const resolved = await resolveServedModels({ sessions: sessions([done, later]), apiKey: KEY, home, env: ENABLED_ENV, fetchImpl: second.fetchImpl });
-      // r1 is cached, so the lookup starts a minute before r2.
-      assert.equal(second.urls[0].searchParams.get("since"), "2026-11-01T11:59:00.000Z");
+      // r1 is cached, so the lookup starts a minute before r2's notBefore
+      // (r1's completion): r2 can't have started before that.
+      assert.equal(second.urls[0].searchParams.get("since"), "2026-11-01T09:59:00.000Z");
       assert.equal(resolved.get("r2").model, SERVED);
+    });
+  });
+
+  it("resolves a call that ran for minutes, which the route recorded when it started", async () => {
+    await withHome(async (home) => {
+      const quick = { key: "r1", responseId: "r1", signature: usageSignature(1, 0, 1), at: "2026-11-01T10:00:00Z", notBefore: "2026-11-01T09:59:50Z" };
+      // Started right after r1, completed (and logged) 90 seconds later.
+      const slow = { key: "r2", responseId: "r2", signature: usageSignature(2, 0, 1), at: "2026-11-01T10:01:35Z", notBefore: "2026-11-01T10:00:00Z" };
+      const rows = [
+        { ...remote({ responseId: "r1", input: 1, cached: 0, output: 1 }), started_at: "2026-11-01T09:59:58Z" },
+        { ...remote({ responseId: "r2", input: 2, cached: 0, output: 1, model: "kimi-k3" }), started_at: "2026-11-01T10:00:05Z" },
+      ];
+      // Like the route: only rows that started at or after `since`.
+      const urls = [];
+      const fetchImpl = async (url) => {
+        urls.push(new URL(url));
+        const since = Date.parse(urls.at(-1).searchParams.get("since") ?? "");
+        const calls = rows.filter((row) => !(Date.parse(row.started_at) < since));
+        return { ok: true, status: 200, json: async () => ({ tracing_enabled: true, calls, next_since: null }) };
+      };
+      const sessions = [{ sessionId: ROOT, startedAt: "2026-11-01T09:59:50Z", calls: [quick, slow] }];
+      await resolveServedModels({ sessions: [{ ...sessions[0], calls: [quick] }], apiKey: KEY, home, env: ENABLED_ENV, fetchImpl });
+      const resolved = await resolveServedModels({ sessions, apiKey: KEY, home, env: ENABLED_ENV, fetchImpl });
+      assert.equal(resolved.get("r2").model, "kimi-k3");
     });
   });
 
@@ -504,10 +530,12 @@ describe("codex served-model lookup", () => {
 
   it("compares a log timestamp with an offset as an instant when windowing the lookup", async () => {
     await withHome(async (home) => {
-      // 15:18:10+01:00 is 14:18:10Z: inside a window that starts at 14:17:10Z.
-      const offsetCall = { key: "old#0", responseId: "", signature: usageSignature(3, 0, 1), at: "2026-11-01T15:18:10+01:00" };
+      // A session started at 15:18:10+01:00 (14:18:10Z) pages from 14:17:10Z,
+      // and its call logged at 15:18:20+01:00 (14:18:20Z) falls inside that window.
+      const offsetCall = { key: "old#0", responseId: "", signature: usageSignature(3, 0, 1), at: "2026-11-01T15:18:20+01:00" };
       const { fetchImpl, urls } = pagedFetch([{ calls: [remote({ input: 3, cached: 0, output: 1, traceId: "1" })], next_since: null }]);
-      const resolved = await resolveServedModels({ sessions: [{ sessionId: ROOT, calls: [offsetCall] }], apiKey: KEY, home, env: ENABLED_ENV, fetchImpl });
+      const sessions = [{ sessionId: ROOT, startedAt: "2026-11-01T15:18:10+01:00", calls: [offsetCall] }];
+      const resolved = await resolveServedModels({ sessions, apiKey: KEY, home, env: ENABLED_ENV, fetchImpl });
       assert.equal(urls[0].searchParams.get("since"), "2026-11-01T14:17:10.000Z");
       assert.equal(resolved.get("old#0").model, SERVED);
     });

@@ -257,6 +257,21 @@ nexus codex off
 `on` selects and installs the Fireworks pet unless you've chosen your own `tui.pet`, use an
 inline `tui = { ... }` table, or have a non-empty folder of your own at `pets/fireworks-nexus/`.
 
+**Ultra-fast in the footer (Codex 0.171.0 or newer).** `on` also gives Codex a footer of its
+own, through Codex's experimental custom status line: your model and folder on the left, and
+while an Ultra-fast boost is on, `ϟ Ultra-fast on` with the time left on the right; for ten
+minutes after a boost ends, `ϟ Ultra-fast ended at 10:20 PT` in your time zone. It replaces
+Codex's built-in footer items. During a boost the Fireworks pet becomes a tile that fills when
+Codex starts and drains as the boost runs out (Codex reloads the pet only when it starts, or
+on `/pet`). The boost is checked every two minutes with the key `on` wrote into Codex's
+config, against the Fireworks API only; the footer finds the terminal's width by asking the
+terminal Codex runs in. It's left out if you've set your own `tui.status_line_provider` or
+`features.tui_extensions_statusline`, have an MCP server named `fireworks-nexus`, define
+`tui`, `features` or `mcp_servers` as an inline table, or your config isn't valid TOML.
+`NEXUS_CODEX_ULTRAFAST=0` before `nexus codex on` leaves it out;
+`NEXUS_ULTRAFAST_STATUS=0` skips the boost check; `NEXUS_CODEX_ULTRAFAST_WIDTH=0` stops the
+width check (the badge then follows the folder).
+
 ### Signing in with ChatGPT
 
 Codex keeps its own sign-in. The first `nexus codex` selects `auto` and sets
