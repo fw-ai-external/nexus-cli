@@ -1,6 +1,13 @@
 {
   "releases": [
     {
+      "version": "0.12.2",
+      "highlights": [
+        "Code cleanup and small reliability fixes. After `nexus codex off` and `nexus codex on`, Nexus keeps the Fireworks pet for your next Codex session if the saved pet status is still current."
+      ],
+      "improvements": []
+    },
+    {
       "version": "0.12.1",
       "highlights": [
         "Key rotation: `nexus login --force` also updates harness configs Nexus knows about at custom paths such as `--config-path`. If Nexus can't confirm a copy moved to the new key, it keeps the old key and shows how to reconnect it.",

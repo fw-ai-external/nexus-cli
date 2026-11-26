@@ -22,7 +22,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { fetchBoostStatus, mockOrigin, REQUEST_TIMEOUT_MS } from "../ultrafast-fireworks/hooks/rewards.mjs";
-import { boostFromJson, footerTree, isRunning, NO_BOOST, petManifest } from "./ultrafast.mjs";
+import { boostFromJson, footerTree, isRunning, isStatusCacheFile, NO_BOOST, petManifest } from "./ultrafast.mjs";
 
 export const URI = "ui://fireworks-nexus/ultrafast";
 export const TOOL = "ultrafast_status";
@@ -111,7 +111,11 @@ export function createStatusServer(deps) {
   const widthOn = env.NEXUS_CODEX_ULTRAFAST_WIDTH !== "0" && !test;
   const configFile = env.NEXUS_CODEX_CONFIG ?? "";
   const petDir = test ? "" : env.NEXUS_CODEX_PET_DIR ?? "";
-  const cacheFile = petDir ? path.join(petDir, STATUS_CACHE_FILE) : "";
+  // `on` names a cache in Nexus's data folder; a config from an older `on`
+  // has none (and any other value is ignored), so the cache stays in the pet
+  // folder as it used to.
+  const namedCache = isStatusCacheFile(env.NEXUS_CODEX_STATUS_CACHE) ? env.NEXUS_CODEX_STATUS_CACHE : "";
+  const cacheFile = test ? "" : namedCache || (petDir ? path.join(petDir, STATUS_CACHE_FILE) : "");
   const mockUrl = mockOrigin(env.NEXUS_ULTRAFAST_MOCK_URL) ? env.NEXUS_ULTRAFAST_MOCK_URL : undefined;
 
   const state = {

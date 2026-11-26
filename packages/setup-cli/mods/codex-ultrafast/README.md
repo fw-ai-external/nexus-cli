@@ -29,8 +29,11 @@ the boost runs out. Without a boost the pet is the usual dotted Fireworks logo.
   `[model_providers.fireworks-ai]`), through the same check the Claude Code
   mod uses (`../ultrafast-fireworks/hooks/rewards.mjs`). Requests go only to
   the Fireworks API, with a deadline; no answer keeps what was last shown.
-  The last status is cached in the pet folder for a day, so a new session
-  shows a running boost right away.
+  The last status is cached for a day in Nexus's data folder
+  (`~/.nexus/codex/ultrafast-status.<config>.json`, named by `on` in
+  `NEXUS_CODEX_STATUS_CACHE`), so a new session shows a running boost right
+  away. It's kept out of the pet folder because `off` deletes that folder,
+  and an `off` then `on` mid-boost must still find it.
 - **Pet.** The tile frames live in Nexus's pet sheet, beside the logo
   (`scripts/render-codex-ultrafast-pet.mjs` paints them). Codex reads
   `pet.json` only when the pet loads (launch or `/pet`), and restarts the
@@ -38,7 +41,9 @@ the boost runs out. Without a boost the pet is the usual dotted Fireworks logo.
   launch.
   `nexus codex on` reinstalls the plain `pet.json`, so during a boost it
   writes the boost pet right away from this cache (same key only), and the
-  next Codex shows the tile.
+  next Codex shows the tile. Without a cache (a first boost), the first Codex
+  shows the logo until the next launch or `/pet`: the server's first check
+  lands after Codex has read the pet.
 - **Account switches.** `nexus login` writes a new key into Codex's config and
   checks the new account's boost at once (3 s cap), caching it and setting the
   pet, so the next Codex is right even if it was closed. A running server

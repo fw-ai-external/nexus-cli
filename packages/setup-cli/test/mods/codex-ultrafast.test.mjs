@@ -246,13 +246,15 @@ describe("Codex Ultra-fast key", () => {
 
 // --- the server, in-process ------------------------------------------------------------------
 
+const CACHE_FILE = "/h/.nexus/codex/ultrafast-status.0123456789abcdef.json";
+
 function harness({ env = {}, files = {}, statusBody = null, statusCode = 404, now = NOW, columns = 0 } = {}) {
   const sent = [];
   const written = {};
   const requests = [];
   let clock = now;
   const deps = {
-    env: { NEXUS_CODEX_CONFIG: "/h/.codex/config.toml", NEXUS_CODEX_PET_DIR: "/h/.codex/pets/fireworks-nexus", ...env },
+    env: { NEXUS_CODEX_CONFIG: "/h/.codex/config.toml", NEXUS_CODEX_PET_DIR: "/h/.codex/pets/fireworks-nexus", NEXUS_CODEX_STATUS_CACHE: CACHE_FILE, ...env },
     now: () => clock,
     fetch: async (url, init) => {
       requests.push({ url, auth: init.headers.Authorization });
@@ -304,7 +306,7 @@ describe("Codex Ultra-fast server", () => {
     assert.match(footer, /4h 00m left/);
     const pet = JSON.parse(h.written["/h/.codex/pets/fireworks-nexus/pet.json"]);
     assert.deepEqual(pet.animations.level.frames, levelFrames(fillLevel(0.8)));
-    const cache = JSON.parse(h.written[`/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`]);
+    const cache = JSON.parse(h.written[CACHE_FILE]);
     assert.equal(cache.status.active, true);
     assert.ok(!JSON.stringify(h.written).includes("fw_test_key"), "the key is never written anywhere");
   });
@@ -334,7 +336,7 @@ describe("Codex Ultra-fast server", () => {
   });
 
   it("starts from a fresh cache, and ignores a stale or corrupt one", async () => {
-    const cacheFile = `/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`;
+    const cacheFile = CACHE_FILE;
     const fresh = { keyTag: keyTag("fw_test_key"), status: boostWithShare(0.5), fetchedAt: NOW - 60_000, endedAt: null };
     const a = harness({ files: { [cacheFile]: JSON.stringify(fresh), "/h/.codex/config.toml": CONFIG } });
     await a.server.loadCache();
@@ -346,8 +348,28 @@ describe("Codex Ultra-fast server", () => {
     }
   });
 
+  it("a config from an older on (no cache path) keeps the cache in the pet folder", async () => {
+    const legacy = `/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`;
+    const fresh = { keyTag: keyTag("fw_test_key"), status: boostWithShare(0.5), fetchedAt: NOW - 60_000, endedAt: null };
+    const h = harness({ env: { NEXUS_CODEX_STATUS_CACHE: "" }, files: { [legacy]: JSON.stringify(fresh), "/h/.codex/config.toml": CONFIG }, statusBody: runningStatus(NOW + HOUR) });
+    await h.server.loadCache();
+    assert.match(h.read(), /Ultra-fast on/);
+    await h.server.check();
+    assert.ok(h.written[legacy], "saved where it was read");
+    assert.equal(h.written[CACHE_FILE], undefined);
+  });
+
+  it("writes only to a cache path named the way on names it", async () => {
+    for (const bad of ["/etc/passwd", "relative/ultrafast-status.0123456789abcdef.json", "/h/.nexus/codex/ultrafast-status.json"]) {
+      const h = harness({ env: { NEXUS_CODEX_STATUS_CACHE: bad }, files: { "/h/.codex/config.toml": CONFIG }, statusBody: runningStatus(NOW + HOUR) });
+      await h.server.check();
+      assert.equal(h.written[bad], undefined, bad);
+      assert.ok(h.written[`/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`], "falls back to the pet folder");
+    }
+  });
+
   it("a cached boost from another key (another account) is ignored: no badge, no ended note", async () => {
-    const cacheFile = `/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`;
+    const cacheFile = CACHE_FILE;
     const other = JSON.stringify({ keyTag: keyTag("fw_other_account_key"), status: boostWithShare(0.5), fetchedAt: NOW - 60_000, endedAt: null });
     const h = harness({ files: { [cacheFile]: other, "/h/.codex/config.toml": CONFIG }, statusCode: 404, columns: 90 });
     await h.server.loadCache();
@@ -409,7 +431,7 @@ describe("Codex Ultra-fast server", () => {
   });
 
   it("NEXUS_ULTRAFAST_STATUS=0 ignores a cached boost: no badge, plain pet", async () => {
-    const cacheFile = `/h/.codex/pets/fireworks-nexus/${STATUS_CACHE_FILE}`;
+    const cacheFile = CACHE_FILE;
     const cached = JSON.stringify({ keyTag: keyTag("fw_test_key"), status: boostWithShare(0.5), fetchedAt: NOW - 60_000, endedAt: null });
     const h = harness({ env: { NEXUS_ULTRAFAST_STATUS: "0" }, files: { [cacheFile]: cached, "/h/.codex/config.toml": CONFIG } });
     await h.server.start();

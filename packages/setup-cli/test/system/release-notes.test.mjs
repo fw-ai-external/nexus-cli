@@ -114,11 +114,28 @@ describe("release notes", () => {
     assert.doesNotMatch(formatted, /\u2014/);
   });
 
+  it("formats the v0.12.2 user-facing summary", async () => {
+    const releases = await readReleaseNotes();
+    const release = releases.find((candidate) => candidate.version === "0.12.2");
+    assert.ok(release);
+    assert.equal(releases[0].version, "0.12.2");
+
+    const formatted = formatReleaseNotes(release);
+    assert.match(formatted, /What's new in Nexus CLI v0\.12\.2/);
+    assert.equal(release.highlights.length, 1);
+    assert.equal(release.improvements.length, 0);
+    assert.match(formatted, /Code cleanup and small reliability fixes/);
+    assert.deepEqual(releaseNotesForRange(releases, "0.12.1", "0.12.2").map((entry) => entry.version), ["0.12.2"]);
+    // Keep the notes simple: no placeholder harness commands or internals.
+    assert.doesNotMatch(formatted, /<harness>/);
+    assert.doesNotMatch(formatted, /\u2014/);
+    assert.doesNotMatch(formatted, /shim|https?:\/\/|\$\.http/i);
+  });
+
   it("formats the v0.12.1 user-facing summary", async () => {
     const releases = await readReleaseNotes();
     const release = releases.find((candidate) => candidate.version === "0.12.1");
     assert.ok(release);
-    assert.equal(releases[0].version, "0.12.1");
 
     const formatted = formatReleaseNotes(release);
     assert.match(formatted, /What's new in Nexus CLI v0\.12\.1/);

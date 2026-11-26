@@ -57,7 +57,8 @@ import {
 } from "../../firerouter/core.mjs";
 import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
 import { canInstallCodexPet, codexPetDir, installCodexPet, removeCodexPet, selectsCodexPet } from "./pet-patch.mjs";
-import { applyCachedBoostToPet } from "./ultrafast.mjs";
+import { applyCachedBoostToPet, codexUltrafastCacheWarning } from "./ultrafast.mjs";
+import { hasCodexUltrafast } from "./ultrafast-patch.mjs";
 export { printCodexRestartHint } from "../../cli/messages.mjs";
 
 export const CODEX_CONFIG_RELATIVE_PATH = ".codex/config.toml";
@@ -100,9 +101,24 @@ export function codexCatalogPath(home, catalogPath = "") {
   return catalogPath || path.join(home, CODEX_CATALOG_RELATIVE_PATH);
 }
 
+/** A short tag for one Codex config, so files for several `CODEX_HOME`s don't collide. */
+function configTag(configPath) {
+  return createHash("sha256").update(path.resolve(configPath)).digest("hex").slice(0, 16);
+}
+
 export function codexBackupPath(dataDir, configPath) {
-  const key = createHash("sha256").update(path.resolve(configPath)).digest("hex").slice(0, 16);
-  return path.join(dataDir, `config-backup.${key}.json`);
+  return path.join(dataDir, `config-backup.${configTag(configPath)}.json`);
+}
+
+/**
+ * Where the Ultra-fast status server caches the last boost status for the
+ * Codex config at `configPath`. In Nexus's own data folder, not the pet
+ * folder: `off` deletes the pet folder, and the cache must survive an
+ * `off` then `on` so `on` can put the boost pet in place before Codex starts.
+ */
+export function codexUltrafastCachePath(dataDir, configPath) {
+  // Absolute: Codex starts the server in its own working folder.
+  return path.resolve(dataDir, `ultrafast-status.${configTag(configPath)}.json`);
 }
 
 function emptyTomlDoc() {
@@ -606,7 +622,7 @@ export async function enableCodexFireworks({
   // The Ultra-fast footer (ultrafast-patch.mjs); the server picks the pet's
   // animations only when the pet is Nexus's.
   routing.ultrafast = ultrafast
-    ? { ...ultrafast, configPath, petDir: routing.pet ? codexPetDir(configPath) : "" }
+    ? { ...ultrafast, configPath, petDir: routing.pet ? codexPetDir(configPath) : "", cacheFile: codexUltrafastCachePath(dataDir, configPath) }
     : null;
   // Refuse before the backup or catalog is touched, so a refused `on` leaves
   // nothing behind for `off` to restore.
@@ -710,14 +726,23 @@ export async function enableCodexFireworks({
   if (nextRaw !== original.raw) {
     await writeCodexConfig(configPath, nextRaw, { mode: 0o600 });
   }
+  const ultrafastWritten = Boolean(routing.ultrafast) && hasCodexUltrafast(nextRaw);
   // The Fireworks terminal pet, after the config write so its folder only
   // exists while Nexus routes Codex; only when the config selects it (not when
   // the user chose their own pet).
   if (selectsCodexPet(nextRaw)) {
     await installCodexPet(configPath);
     // During a boost, the next Codex shows the boost pet, not the plain one
-    // just reinstalled (Codex reads the pet only when it starts).
-    if (routing.ultrafast) await applyCachedBoostToPet(codexPetDir(configPath), resolvedEffective);
+    // just reinstalled (Codex reads the pet only when it starts). Only with
+    // Nexus's footer in the config: its server is what clears the tile when the
+    // boost ends, and a config that kept the user's own footer has none.
+    if (ultrafastWritten) await applyCachedBoostToPet(codexPetDir(configPath), resolvedEffective, { cacheFile: routing.ultrafast.cacheFile });
+  }
+  // The server writes its cache with an all-at-once rename, which needs the
+  // folder to exist. Best effort: without it the footer still works, uncached.
+  if (ultrafastWritten) {
+    await mkdir(path.dirname(routing.ultrafast.cacheFile), { recursive: true, mode: 0o700 })
+      .catch((error) => console.log(codexUltrafastCacheWarning(routing.ultrafast.cacheFile, error)));
   }
 
   return {
