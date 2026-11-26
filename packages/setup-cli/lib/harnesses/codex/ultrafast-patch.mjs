@@ -111,12 +111,17 @@ export function canPatchCodexUltrafast(raw) {
 /**
  * The MCP server table: Codex starts `nodePath serverPath` with only the
  * environment it passes every MCP server (HOME, PATH, TZ, ...), plus `env`
- * (where to find the config and the pet folder) and `env_vars` (the switches).
+ * (where to find the config, the pet folder and the status cache) and
+ * `env_vars` (the switches).
  * The Fireworks key is not in it: the server reads the key `on` wrote into the
  * Codex config, as `codex` itself does.
  */
-function mcpTable({ nodePath, serverPath, configPath, petDir }) {
-  const env = [`NEXUS_CODEX_CONFIG = ${tomlString(configPath)}`, ...(petDir ? [`NEXUS_CODEX_PET_DIR = ${tomlString(petDir)}`] : [])];
+function mcpTable({ nodePath, serverPath, configPath, petDir, cacheFile }) {
+  const env = [
+    `NEXUS_CODEX_CONFIG = ${tomlString(configPath)}`,
+    ...(petDir ? [`NEXUS_CODEX_PET_DIR = ${tomlString(petDir)}`] : []),
+    ...(cacheFile ? [`NEXUS_CODEX_STATUS_CACHE = ${tomlString(cacheFile)}`] : []),
+  ];
   return [
     MCP_HEADER,
     `command = ${tomlString(nodePath)}`,
@@ -130,9 +135,11 @@ function mcpTable({ nodePath, serverPath, configPath, petDir }) {
  * Add the Ultra-fast footer to `raw`, or return `raw` unchanged when the user's
  * config rules it out (see {@link canPatchCodexUltrafast}).
  * @param {string} raw
- * @param {{ nodePath: string, serverPath: string, configPath: string, petDir?: string }} options
+ * @param {{ nodePath: string, serverPath: string, configPath: string, petDir?: string, cacheFile?: string }} options
  *   `petDir` is the Nexus pet folder when the config selects Nexus's pet, so the
  *   server can pick its animations; without it only the footer changes.
+ *   `cacheFile` is where the server keeps the last boost status (Nexus's data
+ *   folder, so it outlives the pet folder across `off` and `on`).
  */
 export function patchCodexUltrafastRaw(raw, options) {
   if (!canPatchCodexUltrafast(raw)) return raw;
@@ -156,6 +163,17 @@ export function hasCodexUltrafast(raw) {
 }
 
 /** The server script path in the config's Nexus MCP table, or "". */
+/**
+ * The status cache path the config's MCP table gives the server
+ * (`NEXUS_CODEX_STATUS_CACHE`), or "" for a footer an older `on` wrote.
+ * @param {string} raw
+ */
+export function configuredCodexUltrafastCacheFile(raw) {
+  if (!hasCodexUltrafast(raw)) return "";
+  const value = parsed(raw)?.tables[MCP_TABLE]?.env?.NEXUS_CODEX_STATUS_CACHE;
+  return typeof value === "string" ? value : "";
+}
+
 export function configuredCodexUltrafastServer(raw) {
   if (!hasCodexUltrafast(raw)) return "";
   const args = parsed(raw)?.tables[MCP_TABLE]?.args;

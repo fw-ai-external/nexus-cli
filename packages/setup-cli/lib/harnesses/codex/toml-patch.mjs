@@ -259,7 +259,7 @@ export function stripFireconnectRoutingRaw(raw, { stripRootRouting = false } = {
  *   envHttpHeaders?: Record<string, string>,
  *   chatgptLogin?: boolean,
  *   pet?: boolean,
- *   ultrafast?: { nodePath: string, serverPath: string, configPath: string, petDir?: string } | null,
+ *   ultrafast?: { nodePath: string, serverPath: string, configPath: string, petDir?: string, cacheFile?: string } | null,
  * }} routing `pet` selects the Fireworks terminal pet (pet-patch.mjs)
  *   unless the user already chose one. `ultrafast` adds the Ultra-fast footer
  *   (ultrafast-patch.mjs) unless the user's config rules it out.

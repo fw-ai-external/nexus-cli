@@ -22,7 +22,7 @@ import {
   readCodexTomlIfExists,
 } from "./core.mjs";
 import { codexUltrafastInstall } from "./ultrafast.mjs";
-import { canPatchCodexUltrafast, configuredCodexUltrafastServer, stripCodexUltrafastRaw } from "./ultrafast-patch.mjs";
+import { canPatchCodexUltrafast, configuredCodexUltrafastCacheFile, configuredCodexUltrafastServer, stripCodexUltrafastRaw } from "./ultrafast-patch.mjs";
 
 export const CODEX_SIGN_IN_UPGRADE_NOTE =
   "Switched Codex to its own sign-in: config.toml now sets requires_openai_auth = true and sends "
@@ -161,8 +161,10 @@ async function codexReonReason(home) {
 /**
  * The Ultra-fast footer after an upgrade: re-point it when the server script
  * moved (a reinstall changes the package folder, and Codex would report the
- * status line unavailable), or add it for a Codex that supports it and whose
- * config allows it. "" otherwise, so `on` isn't re-run for nothing.
+ * status line unavailable) or when an older `on` wrote it without a status
+ * cache path (its cache sits in the pet folder, which `off` deletes), or add
+ * it for a Codex that supports it and whose config allows it. "" otherwise,
+ * so `on` isn't re-run for nothing.
  * @param {string} raw the config text
  * @param {string} home
  */
@@ -170,7 +172,8 @@ export async function codexUltrafastReonReason(raw, home) {
   const install = await codexUltrafastInstall({ home });
   const configured = configuredCodexUltrafastServer(raw);
   if (configured) {
-    return install && configured !== install.serverPath ? CODEX_ULTRAFAST_MOVED_NOTE : "";
+    const current = configured === install?.serverPath && Boolean(configuredCodexUltrafastCacheFile(raw));
+    return install && !current ? CODEX_ULTRAFAST_MOVED_NOTE : "";
   }
   return install && canPatchCodexUltrafast(stripCodexUltrafastRaw(raw)) ? CODEX_ULTRAFAST_NOTE : "";
 }

@@ -7,6 +7,7 @@
  * Environment (set by `on` in the MCP table, or passed through by Codex):
  *   NEXUS_CODEX_CONFIG       Codex's config.toml, where `on` wrote the Fireworks key
  *   NEXUS_CODEX_PET_DIR      the Nexus pet folder (absent when the user chose their own pet)
+ *   NEXUS_CODEX_STATUS_CACHE the last boost status, in Nexus's data folder (kept across `off` and `on`)
  *   NEXUS_ULTRAFAST_STATUS=0 no boost check (the footer shows model and folder only)
  *   NEXUS_ULTRAFAST_MOCK_URL a loopback stand-in for the status API (development)
  *   NEXUS_CODEX_ULTRAFAST_WIDTH=0  no terminal width probe (the badge follows the text)

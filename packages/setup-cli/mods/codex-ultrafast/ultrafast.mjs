@@ -8,11 +8,24 @@
  * and either time possibly null.
  */
 
+import path from "node:path";
+
 export const COLOR = Object.freeze({ amber: "#ffba50", text: "#ffffff", fg: "#e4e4eb", dim: "#8e8e9f", red: "#ff5f5f" });
 
 // --- boost --------------------------------------------------------------------------------
 
 /** No boost: plain footer, plain pet, no "ended" note. */
+/**
+ * Whether `file` is a status cache path `nexus codex on` names
+ * (lib/harnesses/codex/core.mjs codexUltrafastCachePath): absolute, and named
+ * `ultrafast-status.<16 hex>.json`. The server writes nothing else from its
+ * environment, so a stray value can't point its writes at another file.
+ * @param {unknown} file
+ */
+export function isStatusCacheFile(file) {
+  return typeof file === "string" && path.isAbsolute(file) && /^ultrafast-status\.[0-9a-f]{16}\.json$/.test(path.basename(file));
+}
+
 export const NO_BOOST = Object.freeze({ active: false, activationId: "", activatedAt: null, expiresAt: null, reason: "" });
 
 const finiteOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
