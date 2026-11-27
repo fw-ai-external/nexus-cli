@@ -40,6 +40,7 @@ import {
   agentPaneWorthShowing,
   renderAgentPane,
   renderBadges,
+  renderCreditNotice,
   renderFooter,
   renderTurnRow,
   rule,
@@ -74,12 +75,8 @@ const DEFAULT_KEY_HINT = "← agents · q quit";
 
 class Dashboard {
   constructor(filePath, index, {
-    fullscreen = true,
-    stream = process.stdout,
-    agentLabel = "",
-    keyHint = DEFAULT_KEY_HINT,
-    sessionLabel = "",
-    harnessName = "",
+    fullscreen = true, stream = process.stdout, agentLabel = "", keyHint = DEFAULT_KEY_HINT,
+    sessionLabel = "", harnessName = "", creditIndicator = null,
   } = {}) {
     this.path = filePath;
     this.index = index;
@@ -96,6 +93,7 @@ class Dashboard {
     this.session = sessionLabel || (filePath ? path.basename(filePath, ".jsonl").slice(0, 8) : "········");
     this.agentLabel = agentLabel;
     this.keyHint = keyHint;
+    this.creditIndicator = creditIndicator;
     this.locked = false;
     this.armed = filePath == null;
     this.tick = 0;
@@ -292,6 +290,7 @@ class Dashboard {
       agentLabel: this.agentLabel,
       colorOf: this.colorOf,
       width,
+      creditIndicator: this.creditIndicator,
     });
   }
 
@@ -371,12 +370,11 @@ class Dashboard {
     write(`${ACCENT}${V}${R}${B}${t}${R}${" ".repeat(Math.max(0, w - vislen(t)))}${ACCENT}${V}${R}`);
     write(`${ACCENT}${BL}${H.repeat(w)}${BR}${R}`);
     write(`${D}${clip(Dashboard.HDR, Dashboard.plainWidth(this.stream))}${R}`);
+    for (const ln of renderCreditNotice(this.creditIndicator, Dashboard.plainWidth(this.stream))) write(ln);
   }
 }
 
 Dashboard.TITLE = "  ✦  Claude Code · Live Cost Meter  ";
-
-
 
 /**
  * Read whole lines appended since `pos`.
@@ -487,6 +485,7 @@ export async function runUsageMeter({
   refreshServed,
   servedMs = 10_000,
   harnessName = "",
+  creditIndicator = null, readCreditIndicator, creditTimeoutMs = 5_000,
 } = {}) {
   if (!filePath) {
     throw new Error("filePath is required");
@@ -499,11 +498,7 @@ export async function runUsageMeter({
   const usePlain = plain || !colorOn;
 
   const db = new Dashboard(filePath, new ModelIndex(), {
-    fullscreen: !usePlain,
-    stream,
-    agentLabel,
-    sessionLabel,
-    harnessName,
+    fullscreen: !usePlain, stream, agentLabel, sessionLabel, harnessName, creditIndicator,
     ...(keyHint ? { keyHint } : {}),
   });
   const reader = createRecordReader(translate && (() => translate(filePath)), { onFailure: (error) => { db.failure = error; } });
@@ -534,6 +529,13 @@ export async function runUsageMeter({
   }
 
   let restored = false;
+  let lastPlainCredit = creditIndicator ? `${creditIndicator.standing}:${creditIndicator.limit}` : "";
+  const flushPlainCredit = (credit) => {
+    const key = credit ? `${credit.standing}:${credit.limit}` : "";
+    if (!usePlain || key === lastPlainCredit) return;
+    lastPlainCredit = key;
+    for (const ln of renderCreditNotice(credit, Dashboard.plainWidth(stream))) stream.write(`${ln}\n`);
+  };
   const restore = () => {
     if (restored || usePlain) return;
     restored = true;
@@ -545,6 +547,7 @@ export async function runUsageMeter({
   // the status depend on which arrived first.
   const onSigInt = () => {
     restore();
+    if (db.creditIndicator) flushPlainCredit(db.creditIndicator);
     stream.write("\n");
     process.exit(130);
   };
@@ -552,56 +555,56 @@ export async function runUsageMeter({
 
   // Sibling spend costs one read per subagent log, so refresh it on its own
   // slow cadence instead of every poll, and never let it block the tail loop.
-  let peersAt = 0;
-  let peersBusy = false;
-  let peersAgain = false; // a forced refresh asked for mid-flight runs right after it
+  let peersAt = 0, peersBusy = false, peersAgain = false;
   const wantAgents = Boolean(agentPane && !usePlain && typeof readAgents === "function");
+  const wantCredit = typeof readCreditIndicator === "function";
+  const safeRead = (fn, onErr) => (typeof fn === "function" ? Promise.resolve().then(fn).catch(() => onErr) : Promise.resolve(onErr));
   // Both the footer split and the agents pane come from the same listing, so
-  // they share one cadence and one in-flight guard rather than each re-reading
-  // every subagent log on its own timer.
+  // they share one cadence and one in-flight guard.
   const refreshPeers = ({ force = false } = {}) => {
-    if (peersBusy) {
-      if (force) peersAgain = true;
-      return;
-    }
+    if (peersBusy) { if (force) peersAgain = true; return; }
     if (force) peersAt = 0;
     if (typeof readPeers !== "function" && !wantAgents) return;
     const now = Date.now();
     if (peersAt && now - peersAt < peersMs) return;
     peersBusy = true;
     peersAt = now;
-    Promise.all([
-      typeof readPeers === "function"
-        ? Promise.resolve().then(() => readPeers()).catch(() => undefined)
-        : Promise.resolve(undefined),
-      wantAgents
-        ? Promise.resolve().then(() => readAgents()).catch(() => undefined)
-        : Promise.resolve(undefined),
-    ])
+    Promise.all([safeRead(readPeers, undefined), wantAgents ? safeRead(readAgents, undefined) : undefined])
       .then(([peers, agents]) => {
-        // undefined means that read failed — keep the previous figure rather
-        // than blanking a pane because one poll hit a half-written log.
         if (peers !== undefined) db.peers = peers;
         if (Array.isArray(agents)) syncAgentPane(agentPane, agents);
       })
       .catch(() => { /* keep the previous figures */ })
       .finally(() => {
         peersBusy = false;
-        if (peersAgain) {
-          peersAgain = false;
-          refreshPeers({ force: true });
-        }
+        if (peersAgain) { peersAgain = false; refreshPeers({ force: true }); }
       });
+  };
+  // Credit standing polls on its own detached, timeout-bounded promise so a
+  // stalled settings/keychain/network read never blocks first frame or peers.
+  let creditAt = 0, creditBusy = false, creditSeq = 0, creditTimer = null, closed = false, drawn = false;
+  const refreshCredit = () => {
+    if (!wantCredit || creditBusy || closed) return;
+    const now = Date.now();
+    if (creditAt && now - creditAt < peersMs) return;
+    creditBusy = true;
+    creditAt = now;
+    const seq = ++creditSeq;
+    const timeout = new Promise((r) => { creditTimer = setTimeout(() => r(undefined), creditTimeoutMs); creditTimer.unref?.(); });
+    Promise.race([safeRead(readCreditIndicator, undefined), timeout])
+      .then((credit) => {
+        if (closed || seq !== creditSeq || credit === undefined) return;
+        db.creditIndicator = credit;
+        flushPlainCredit(credit);
+        if (!usePlain && drawn) db.draw();
+      })
+      .finally(() => { clearTimeout(creditTimer); creditTimer = null; if (seq === creditSeq) creditBusy = false; });
   };
 
   // Served models come from the network on their own slow cadence, never awaited
   // here; something new replays the log so those calls price as what ran.
   let replayWanted = false;
-  const refreshServedModels = createBackgroundRefresh({
-    run: refreshServed,
-    everyMs: servedMs,
-    onChange: () => { replayWanted = true; },
-  });
+  const refreshServedModels = createBackgroundRefresh({ run: refreshServed, everyMs: servedMs, onChange: () => { replayWanted = true; } });
 
   let fd;
   try {
@@ -613,14 +616,7 @@ export async function runUsageMeter({
     // agents pane rather than popping them in a beat later.
     if (typeof readPeers === "function" || wantAgents) {
       peersAt = Date.now();
-      const [peers, agents] = await Promise.all([
-        typeof readPeers === "function"
-          ? Promise.resolve().then(() => readPeers()).catch(() => null)
-          : Promise.resolve(null),
-        wantAgents
-          ? Promise.resolve().then(() => readAgents()).catch(() => null)
-          : Promise.resolve(null),
-      ]);
+      const [peers, agents] = await Promise.all([safeRead(readPeers, null), wantAgents ? safeRead(readAgents, null) : null]);
       db.peers = peers;
       if (Array.isArray(agents)) syncAgentPane(agentPane, agents);
     }
@@ -628,6 +624,7 @@ export async function runUsageMeter({
     for (;;) {
       if (signal?.aborted) break;
       refreshPeers();
+      refreshCredit();
       refreshServedModels();
       if (replayWanted) {
         replayWanted = false;
@@ -661,26 +658,22 @@ export async function runUsageMeter({
             shown += 1;
           }
         }
-      } else if (lines.length) {
-        db.draw();
-      }
+      } else if (lines.length) { db.draw(); drawn = true; }
       if (!follow) break;
       db.tick += 1;
-      if (!usePlain) db.draw();
+      if (!usePlain) { db.draw(); drawn = true; }
       await sleep(pollMs);
     }
   } finally {
-    if (fd) {
-      await fd.close().catch(() => {});
-    }
+    closed = true;
+    clearTimeout(creditTimer);
+    if (fd) await fd.close().catch(() => {});
     process.off("SIGINT", onSigInt);
     restore();
     if (reader.failure) process.stderr.write(`warning: couldn't read this session's log: ${sanitize(reader.failure.message)}\n`);
     if (usePlain) {
       stream.write("\n");
-      for (const ln of db.footer(Dashboard.plainWidth(stream))) {
-        stream.write(`${ln}\n`);
-      }
+      for (const ln of db.footer(Dashboard.plainWidth(stream))) stream.write(`${ln}\n`);
     }
   }
   return db;

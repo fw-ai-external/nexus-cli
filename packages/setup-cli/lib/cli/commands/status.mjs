@@ -25,6 +25,13 @@ import {
 } from "../../fireworks/residency.mjs";
 import { readGlobalConfig } from "../../config/global-config.mjs";
 import {
+  NEXUS_BILLING_URL,
+  creditStandingJsonPayload,
+  formatCreditStandingLastAttempt,
+  loadCreditStanding,
+  readCreditStandingLastAttempt,
+} from "../../fireworks/credit-standing.mjs";
+import {
   apiKeyFingerprint,
   formatExpiry,
   keyExpiresSoon,
@@ -120,7 +127,19 @@ export async function runStatusCommand(ctx) {
   // must use. Read only for a verified key; a failed read keeps the cached one,
   // and with none it stays unknown (null): nothing is compared or advised.
   // The key was verified above, so its account ID skips a second check.
-  const residency = auth.signedIn ? await refreshAccountResidency(active, { accountId: auth.accountId }) : null;
+  const [residency, creditIndicator] = auth.signedIn
+    ? await Promise.all([
+      refreshAccountResidency(active, { accountId: auth.accountId }),
+      loadCreditStanding({ home, apiKey: active }),
+    ])
+    : [null, null];
+  const creditStanding = creditStandingJsonPayload(creditIndicator);
+  const creditLastAttempt = ctx.verbose
+    && auth.signedIn !== false
+    && active
+    && process.env.NEXUS_CREDIT_STATUS !== "0"
+    ? readCreditStandingLastAttempt(home, { keyFingerprint: apiKeyFingerprint(active) })
+    : null;
   const unsupportedResidency = residency === null ? accountUnsupportedResidency() : "";
   const harnessResidency = (await readGlobalConfig(home)).harnesses;
   for (const h of summary.perHarness) {
@@ -142,12 +161,34 @@ export async function runStatusCommand(ctx) {
         ? null
         : { value: residency, inferenceHost: residencyInferenceHost(residency) || "api.fireworks.ai" },
       ...(unsupportedResidency ? { unsupportedResidency } : {}),
+      ...(creditStanding ? { creditStanding } : {}),
+      ...(ctx.verbose && creditLastAttempt ? { creditStandingDiagnostic: creditLastAttempt } : {}),
       ...summary,
     }, null, 2));
   } else {
     printAuthLine(auth, keyExpiresAt);
     printActiveKeyLine(source, summary);
     printKeyExpiry(keyExpiresAt, auth);
+    if (creditIndicator) {
+      if (creditIndicator.standing === "depleted") {
+        printField("Plan credits", "credits used up");
+        console.log(warn(`Nexus plan limit reached — credits used up. Add credits at ${accent(NEXUS_BILLING_URL)}`));
+      } else {
+        const limitLabel = creditIndicator.limit === "monthly" ? "monthly" : "5-hour";
+        printField("Plan credits", `using credits (${limitLabel} plan limit reached)`);
+      }
+      if (ctx.verbose && creditLastAttempt?.outcome === "error") {
+        const formatted = formatCreditStandingLastAttempt(creditLastAttempt).replace(/^unknown \((.*)\)$/, "$1");
+        if (formatted) {
+          console.log(muted(`Last credit refresh failed (${formatted}).`));
+        }
+      }
+    } else if (ctx.verbose && creditLastAttempt) {
+      const diagnosticLine = formatCreditStandingLastAttempt(creditLastAttempt);
+      if (diagnosticLine) {
+        printField("Plan credits", diagnosticLine);
+      }
+    }
     if (residency) {
       printField("Data residency", `${residency} (inference on ${residencyInferenceHost(residency)})`);
     } else if (unsupportedResidency) {

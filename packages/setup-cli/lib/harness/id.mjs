@@ -82,7 +82,7 @@ export const FILE_CONFIG_HARNESS_SET = new Set(FILE_CONFIG_HARNESS_IDS);
  * itself. Lives beside the ids so parse-time checks stay free of adapter
  * imports; a test asserts parity with each profile's `azure`.
  */
-export const AZURE_ON_HARNESS_IDS = Object.freeze([
+const AZURE_ON_HARNESS_IDS = Object.freeze([
   HARNESS.CURSOR,
   HARNESS.OPENCODE,
   HARNESS.PI,

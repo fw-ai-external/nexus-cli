@@ -13,7 +13,7 @@ export const UNPRICED_TEXT = "n/a";
  * @param {number | null} b
  * @returns {number | null}
  */
-export function addCost(a, b) {
+function addCost(a, b) {
   return a == null || b == null ? null : a + b;
 }
 

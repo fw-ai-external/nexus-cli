@@ -1,7 +1,7 @@
 import process from "node:process";
 
 import { verifyFireworksApiKey } from "../keys/verify-api-key.mjs";
-import { fireworksGatewayFetchSignal } from "./gateway-fetch.mjs";
+import { fireworksGatewayFetchSignal, isDefiniteRefusal } from "./gateway-fetch.mjs";
 import { FIREWORKS_GATEWAY_URL } from "./models.mjs";
 
 // Plan tiers whose only Fireworks model is the `auto` mix.
@@ -54,10 +54,10 @@ const NO_PLAN = Object.freeze({ catalogTier: "", tier: "", state: "" });
  * null when the lookup got no answer (network, timeout, 429, 5xx). Never
  * throws.
  * @param {string} apiKey
- * @param {{ timeoutMs?: number }} [options] bounds the whole lookup; 0 keeps the gateway default.
+ * @param {{ timeoutMs?: number, gatewayUrl?: string }} [options] bounds the whole lookup; 0 keeps the gateway default.
  * @returns {Promise<{ catalogTier: string, tier: string, state: string } | null>}
  */
-export async function fetchNexusPlan(apiKey, { timeoutMs = 0 } = {}) {
+export async function fetchNexusPlan(apiKey, { timeoutMs = 0, gatewayUrl = "" } = {}) {
   // Specs stay offline: they describe the account's plan tier and state, or
   // UNAVAILABLE for a failed lookup, instead. NEXUS_TEST_PLAN_CATALOG_TIER
   // sets the catalog's tier apart from the plan in force.
@@ -71,9 +71,14 @@ export async function fetchNexusPlan(apiKey, { timeoutMs = 0 } = {}) {
     };
   }
   try {
-    const gatewayUrl = process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL;
+    const resolvedGatewayUrl = (gatewayUrl?.trim() || process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL)
+      .replace(/\/+$/, "");
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
-    const verified = await verifyFireworksApiKey(apiKey, { gatewayUrl, timeoutMs, quiet: true });
+    const verified = await verifyFireworksApiKey(apiKey, {
+      gatewayUrl: resolvedGatewayUrl,
+      timeoutMs,
+      quiet: true,
+    });
     const accountId = String(verified?.accountId ?? "").trim().replace(/^accounts\//, "");
     if (!verified?.ok || !accountId) {
       return verified?.ok || isDefiniteRefusal(verified?.status) ? { ...NO_PLAN } : null;
@@ -82,7 +87,7 @@ export async function fetchNexusPlan(apiKey, { timeoutMs = 0 } = {}) {
     if (deadline > 0 && remainingTimeoutMs <= 0) {
       return null;
     }
-    const response = await fetch(`${gatewayUrl}/v1/accounts/${encodeURIComponent(accountId)}/nexusPlans`, {
+    const response = await fetch(`${resolvedGatewayUrl}/v1/accounts/${encodeURIComponent(accountId)}/nexusPlans`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: deadline > 0 ? AbortSignal.timeout(remainingTimeoutMs) : fireworksGatewayFetchSignal(),
     });
@@ -102,11 +107,6 @@ export async function fetchNexusPlan(apiKey, { timeoutMs = 0 } = {}) {
   } catch {
     return null;
   }
-}
-
-/** A 4xx other than 429: the gateway answered, and retrying won't change it. */
-function isDefiniteRefusal(status) {
-  return status >= 400 && status < 500 && status !== 429;
 }
 
 /** The plan the catalog is gated by: one that has not ended, else the newest ended one (the list is newest first). */

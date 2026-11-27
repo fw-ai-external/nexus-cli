@@ -455,7 +455,8 @@ export function accountIdOfUserName(userName) {
 }
 
 export function apiKeyFingerprint(apiKey) {
-  return createHash("sha256").update(apiKey.trim()).digest("hex");
+  const trimmed = typeof apiKey === "string" ? apiKey.trim() : "";
+  return trimmed ? createHash("sha256").update(trimmed).digest("hex") : "";
 }
 
 /** @param {string} home */

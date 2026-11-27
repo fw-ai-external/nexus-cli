@@ -13,18 +13,28 @@ import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-
 import { lookupFireworksPricing } from "../../../lib/fireworks/pricing.mjs";
 import {
   claudeStatusLineCommand,
+  claudeStatusLineCreditStanding,
   claudeStatusLineKeyExpiry,
   claudeStatusLineModelLabel,
   claudeStatusLineSettings,
   claudeStatusLineUsage,
+  fitClaudeStatusLineRows,
+  formatStatusLineCreditIndicator,
   formatTokensPerSecond,
   isFireconnectStatusLine,
   renderClaudeStatusLine,
   stripClaudeStatusLine,
   withClaudeStatusLine,
 } from "../../../lib/harnesses/claude/statusline.mjs";
+import {
+  CREDIT_STANDING_MAX_AGE_MS,
+  creditKeyFingerprint,
+  readCreditStandingCache,
+  writeCreditStandingCache,
+  writeStoredKeyFingerprint,
+} from "../../../lib/fireworks/credit-standing.mjs";
 import { mockServerlessModel, mockServerlessModelRows, runFireconnect, withTempHome } from "../../helpers.mjs";
-import { mintedKeyStatePath, writeMintedKeyState } from "../../../lib/keys/mint-api-key.mjs";
+import { clearMintedKeyState, mintedKeyStatePath, writeMintedKeyState } from "../../../lib/keys/mint-api-key.mjs";
 
 const USER_STATUS_LINE = { type: "command", command: "~/my-own-statusline.sh" };
 
@@ -1448,6 +1458,343 @@ describe("claude status line key expiry", () => {
       await record(home, new Date(Date.now() + 2 * HOUR).toISOString());
       const plain = stripAnsi(await renderClaudeStatusLine({ model: { id: "claude-sonnet-4-5" } }, { home }));
       assert.match(plain.split("\n")[0], /^(?:\S+ )?⚠ key expires in [23]h · run nexus login/, plain);
+    });
+  });
+});
+
+describe("claude status line credit visibility", () => {
+  const KEY = "fw_example_statusline_key_0000000";
+  const FP = creditKeyFingerprint(KEY);
+  const seedMinted = (home) => writeMintedKeyState(home, {
+    keyId: "key-1",
+    userName: "accounts/example-account/users/example-user",
+    displayName: "nexus-cli-test",
+    apiKey: KEY,
+  });
+
+  const CLEAN_ENV = { NEXUS_TEST: "1" };
+  const HEADER_ENV = { ANTHROPIC_CUSTOM_HEADERS: `X-Fireworks-Api-Key: ${KEY}`, NEXUS_TEST: "1" };
+
+  it("shows nothing under cap, on non-credit suspensions, org wallets, disabled overage, stale or missing caches", async () => {
+    await withTempHome("statusline-credit-quiet", async (home) => {
+      const now = Date.now();
+      await seedMinted(home);
+      const input = { model: { id: "auto[1m]" } };
+
+      // Missing cache -> normal display
+      assert.doesNotMatch(stripAnsi(await renderClaudeStatusLine(input, { home, env: HEADER_ENV })), /credits/i);
+
+      const quietRecords = [
+        // Under cap
+        { fetchedAt: now, keyFingerprint: FP, status: "ok", monthlyUsedPercent: 80, sessionUsedPercent: 99.6, overageStatus: "OVERAGE_STATUS_ACTIVE", suspendState: "UNSUSPENDED", ownsWallet: true },
+        // Non-credit suspension
+        { fetchedAt: now, keyFingerprint: FP, status: "ok", monthlyUsedPercent: 100, sessionUsedPercent: 50, overageStatus: "OVERAGE_STATUS_ACTIVE", suspendState: "FAILED_PAYMENTS", ownsWallet: true },
+        // Org wallet
+        { fetchedAt: now, keyFingerprint: FP, status: "ok", monthlyUsedPercent: 100, sessionUsedPercent: 50, overageStatus: "OVERAGE_STATUS_ACTIVE", suspendState: "UNSUSPENDED", ownsWallet: false },
+        // Disabled overage
+        { fetchedAt: now, keyFingerprint: FP, status: "ok", monthlyUsedPercent: 100, sessionUsedPercent: 50, overageStatus: "OVERAGE_STATUS_DISABLED", suspendState: "UNSUSPENDED", ownsWallet: true },
+        // Stale cache beyond 5m display bound
+        { fetchedAt: now - CREDIT_STANDING_MAX_AGE_MS - 10_000, keyFingerprint: FP, status: "ok", monthlyUsedPercent: 100, sessionUsedPercent: 50, overageStatus: "OVERAGE_STATUS_ACTIVE", suspendState: "UNSUSPENDED", ownsWallet: true },
+        // Different key fingerprint
+        { fetchedAt: now, keyFingerprint: creditKeyFingerprint("fw_other_account_key"), status: "ok", monthlyUsedPercent: 100, sessionUsedPercent: 50, overageStatus: "OVERAGE_STATUS_ACTIVE", suspendState: "UNSUSPENDED", ownsWallet: true },
+        // No active plan ("none")
+        { fetchedAt: now, keyFingerprint: FP, status: "none" },
+      ];
+
+      for (const rec of quietRecords) {
+        writeCreditStandingCache(home, rec);
+        const plain = stripAnsi(await renderClaudeStatusLine(input, { home, env: HEADER_ENV }));
+        assert.doesNotMatch(plain, /using credits|credits used up/i, JSON.stringify(rec));
+      }
+    });
+  });
+
+  it("renders 'using credits' when capped with ACTIVE + UNSUSPENDED + own wallet, staying within 2 lines", async () => {
+    await withTempHome("statusline-credit-active", async (home) => {
+      await seedMinted(home);
+      const transcript = path.join(home, "session.jsonl");
+      await writeFile(transcript, assistantLine({ id: "m1", model: "accounts/fireworks/models/glm-5p2", input: 1000, output: 500 }));
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 40,
+        sessionUsedPercent: 100,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+
+      const rendered = await renderClaudeStatusLine({
+        model: { id: "auto[1m]" },
+        transcript_path: transcript,
+      }, { home, env: HEADER_ENV });
+      const plain = stripAnsi(rendered);
+      assert.equal(rendered.trimEnd().split("\n").length, 2, plain);
+      assert.match(plain, /using credits/, plain);
+      assert.doesNotMatch(plain, /credits used up/, plain);
+      for (const esc of rendered.matchAll(/\x1b\[[0-9;]*./g)) {
+        assert.ok(esc[0].endsWith("m"), `unterminated escape: ${JSON.stringify(esc[0])}`);
+      }
+    });
+  });
+
+  it("renders '⚠ credits used up' when capped with ACTIVE + CREDIT_DEPLETED + own wallet", async () => {
+    await withTempHome("statusline-credit-depleted", async (home) => {
+      await seedMinted(home);
+      const transcript = path.join(home, "session.jsonl");
+      await writeFile(transcript, assistantLine({ id: "m1", model: "accounts/fireworks/models/glm-5p2", input: 1000, output: 500 }));
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 50,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+
+      const rendered = await renderClaudeStatusLine({
+        model: { id: "auto[1m]" },
+        transcript_path: transcript,
+      }, { home, env: HEADER_ENV });
+      const plain = stripAnsi(rendered);
+      assert.equal(rendered.trimEnd().split("\n").length, 2, plain);
+      assert.match(plain, /⚠ credits used up/, plain);
+
+      // Without a Fireworks session key or Nexus apiKeyHelper, browser minted-key
+      // cache must NOT appear on an unrelated / unconfigured Claude session.
+      const unrelated = stripAnsi(await renderClaudeStatusLine({
+        model: { id: "auto[1m]" },
+        transcript_path: transcript,
+      }, { home, env: CLEAN_ENV }));
+      assert.doesNotMatch(unrelated, /credits used up|using credits/i, unrelated);
+    });
+  });
+
+  it("prefers the active header key over a mismatched browser mint record", async () => {
+    await withTempHome("statusline-credit-header-wins", async (home) => {
+      const now = Date.now();
+      const keyB = "fw_example_header_override_key_00";
+      const fpB = creditKeyFingerprint(keyB);
+      // Minted record holds key A while Claude's gateway header holds key B.
+      await seedMinted(home);
+      const headerEnv = { ANTHROPIC_CUSTOM_HEADERS: `X-Fireworks-Api-Key: ${keyB}` };
+
+      // Cache fingerprinted for key A must NOT display when header carries key B.
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+      assert.equal(await claudeStatusLineCreditStanding(home, now, { env: { ...headerEnv, NEXUS_TEST: "1" } }), "");
+
+      // Cache fingerprinted for key B MUST display.
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: fpB,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+      assert.equal(
+        stripAnsi(await claudeStatusLineCreditStanding(home, now, { env: { ...headerEnv, NEXUS_TEST: "1" } })),
+        "⚠ credits used up",
+      );
+
+      // When ANTHROPIC_API_KEY carries stale Fireworks key A and ANTHROPIC_CUSTOM_HEADERS
+      // carries X-Fireworks-Api-Key for key B, header key B's fingerprint must win.
+      const conflictedEnv = {
+        ANTHROPIC_API_KEY: KEY,
+        ANTHROPIC_AUTH_TOKEN: KEY,
+        ANTHROPIC_CUSTOM_HEADERS: `X-Fireworks-Api-Key: ${keyB}`,
+        NEXUS_TEST: "1",
+      };
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      assert.equal(
+        stripAnsi(await claudeStatusLineCreditStanding(home, now, { env: conflictedEnv })),
+        "⚠ credits used up",
+        "must validate against X-Fireworks-Api-Key (key B), not stale ANTHROPIC_API_KEY (key A)",
+      );
+    });
+  });
+
+  it("supports Nexus apiKeyHelper without a mint record and stays quiet for custom helpers or signed-out state", async () => {
+    await withTempHome("statusline-credit-key-helper", async (home) => {
+      const now = Date.now();
+      const pastedKey = "fw_example_pasted_helper_key_0000";
+      const pastedFp = creditKeyFingerprint(pastedKey);
+      const settingsPath = userSettingsPath(home);
+      await mkdir(path.dirname(settingsPath), { recursive: true });
+      await mkdir(path.join(home, ".nexus"), { recursive: true });
+
+      // Signed-out / unconfigured session: fresh capped cache must NOT render and must NOT spawn,
+      // even when a browser mint record exists on disk.
+      await seedMinted(home);
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        return { unref() {}, on() { return this; } };
+      };
+      assert.equal(await claudeStatusLineCreditStanding(home, now, { env: {}, spawnFn }), "");
+      assert.equal(spawns, 0);
+
+      // Arbitrary user-defined apiKeyHelper must NOT spawn stored-key refresh or show browser cache.
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "/usr/local/bin/my-vault-helper" }));
+      await writeFile(path.join(home, ".nexus", "config.json"), JSON.stringify({ apiKey: "{keychain:fireworks-api-key}" }));
+      assert.equal(await claudeStatusLineCreditStanding(home, now, { env: {}, spawnFn }), "");
+      assert.equal(spawns, 0);
+
+      // Nexus apiKeyHelper with a pasted key (no mint record): spawns refresher, then validates via stored fingerprint.
+      await clearMintedKeyState(home);
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: pastedFp,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "nexus key export" }));
+      assert.equal(await claudeStatusLineCreditStanding(home, now, { env: {}, spawnFn }), "");
+      assert.equal(spawns, 1);
+
+      // Once detached worker records stored-key fingerprint, cached standing renders.
+      writeStoredKeyFingerprint(home, pastedFp);
+      assert.equal(
+        stripAnsi(await claudeStatusLineCreditStanding(home, now + 1_000, { env: {}, spawnFn })),
+        "using credits",
+      );
+      assert.equal(spawns, 1);
+    });
+  });
+
+  it("moves the credit indicator to row 2 on narrow terminals so it is not truncated", () => {
+    const credit = formatStatusLineCreditIndicator({ standing: "depleted", limit: "monthly", label: "credits used up" });
+    const parts = {
+      badge: null,
+      keyExpiry: "",
+      shortKeyExpiry: "",
+      creditStanding: credit,
+      usage: ["━━━━━━━━━━━━━━━━", "$0.12", "▓▓▓░░ 450 TPS"],
+      legend: ["━ GLM 5.2 40% cache"],
+    };
+    const [wide1, wide2] = fitClaudeStatusLineRows({ ...parts, width: 100 }).map(stripAnsi);
+    assert.match(wide1, /⚠ credits used up$/);
+    assert.equal(wide2, "━ GLM 5.2 40% cache");
+
+    const [narrow1, narrow2] = fitClaudeStatusLineRows({ ...parts, width: 45 }).map(stripAnsi);
+    assert.doesNotMatch(narrow1, /credits used up/);
+    assert.match(narrow2, /^⚠ credits used up · ━ GLM 5\.2 40% cache$/);
+  });
+
+  it("triggers detached background refresh only when stale and eligible, never blocking render", async () => {
+    await withTempHome("statusline-credit-refresh-trigger", async (home) => {
+      const now = Date.now();
+      await seedMinted(home);
+      const settingsPath = userSettingsPath(home);
+      await mkdir(path.dirname(settingsPath), { recursive: true });
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "nexus key export" }));
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        return { unref() {}, on() { return this; } };
+      };
+
+      // Stale/missing cache with NEXUS_TEST unset -> spawns detached refresh once.
+      const first = await claudeStatusLineCreditStanding(home, now, { env: {}, spawnFn });
+      assert.equal(first, "");
+      assert.equal(spawns, 1);
+
+      // Immediate second turn hits lock cooldown -> no second spawn.
+      await claudeStatusLineCreditStanding(home, now + 1_000, { env: {}, spawnFn });
+      assert.equal(spawns, 1);
+
+      // Fresh cache skips spawn altogether and returns indicator immediately.
+      writeCreditStandingCache(home, {
+        fetchedAt: now,
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 20,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      const text = stripAnsi(await claudeStatusLineCreditStanding(home, now + 10_000, { env: {}, spawnFn }));
+      assert.equal(text, "using credits");
+      assert.equal(spawns, 1);
+    });
+  });
+
+  it("clears cached credit standing on `claude on` and `claude off`", async () => {
+    await withTempHome("statusline-credit-clear-on-off", async (home) => {
+      const settingsPath = userSettingsPath(home);
+      await mkdir(path.dirname(settingsPath), { recursive: true });
+      await writeFile(settingsPath, JSON.stringify({ env: {} }));
+      const headerEnv = { ANTHROPIC_CUSTOM_HEADERS: `X-Fireworks-Api-Key: ${KEY}`, NEXUS_TEST: "1" };
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      assert.match(stripAnsi(await renderClaudeStatusLine({ model: { id: "auto" } }, { home, env: headerEnv })), /using credits/);
+
+      await runFireconnect(["login", "--api-key", "fw_test_key_12345"], { HOME: home, FIREWORKS_API_KEY: "" });
+      const on = await runFireconnect(["claude", "on", "--non-interactive"], { HOME: home, FIREWORKS_API_KEY: "" });
+      assert.equal(on.code, 0, on.stderr);
+      assert.equal(readCreditStandingCache(home, { keyFingerprint: FP }), null);
+      assert.doesNotMatch(stripAnsi(await renderClaudeStatusLine({ model: { id: "auto" } }, { home, env: headerEnv })), /using credits/);
+
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: FP,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 0,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+      const off = await runFireconnect(["claude", "off"], { HOME: home });
+      assert.equal(off.code, 0, off.stderr);
+      assert.equal(readCreditStandingCache(home, { keyFingerprint: FP }), null);
+      assert.doesNotMatch(stripAnsi(await renderClaudeStatusLine({ model: { id: "auto" } }, { home, env: headerEnv })), /credits used up/);
     });
   });
 });

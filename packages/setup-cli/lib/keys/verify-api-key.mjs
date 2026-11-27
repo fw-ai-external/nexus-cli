@@ -21,20 +21,23 @@ import { warnInsecureUrlOverride } from "../system/url-override-warning.mjs";
  * Never throws — callers map the result to one-line recovery copy.
  *
  * @param {string} apiKey
- * @param {{ gatewayUrl?: string, timeoutMs?: number, quiet?: boolean }} [options]
+ * @param {{ gatewayUrl?: string, timeoutMs?: number, quiet?: boolean, fetchFn?: typeof fetch }} [options]
  *   `timeoutMs` bounds the request for display paths that must paint
  *   quickly; the default stays the gateway-wide 30s budget.
  * @returns {Promise<VerifyResult>}
  */
-export async function verifyFireworksApiKey(apiKey, { gatewayUrl = "", timeoutMs = 0, quiet = false } = {}) {
-  const base = gatewayUrl
+export async function verifyFireworksApiKey(
+  apiKey,
+  { gatewayUrl = "", timeoutMs = 0, quiet = false, fetchFn = fetch } = {},
+) {
+  const base = (gatewayUrl
     || process.env.NEXUS_GATEWAY_URL?.trim()
-    || FIREWORKS_GATEWAY_URL;
+    || FIREWORKS_GATEWAY_URL).replace(/\/+$/, "");
   if (!quiet) warnInsecureUrlOverride(base, gatewayUrl ? "Gateway URL override" : "NEXUS_GATEWAY_URL");
 
   let response;
   try {
-    response = await fetch(`${base}/verifyApiKey`, {
+    response = await fetchFn(`${base}/verifyApiKey`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : fireworksGatewayFetchSignal(),
     });
@@ -54,8 +57,8 @@ export async function verifyFireworksApiKey(apiKey, { gatewayUrl = "", timeoutMs
     };
   }
 
-  const email = response.headers.get("x-fireworks-developer-email") ?? "";
-  const accountId = response.headers.get("x-fireworks-account-id") ?? "";
+  const email = response.headers?.get?.("x-fireworks-developer-email") ?? "";
+  const accountId = response.headers?.get?.("x-fireworks-account-id") ?? "";
 
   if (response.ok) {
     return { ok: true, reason: "", email, accountId, status: response.status, detail: "" };

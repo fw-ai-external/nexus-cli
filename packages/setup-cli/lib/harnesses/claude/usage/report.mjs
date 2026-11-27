@@ -2,6 +2,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { sanitize } from "../../../ui/sanitize.mjs";
 import { FIREWORKS_PRICING_DOCS_URL } from "../../../fireworks/pricing.mjs";
+import { formatCreditStandingUsageLines } from "../../../fireworks/credit-standing.mjs";
 import {
   UNPRICED_TEXT,
   addUsage,
@@ -986,7 +987,7 @@ function sessionBannerLabel(report) {
   return name ? `${id} (${name})` : id;
 }
 
-function formatClaudeUsageVerboseReport(report) {
+function formatClaudeUsageVerboseReport(report, { creditIndicator = null } = {}) {
   if (report.rows.length === 0 && (report.subagents ?? []).length === 0) {
     return `No assistant entries found in ${report.path}`;
   }
@@ -1024,10 +1025,11 @@ function formatClaudeUsageVerboseReport(report) {
     lines.push("Note: Some rows used fallback/reference pricing because the model id was not recognized.");
   }
   lines.push(...unpricedNote(report));
+  lines.push(...formatCreditStandingUsageLines(creditIndicator));
   return lines.join("\n");
 }
 
-function formatClaudeUsagePlainSummaryReport(report) {
+function formatClaudeUsagePlainSummaryReport(report, { creditIndicator = null } = {}) {
   if (report.rows.length === 0 && (report.subagents ?? []).length === 0) {
     return `No assistant entries found in ${report.path}`;
   }
@@ -1049,20 +1051,21 @@ function formatClaudeUsagePlainSummaryReport(report) {
     lines.push("Note: Some rows used fallback/reference pricing because the model id was not recognized.");
   }
   lines.push(...unpricedNote(report));
+  lines.push(...formatCreditStandingUsageLines(creditIndicator));
   return lines.join("\n");
 }
 
-export function formatClaudeUsageReport(report, { verbose = false, plain = false, stream } = {}) {
+export function formatClaudeUsageReport(report, { verbose = false, plain = false, stream, creditIndicator = null } = {}) {
   if (verbose) {
-    return formatClaudeUsageVerboseReport(report);
+    return formatClaudeUsageVerboseReport(report, { creditIndicator });
   }
   if (plain) {
-    return formatClaudeUsagePlainSummaryReport(report);
+    return formatClaudeUsagePlainSummaryReport(report, { creditIndicator });
   }
-  return formatClaudeUsageSummaryDisplay(report, { stream });
+  return formatClaudeUsageSummaryDisplay(report, { stream, creditIndicator });
 }
 
-export function formatClaudeUsageReports(reportGroup, { verbose = false, plain = false, stream } = {}) {
+export function formatClaudeUsageReports(reportGroup, { verbose = false, plain = false, stream, creditIndicator = null } = {}) {
   const sessions = reportGroup.sessions ?? [];
   if (sessions.length === 0) {
     return "No Claude Code session usage found.";
@@ -1086,11 +1089,12 @@ export function formatClaudeUsageReports(reportGroup, { verbose = false, plain =
     if (reportGroup.unpriced) {
       lines.push(`Note: ${reportGroup.unpriced} request(s) have no rate available; their cost is not included.`);
     }
+    lines.push(...formatCreditStandingUsageLines(creditIndicator));
     return lines.join("\n");
   }
   if (plain) {
     if (sessions.length === 1) {
-      return formatClaudeUsagePlainSummaryReport(sessions[0]);
+      return formatClaudeUsagePlainSummaryReport(sessions[0], { creditIndicator });
     }
     const lines = [];
     sessions.forEach((report, index) => {
@@ -1109,7 +1113,8 @@ export function formatClaudeUsageReports(reportGroup, { verbose = false, plain =
     if (reportGroup.unpriced) {
       lines.push(`Note: ${reportGroup.unpriced} request(s) have no rate available; their cost is not included.`);
     }
+    lines.push(...formatCreditStandingUsageLines(creditIndicator));
     return lines.join("\n");
   }
-  return formatClaudeUsageReportsSummaryDisplay(reportGroup, { stream });
+  return formatClaudeUsageReportsSummaryDisplay(reportGroup, { stream, creditIndicator });
 }

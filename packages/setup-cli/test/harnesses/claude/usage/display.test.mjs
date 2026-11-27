@@ -10,6 +10,9 @@ import {
   runClaudeUsageInteractiveDisplay,
 } from "../../../../lib/harnesses/claude/usage/display.mjs";
 import { formatUsageCost } from "../../../../lib/harnesses/claude/usage/format.mjs";
+import { renderFooter } from "../../../../lib/harnesses/claude/usage/meter-render.mjs";
+import { applyMeterStyle } from "../../../../lib/harnesses/claude/usage/meter-style.mjs";
+import { NEXUS_BILLING_URL } from "../../../../lib/fireworks/credit-standing.mjs";
 
 function lastInteractiveFrame(text) {
   const plain = String(text).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
@@ -754,5 +757,108 @@ describe("claude usage display", () => {
     const modelRow = text.split("\n").find((line) => line.includes("claude-haiku"));
     assert.match(modelRow, /claude-haiku-4-5-20251001\s+\$1\.00/);
     assert.equal(modelRow.length, 99);
+  });
+
+  it("renders credit standing banners in static, interactive, and live-meter usage views", () => {
+    const report = {
+      path: "/tmp/12345678-1234-4234-9234-123456789abc.jsonl",
+      rows: [{ model: "accounts/fireworks/models/glm-5p2", displayModel: "glm-5p2", input: 100, output: 50, cacheRead: 0, cost: 0.05 }],
+      grandTotals: { input: 100, output: 50, cacheRead: 0, cost: 0.05 },
+      grandRequests: 1,
+      subagents: [],
+      estimated: false,
+    };
+    const active = { standing: "available", limit: "session", label: "using credits" };
+    const depleted = { standing: "depleted", limit: "monthly", label: "credits used up" };
+
+    // Null indicator -> no credit banner.
+    const quiet = formatClaudeUsageSummaryDisplay(report, { stream: { isTTY: false, columns: 100 }, creditIndicator: null });
+    assert.doesNotMatch(quiet, /using credits|credits used up|settings\/billing/);
+
+    // Active credits -> shows "using credits" in static & interactive views.
+    const activeStatic = formatClaudeUsageSummaryDisplay(report, { stream: { isTTY: false, columns: 100 }, creditIndicator: active });
+    assert.match(activeStatic, /5-hour plan limit reached — using credits/);
+    const activeInteractive = formatClaudeUsageInteractiveFrame(report, {}, { stream: { isTTY: false, columns: 100 }, creditIndicator: active });
+    assert.match(activeInteractive, /5-hour plan limit reached — using credits/);
+
+    // Depleted credits -> shows "credits used up" + Billing URL in static & interactive views.
+    const depletedStatic = formatClaudeUsageSummaryDisplay(report, { stream: { isTTY: false, columns: 120 }, creditIndicator: depleted });
+    assert.match(depletedStatic, /Monthly plan limit reached — credits used up/);
+    assert.ok(depletedStatic.includes(NEXUS_BILLING_URL), depletedStatic);
+    const depletedInteractive = formatClaudeUsageInteractiveFrame(report, {}, { stream: { isTTY: false, columns: 120 }, creditIndicator: depleted });
+    assert.match(depletedInteractive, /Monthly plan limit reached — credits used up/);
+    assert.ok(depletedInteractive.includes(NEXUS_BILLING_URL), depletedInteractive);
+
+    // Live meter footer shows credit status cleanly when active/depleted.
+    applyMeterStyle(false);
+    const totals = new Map([["GLM 5.2", { input: 100, cacheWrite: 0, cacheRead: 0, output: 50, cost: 0.05 }]]);
+    const footerQuiet = renderFooter({ totals, unpriced: new Set(), peers: null, agentLabel: "Main", colorOf: () => "", width: 100 }).join("\n");
+    assert.doesNotMatch(footerQuiet, /using credits|credits used up/);
+    const footerActive = renderFooter({ totals, unpriced: new Set(), peers: null, agentLabel: "Main", colorOf: () => "", width: 100, creditIndicator: active }).join("\n");
+    assert.match(footerActive, /using credits \(5h plan limit reached\)/);
+    const footerDepleted = renderFooter({ totals, unpriced: new Set(), peers: null, agentLabel: "Main", colorOf: () => "", width: 100, creditIndicator: depleted }).join("\n");
+    assert.match(footerDepleted, /⚠ credits used up/);
+    assert.ok(footerDepleted.includes(NEXUS_BILLING_URL), footerDepleted);
+
+    // Narrow 48-60 column panes must keep the billing URL completely intact on its own line.
+    for (const width of [60, 48]) {
+      const narrowDepleted = renderFooter({
+        totals,
+        unpriced: new Set(),
+        peers: null,
+        agentLabel: "Main",
+        colorOf: () => "",
+        width,
+        creditIndicator: depleted,
+      }).join("\n");
+      assert.match(narrowDepleted, /⚠ credits used up/, `width=${width}`);
+      assert.ok(narrowDepleted.includes(NEXUS_BILLING_URL), `width=${width}:\n${narrowDepleted}`);
+    }
+  });
+
+  it("accounts for the credit standing banner height in interactive detail viewport rows", () => {
+    const sessionId = "44444444-4444-4444-9444-444444444444";
+    const requestRows = Array.from({ length: 12 }, (_, index) => ({
+      model: "accounts/fireworks/models/glm-5p2",
+      displayModel: "glm-5p2",
+      input: index + 1,
+      cacheWrite5m: 0,
+      cacheWrite1h: 0,
+      cacheRead: index,
+      output: 10 + index,
+      cost: (index + 1) * 0.01,
+    }));
+    const report = {
+      path: `/tmp/${sessionId}.jsonl`,
+      rows: requestRows,
+      totals: { input: 78, cacheWrite5m: 0, cacheWrite1h: 0, output: 186, cacheRead: 66, cost: 0.78 },
+      grandTotals: { input: 78, cacheWrite5m: 0, cacheWrite1h: 0, output: 186, cacheRead: 66, cost: 0.78 },
+      grandRequests: 12,
+      subagents: [],
+      estimated: false,
+    };
+    const state = {
+      focusIndex: 0,
+      expandedSessionId: sessionId,
+      detailSessionId: sessionId,
+      requestSource: "parent",
+    };
+    const depleted = { standing: "depleted", limit: "monthly", label: "credits used up" };
+    const stream = { isTTY: false, columns: 100, rows: 35 };
+
+    const withoutBanner = formatClaudeUsageInteractiveFrame(report, state, { stream, creditIndicator: null });
+    const withBanner = formatClaudeUsageInteractiveFrame(report, state, { stream, creditIndicator: depleted });
+
+    const withoutLines = withoutBanner.split("\n");
+    const withLines = withBanner.split("\n");
+    // Adding the credit banner must NOT grow total frame height (would overflow
+    // into the hidden-lines fallback if creditRows were omitted from layerTableLimit).
+    assert.equal(withLines.length, withoutLines.length, `with=${withLines.length} vs without=${withoutLines.length}`);
+
+    const withoutWindow = withoutBanner.match(/rows 1-(\d+) of 12/);
+    const withWindow = withBanner.match(/rows 1-(\d+) of 12/);
+    assert.ok(withoutWindow && withWindow);
+    // The banner reduces the visible request-table budget by its exact height.
+    assert.ok(Number(withWindow[1]) < Number(withoutWindow[1]), `${withWindow[0]} vs ${withoutWindow[0]}`);
   });
 });

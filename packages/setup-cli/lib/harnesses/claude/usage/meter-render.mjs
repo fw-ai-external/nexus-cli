@@ -41,6 +41,7 @@ import {
   vislen,
 } from "./meter-style.mjs";
 import { formatUsageCachePct } from "./format.mjs";
+import { NEXUS_BILLING_URL } from "../../../fireworks/credit-standing.mjs";
 
 /** Most agent rows to show in the pane before collapsing the rest into a count. */
 const AGENT_PANE_ROWS = 6;
@@ -192,7 +193,7 @@ export function renderAgentPane(pane, width) {
  *   width: number,
  * }} ctx
  */
-export function renderFooter({ totals, unpriced, peers, agentLabel, colorOf, width }) {
+export function renderFooter({ totals, unpriced, peers, agentLabel, colorOf, width, creditIndicator = null }) {
   let grand = 0;
   for (const t of totals.values()) grand += t.cost;
   const trackedCost = unpriced.size ? null : grand;
@@ -273,8 +274,30 @@ export function renderFooter({ totals, unpriced, peers, agentLabel, colorOf, wid
   if (unpriced.size) {
     lines.push(`  ${RED}*${R} ${GHOST}unpriced (excluded): ${[...unpriced].sort().join(", ")}${R}`);
   }
+  lines.push(...renderCreditNotice(creditIndicator, width));
   // Even with the bar gone the fixed columns need ~59 cols, and the unpriced line
   // is unbounded, so clip rather than let anything wrap the frame.
+  return lines.map((l) => (vislen(l) > width ? clipAnsi(l, width) : l));
+}
+
+/**
+ * Render the compact credit-standing notice lines for the live meter (both the
+ * fullscreen footer and inline plain/NO_COLOR output). Keeps the billing URL on
+ * its own indented line so narrow (48-64 col) panes never truncate the link.
+ * @param {import("../../../fireworks/credit-standing.mjs").ActiveCreditIndicator | null | undefined} creditIndicator
+ * @param {number} width
+ * @returns {string[]}
+ */
+export function renderCreditNotice(creditIndicator, width) {
+  if (!creditIndicator) return [];
+  const lines = creditIndicator.standing === "depleted"
+    ? [
+      `  ${RED}⚠${R} ${B}credits used up${R}`,
+      `  ${GHOST}${NEXUS_BILLING_URL}${R}`,
+    ]
+    : [
+      `  ${ACCENT}using credits${R} ${GHOST}(${creditIndicator.limit === "monthly" ? "monthly" : "5h"} plan limit reached)${R}`,
+    ];
   return lines.map((l) => (vislen(l) > width ? clipAnsi(l, width) : l));
 }
 

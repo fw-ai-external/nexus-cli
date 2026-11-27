@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
@@ -148,6 +148,17 @@ import {
 } from "./claude-code-version.mjs";
 import { claudeModsEnabled } from "./mods.mjs";
 import { clearUltrafastBadge } from "./ultrafast-badge.mjs";
+import {
+  CREDIT_STANDING_LOCK_TTL_MS,
+  clearCreditStandingCache,
+  creditKeyFingerprint,
+  creditStandingJsonPayload,
+  hasActiveCreditStandingRefreshLock,
+  isCreditStandingCacheFresh,
+  loadCreditStanding,
+  readActiveCreditIndicator,
+  readCreditStandingCache,
+} from "../../fireworks/credit-standing.mjs";
 import { activeAccountResidency, fireworksInferenceUrl, resolveHarnessResidency } from "../../fireworks/residency.mjs";
 
 const CLAUDE_FIREROUTER = Object.freeze({
@@ -238,11 +249,209 @@ async function claudeSettingsRouted(ctx) {
   }
 }
 
-async function claudeResolveKey(ctx) {
+async function claudeResolveUsageAuth(ctx) {
   const { settingsPath, dataDir } = claudePathsFor(ctx);
-  const settings = await readJsonIfExists(settingsPath);
-  const state = await readJsonIfExists(providerStatePath(dataDir));
-  return resolveClaudeAuthState(settings, state).token;
+  const [settings, state] = await Promise.all([
+    readJsonIfExists(settingsPath),
+    readJsonIfExists(providerStatePath(dataDir)),
+  ]);
+  const auth = resolveClaudeAuthState(settings, state);
+  return {
+    token: auth.token,
+    usesNexusHelper: auth.authMode === "apiKeyHelper" && isNexusApiKeyHelper(settings.apiKeyHelper, state),
+  };
+}
+
+async function lstatToken(filePath) {
+  if (!filePath) return "missing";
+  try {
+    const info = await lstat(filePath);
+    if (!info.isFile()) return "nonfile";
+    return `${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+  } catch {
+    return "missing";
+  }
+}
+
+async function readSmallRegularText(filePath, maxBytes = 64 * 1024) {
+  if (!filePath) return "missing";
+  try {
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.size > maxBytes) return "nonfile";
+    return await readFile(filePath, "utf8");
+  } catch {
+    return "missing";
+  }
+}
+
+function encryptedSecretsPathForHome(home, env = process.env) {
+  if (!home) return "";
+  if (process.platform === "win32") {
+    const root = env?.LOCALAPPDATA || env?.ProgramData || home;
+    return path.join(root, "Keyring", "secrets.json");
+  }
+  const envHome = env?.HOME?.trim() ?? "";
+  const sameHome = Boolean(envHome) && path.resolve(home) === path.resolve(envHome);
+  const dataHome = sameHome && env?.XDG_DATA_HOME ? env.XDG_DATA_HOME : path.join(home, ".local", "share");
+  return path.join(dataHome, "keyring", "secrets.json");
+}
+
+/**
+ * Lightweight filesystem-only snapshot of stored-key state (zero OS keychain
+ * access, zero secret decryption) so the live meter detects out-of-process
+ * `nexus login` / `nexus logout` without re-reading the OS keychain every 2s.
+ */
+async function readStoredCredentialSignature(home, env = process.env) {
+  if (!home) return { hasKeyRef: false, version: "" };
+  const [config, keyStorageRaw, legacyStorageRaw, mintedRaw, secretsStat, plaintextStat, memoryStat] = await Promise.all([
+    readGlobalConfig(home).catch(() => ({ apiKey: "" })),
+    readSmallRegularText(path.join(home, ".nexus", "key-storage.json")),
+    readSmallRegularText(path.join(home, ".nexus", "secret-backend.json")),
+    readSmallRegularText(path.join(home, ".nexus", "minted-key.json")),
+    lstatToken(encryptedSecretsPathForHome(home, env)),
+    lstatToken(path.join(home, ".nexus", ".api-key")),
+    lstatToken(path.join(home, ".nexus", ".secret-memory")),
+  ]);
+  const keyRef = typeof config?.apiKey === "string" ? config.apiKey.trim() : "";
+  const keyRefToken = keyRef ? creditKeyFingerprint(keyRef) : "";
+  return {
+    hasKeyRef: Boolean(keyRef),
+    version: [keyRefToken, keyStorageRaw, legacyStorageRaw, mintedRaw, secretsStat, plaintextStat, memoryStat].join("\0"),
+  };
+}
+
+/**
+ * Create the live-meter credit-standing poller for `nexus claude usage`.
+ *
+ * Re-checks Claude settings and lightweight on-disk credential metadata on
+ * every poll (without passing `fresh: true` on steady-state 2s ticks) so:
+ * - OS keychains are read at most once per command instead of prompting every 2s;
+ * - `nexus logout` or `nexus claude off` stops polling immediately (with zero
+ *   keychain reads) and never recreates a signed-out account's credit cache;
+ * - out-of-process `nexus login` rotation is detected via on-disk credential
+ *   metadata (`config.json`, `key-storage.json`, `minted-key.json`, file store)
+ *   and triggers a single fresh read;
+ * - custom third-party helpers and unconfigured sessions never inherit another
+ *   account's browser-minted credits;
+ * - failed refreshes respect the 60-second cooldown lock (both on-disk and
+ *   in-memory) instead of retrying on every two-second meter poll.
+ *
+ * @param {import("../../harness/types.mjs").HarnessContext} ctx
+ * @param {{
+ *   env?: NodeJS.ProcessEnv,
+ *   nowFn?: () => number,
+ *   resolveAuth?: typeof claudeResolveUsageAuth,
+ *   resolveStoredKey?: typeof resolveFireworksApiKeyValue,
+ *   loadStanding?: typeof loadCreditStanding,
+ *   allowNetworkInTest?: boolean,
+ *   initialCredentialSig?: string,
+ *   trackCredentialChanges?: boolean,
+ * }} [options]
+ */
+export function createClaudeLiveCreditReader(ctx, {
+  env = process.env,
+  nowFn = () => Date.now(),
+  resolveAuth = claudeResolveUsageAuth,
+  resolveStoredKey = resolveFireworksApiKeyValue,
+  loadStanding = loadCreditStanding,
+  allowNetworkInTest = false,
+  initialCredentialSig = "",
+  trackCredentialChanges = resolveStoredKey === resolveFireworksApiKeyValue,
+} = {}) {
+  let refreshing = false;
+  let lastFailedAt = 0;
+  let lastFailedFp = "";
+  let hasLoadedStoredKey = false;
+  let cachedStoredKey = "";
+  let cachedCredSig = initialCredentialSig;
+  return async () => {
+    if (env?.NEXUS_CREDIT_STATUS === "0") return null;
+    let activeKey = "";
+    try {
+      const { token, usesNexusHelper } = await resolveAuth(ctx);
+      if (token) {
+        activeKey = token;
+      } else if (usesNexusHelper) {
+        if (trackCredentialChanges) {
+          const sig = await readStoredCredentialSignature(ctx.home, env);
+          if (!sig.hasKeyRef) {
+            hasLoadedStoredKey = true;
+            cachedStoredKey = "";
+            cachedCredSig = sig.version;
+            activeKey = "";
+          } else if (!hasLoadedStoredKey) {
+            const changedSinceStartup = Boolean(cachedCredSig) && sig.version !== cachedCredSig;
+            cachedStoredKey = await resolveStoredKey({ home: ctx.home, fresh: changedSinceStartup }).catch(() => "");
+            // Re-snapshot after resolution so a one-time legacy literal migration
+            // doesn't look like an external rotation on the next 2s tick.
+            cachedCredSig = (await readStoredCredentialSignature(ctx.home, env)).version;
+            hasLoadedStoredKey = true;
+            activeKey = cachedStoredKey;
+          } else if (sig.version !== cachedCredSig) {
+            cachedStoredKey = await resolveStoredKey({ home: ctx.home, fresh: true }).catch(() => "");
+            cachedCredSig = (await readStoredCredentialSignature(ctx.home, env)).version;
+            activeKey = cachedStoredKey;
+          } else {
+            activeKey = cachedStoredKey;
+          }
+        } else {
+          activeKey = await resolveStoredKey({ home: ctx.home }).catch(() => "");
+        }
+      }
+    } catch {
+      activeKey = "";
+    }
+    const expectedFingerprint = creditKeyFingerprint(activeKey);
+    if (!expectedFingerprint) {
+      lastFailedAt = 0;
+      lastFailedFp = "";
+      return null;
+    }
+    const now = nowFn();
+    const cached = readCreditStandingCache(ctx.home, { keyFingerprint: expectedFingerprint });
+    const inMemoryCooldown = lastFailedFp === expectedFingerprint
+      && lastFailedAt > 0
+      && now - lastFailedAt < CREDIT_STANDING_LOCK_TTL_MS;
+    if (
+      !refreshing
+      && !inMemoryCooldown
+      && (allowNetworkInTest || env?.NEXUS_TEST !== "1")
+      && !isCreditStandingCacheFresh(cached, { expectedFingerprint, now })
+      && !hasActiveCreditStandingRefreshLock(ctx.home, { keyFingerprint: expectedFingerprint, now })
+    ) {
+      refreshing = true;
+      const attemptKey = activeKey;
+      const attemptFp = expectedFingerprint;
+      loadStanding({
+        home: ctx.home,
+        apiKey: attemptKey,
+        now,
+        env,
+        allowNetworkInTest,
+        respectCooldown: true,
+      })
+        .then(() => {
+          const updated = readCreditStandingCache(ctx.home, { keyFingerprint: attemptFp });
+          if (isCreditStandingCacheFresh(updated, { expectedFingerprint: attemptFp, now })) {
+            lastFailedAt = 0;
+            lastFailedFp = "";
+          } else {
+            lastFailedAt = now;
+            lastFailedFp = attemptFp;
+          }
+        })
+        .catch(() => {
+          lastFailedAt = now;
+          lastFailedFp = attemptFp;
+        })
+        .finally(() => { refreshing = false; });
+    }
+    return readActiveCreditIndicator(ctx.home, { expectedFingerprint, now, env });
+  };
+}
+
+async function claudeResolveKey(ctx) {
+  return (await claudeResolveUsageAuth(ctx)).token;
 }
 
 /**
@@ -678,9 +887,10 @@ export default defineHarnessProfile({
       }
       throw error;
     });
-    // The key Claude Code uses may have changed: the banner mod records the
-    // boost again for the new one, so another account's never shows.
+    // The key Claude Code uses may have changed: drop cached per-account
+    // badges so another account's boost or credit standing never shows.
     await clearUltrafastBadge(ctx.home);
+    clearCreditStandingCache(ctx.home);
     await setHarnessState(ctx.home, HARNESS.CLAUDE, {
       enabled: true,
       provider: "fireworks",
@@ -755,6 +965,7 @@ export default defineHarnessProfile({
       wasEnabled: connected,
     });
     await clearUltrafastBadge(ctx.home);
+    clearCreditStandingCache(ctx.home);
     const overrides = claudeCustomPathOverrides(ctx);
     await recordHarnessCustomPath(ctx.home, HARNESS.CLAUDE, overrides, false);
     // `off` at a custom path leaves the default settings alone; see engineOff.
@@ -868,14 +1079,45 @@ export default defineHarnessProfile({
     // cost is computed. Fully best-effort: resolving the key can throw on a
     // malformed/unreadable settings file, and usage must still work off the
     // session logs, so the whole warm is wrapped, not just the fetch.
+    let claudeKey = "";
+    let usesNexusHelper = false;
     try {
-      await warmServerlessPricingCache(await claudeResolveKey(ctx));
+      const resolved = await claudeResolveUsageAuth(ctx);
+      claudeKey = resolved.token;
+      usesNexusHelper = resolved.usesNexusHelper;
     } catch {
-      /* fall back to static spec pricing */
+      claudeKey = "";
+      usesNexusHelper = false;
     }
+    const creditDisabled = process.env.NEXUS_CREDIT_STATUS === "0";
+    let initialCredentialSig = "";
+    const [, creditIndicator] = await Promise.all([
+      // Preserve pre-PR pricing warm scope: only use Claude's explicitly
+      // configured key (never the machine's stored secret, since catalog
+      // requests honor NEXUS_GATEWAY_URL).
+      warmServerlessPricingCache(claudeKey).catch(() => {
+        /* fall back to static spec pricing */
+      }),
+      creditDisabled
+        ? Promise.resolve(null)
+        : (async () => {
+          // Only read credit standing for an explicit Claude Fireworks key or
+          // Nexus's own apiKeyHelper; loadCreditStanding pins to the trusted
+          // Fireworks gateway and ignores NEXUS_GATEWAY_URL.
+          let creditKey = claudeKey;
+          if (!creditKey && usesNexusHelper) {
+            creditKey = await resolveFireworksApiKeyValue({ home: ctx.home }).catch(() => "");
+            initialCredentialSig = (await readStoredCredentialSignature(ctx.home)).version;
+          }
+          if (!creditKey) return null;
+          return loadCreditStanding({ home: ctx.home, apiKey: creditKey });
+        })().catch(() => null),
+    ]);
+    const creditStanding = creditStandingJsonPayload(creditIndicator);
     if (shouldRunClaudeUsageLive(ctx)) {
       const withinDays = ctx.days || undefined;
       let session = ctx.session ?? "";
+      const pickedAtStartup = !session;
       if (!session) {
         // Needs stdin TTY for the multi-session menu; otherwise picks newest.
         session = await promptClaudeUsageSession({ home: ctx.home, withinDays });
@@ -883,11 +1125,17 @@ export default defineHarnessProfile({
           return;
         }
       }
+      const readCreditIndicator = createClaudeLiveCreditReader(ctx, { initialCredentialSig });
       await runClaudeUsageLive({
         home: ctx.home,
         session,
         verbose: ctx.verbose,
         plain: ctx.plain,
+        // If the startup picker ran, drop the pre-picker snapshot so the live
+        // meter reads current standing instead of printing stale credits if
+        // the account changed while the picker was open.
+        creditIndicator: pickedAtStartup ? null : creditIndicator,
+        readCreditIndicator,
         // The session list is always reachable, including from an explicit
         // --session. It was withheld there on the theory that you can only go
         // "back" somewhere you have been, but the list is a destination in its
@@ -900,12 +1148,12 @@ export default defineHarnessProfile({
     if (ctx.lastN) {
       const reportGroup = await readClaudeUsages({ home: ctx.home, session: ctx.session ?? "", lastN: ctx.lastN });
       if (ctx.json) {
-        console.log(JSON.stringify(reportGroup, null, 2));
+        console.log(JSON.stringify(creditStanding ? { ...reportGroup, creditStanding } : reportGroup, null, 2));
         return;
       }
       if (!ctx.verbose && !ctx.plain && hasClaudeUsageRows(reportGroup)) {
         await playUsageIntroAnimation();
-        if (canRunClaudeUsageInteractiveDisplay() && await runClaudeUsageInteractiveDisplay(reportGroup)) {
+        if (canRunClaudeUsageInteractiveDisplay() && await runClaudeUsageInteractiveDisplay(reportGroup, { creditIndicator })) {
           // q/Esc/Ctrl-C resolve the display and restore the cursor, but a
           // paused TTY stdin still holds a libuv ref, so returning up the stack
           // hangs the process. Exit explicitly now that the terminal is restored
@@ -913,18 +1161,18 @@ export default defineHarnessProfile({
           process.exit(0);
         }
       }
-      console.log(formatClaudeUsageReports(reportGroup, { verbose: ctx.verbose, plain: ctx.plain }));
+      console.log(formatClaudeUsageReports(reportGroup, { verbose: ctx.verbose, plain: ctx.plain, creditIndicator }));
       return;
     }
 
     const report = await readClaudeUsage({ home: ctx.home, session: ctx.session ?? "" });
     if (ctx.json) {
-      console.log(JSON.stringify(report, null, 2));
+      console.log(JSON.stringify(creditStanding ? { ...report, creditStanding } : report, null, 2));
       return;
     }
     if (!ctx.verbose && !ctx.plain && hasClaudeUsageRows(report)) {
       await playUsageIntroAnimation();
-      if (canRunClaudeUsageInteractiveDisplay() && await runClaudeUsageInteractiveDisplay(report)) {
+      if (canRunClaudeUsageInteractiveDisplay() && await runClaudeUsageInteractiveDisplay(report, { creditIndicator })) {
         // q/Esc/Ctrl-C resolve the display and restore the cursor, but a paused
         // TTY stdin still holds a libuv ref, so returning up the stack hangs the
         // process. Exit explicitly now that the terminal is restored (same fix
@@ -932,7 +1180,7 @@ export default defineHarnessProfile({
         process.exit(0);
       }
     }
-    console.log(formatClaudeUsageReport(report, { verbose: ctx.verbose, plain: ctx.plain }));
+    console.log(formatClaudeUsageReport(report, { verbose: ctx.verbose, plain: ctx.plain, creditIndicator }));
   },
 
   /** Retired tmux split, kept so old muscle memory gets a pointer instead of "unknown command". */

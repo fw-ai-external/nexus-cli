@@ -58,7 +58,13 @@ describe("planLimitsCatalogToAuto", () => {
   });
 
   test("answers null when the lookup gets no answer", async () => {
-    for (const statuses of [{ verifyStatus: 503 }, { plansStatus: 503 }, { plansStatus: 429 }]) {
+    for (const statuses of [
+      { verifyStatus: 503 },
+      { verifyStatus: 408 },
+      { plansStatus: 503 },
+      { plansStatus: 408 },
+      { plansStatus: 429 },
+    ]) {
       await withGateway({ plans: [{ tier: "PRO", state: "ACTIVE" }], ...statuses }, async () => {
         assert.equal(await planLimitsCatalogToAuto("fw_test_key"), null, JSON.stringify(statuses));
       });

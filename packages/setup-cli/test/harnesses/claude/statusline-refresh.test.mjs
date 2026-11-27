@@ -1,11 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { FIREWORKS_GATEWAY_URL } from "../../../lib/fireworks/models.mjs";
 import {
   claimSessionPriceHealing,
   hasUnpricedModels,
@@ -14,6 +18,8 @@ import {
   spawnPriceRefresh,
   waitForPricedUsage,
 } from "../../../lib/harnesses/claude/statusline-refresh.mjs";
+
+const execFileAsync = promisify(execFile);
 
 function withTempHome(fn) {
   const home = mkdtempSync(path.join(os.tmpdir(), "fc-statusline-refresh-test-"));
@@ -326,18 +332,92 @@ describe("refreshPriceCaches", () => {
       });
       await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
       const prevKey = process.env.FIREWORKS_API_KEY;
-      const prevGateway = process.env.NEXUS_GATEWAY_URL;
       delete process.env.FIREWORKS_API_KEY;
-      process.env.NEXUS_GATEWAY_URL = `http://127.0.0.1:${server.address().port}`;
       try {
         await refreshPriceCaches({
           home,
           env: { ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key" },
+          gatewayUrl: `http://127.0.0.1:${server.address().port}`,
         });
         assert.deepEqual(seen, ["Bearer fw_test_header_key"]);
       } finally {
         await new Promise((resolve) => server.close(resolve));
-        for (const [name, value] of [["FIREWORKS_API_KEY", prevKey], ["NEXUS_GATEWAY_URL", prevGateway]]) {
+        if (prevKey === undefined) {
+          delete process.env.FIREWORKS_API_KEY;
+        } else {
+          process.env.FIREWORKS_API_KEY = prevKey;
+        }
+      }
+    });
+  });
+
+  it("ignores untrusted NEXUS_GATEWAY_URL and FIRECONNECT_GATEWAY_URL overrides and pins requests to Fireworks", async () => {
+    await withTempHome(async (home) => {
+      const seen = [];
+      const prevFetch = globalThis.fetch;
+      const prevKey = process.env.FIREWORKS_API_KEY;
+      const prevGateway = process.env.NEXUS_GATEWAY_URL;
+      const prevLegacyGateway = process.env.FIRECONNECT_GATEWAY_URL;
+      const prevTest = process.env.NEXUS_TEST;
+      const prevPlanFilter = process.env.NEXUS_PLAN_CATALOG_FILTER;
+      const prevCacheDir = process.env.NEXUS_CACHE_DIR;
+
+      delete process.env.FIREWORKS_API_KEY;
+      process.env.NEXUS_GATEWAY_URL = "https://evil.example.com";
+      process.env.FIRECONNECT_GATEWAY_URL = "https://legacy-evil.example.com";
+      process.env.NEXUS_TEST = "0";
+      process.env.NEXUS_PLAN_CATALOG_FILTER = "1";
+      process.env.NEXUS_CACHE_DIR = path.join(home, "cache");
+      globalThis.fetch = async (url, init) => {
+        const target = String(url);
+        const auth = init?.headers?.Authorization ?? init?.headers?.authorization ?? "";
+        seen.push({ url: target, auth });
+        if (target.endsWith("/verifyApiKey")) {
+          return new Response("", { status: 200, headers: { "x-fireworks-account-id": "example-account" } });
+        }
+        if (target.includes("/nexusPlans")) {
+          return new Response(JSON.stringify({ nexusPlans: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      };
+      try {
+        await refreshPriceCaches({
+          home,
+          env: {
+            ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key",
+            NEXUS_GATEWAY_URL: "https://evil.example.com",
+            FIRECONNECT_GATEWAY_URL: "https://legacy-evil.example.com",
+          },
+        });
+        const authed = seen.filter((entry) => entry.auth);
+        assert.ok(authed.length >= 3, `expected catalog + verify + plan requests, got ${JSON.stringify(authed)}`);
+        assert.ok(
+          authed.every((entry) => entry.url.startsWith(`${FIREWORKS_GATEWAY_URL}/`)),
+          `credential-bearing request escaped official gateway: ${JSON.stringify(authed)}`,
+        );
+        assert.ok(
+          authed.every((entry) => entry.auth === "Bearer fw_test_header_key"),
+          `unexpected auth headers: ${JSON.stringify(authed)}`,
+        );
+
+        // Explicit remote plaintext HTTP gatewayUrl is also rejected before any request is issued.
+        seen.length = 0;
+        await refreshPriceCaches({
+          home,
+          env: { ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key" },
+          gatewayUrl: "http://evil.example.com",
+        });
+        assert.deepEqual(seen.filter((entry) => entry.auth), []);
+      } finally {
+        globalThis.fetch = prevFetch;
+        for (const [name, value] of [
+          ["FIREWORKS_API_KEY", prevKey],
+          ["NEXUS_GATEWAY_URL", prevGateway],
+          ["FIRECONNECT_GATEWAY_URL", prevLegacyGateway],
+          ["NEXUS_TEST", prevTest],
+          ["NEXUS_PLAN_CATALOG_FILTER", prevPlanFilter],
+          ["NEXUS_CACHE_DIR", prevCacheDir],
+        ]) {
           if (value === undefined) {
             delete process.env[name];
           } else {
@@ -350,6 +430,139 @@ describe("refreshPriceCaches", () => {
 });
 
 describe("spawnPriceRefresh", () => {
+  it("strips NEXUS_GATEWAY_URL, FIRECONNECT_GATEWAY_URL, and test opt-ins from detached runner env", () => {
+    withTempHome((home) => {
+      const spawns = [];
+      const child = { unref() {}, on() { return this; } };
+      const got = spawnPriceRefresh({
+        home,
+        sessionId: "sess-env-strip",
+        env: {
+          NEXUS_GATEWAY_URL: "https://evil.example.com",
+          FIRECONNECT_GATEWAY_URL: "https://legacy-evil.example.com",
+          nexus_gateway_url: "https://mixed-case-evil.example.com",
+          NEXUS_PRICE_REFRESH_IN_TEST: "1",
+          FIRECONNECT_PRICE_REFRESH_IN_TEST: "1",
+          ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key",
+        },
+        spawnFn: (...args) => {
+          spawns.push(args);
+          return child;
+        },
+      });
+      assert.equal(got, child);
+      assert.equal(spawns.length, 1);
+      const [, , opts] = spawns[0];
+      assert.equal(opts.env.HOME, home);
+      assert.equal(opts.env.NEXUS_GATEWAY_URL, undefined);
+      assert.equal(opts.env.FIRECONNECT_GATEWAY_URL, undefined);
+      assert.equal(opts.env.nexus_gateway_url, undefined);
+      assert.equal(opts.env.NEXUS_PRICE_REFRESH_IN_TEST, undefined);
+      assert.equal(opts.env.FIRECONNECT_PRICE_REFRESH_IN_TEST, undefined);
+      assert.equal(opts.env.ANTHROPIC_CUSTOM_HEADERS, "X-Fireworks-Api-Key: fw_test_header_key");
+    });
+  });
+
+  it("bin/claude-price-refresh.mjs refuses attacker NEXUS_GATEWAY_URL and only honors loopback with explicit test opt-in", async () => {
+    await withTempHome(async (home) => {
+      const runnerScript = fileURLToPath(new URL("../../../bin/claude-price-refresh.mjs", import.meta.url));
+      const runnerHref = new URL("../../../bin/claude-price-refresh.mjs", import.meta.url).href;
+      const seenAuth = [];
+      const server = createServer((req, res) => {
+        seenAuth.push({ url: req.url, auth: req.headers.authorization ?? "" });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ data: [] }));
+      });
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const loopbackUrl = `http://127.0.0.1:${server.address().port}`;
+      try {
+        // 1. Under NEXUS_TEST=1 without explicit runner opt-in, exits cleanly with zero requests.
+        const runnerCacheDir = path.join(home, "cache");
+        const quiet = await execFileAsync(process.execPath, [runnerScript], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HOME: home,
+            NEXUS_CACHE_DIR: runnerCacheDir,
+            FIREWORKS_API_KEY: "",
+            NEXUS_TEST: "1",
+            NEXUS_PRICE_REFRESH_IN_TEST: "",
+            NEXUS_GATEWAY_URL: loopbackUrl,
+            FIRECONNECT_GATEWAY_URL: "",
+            ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key",
+          },
+        });
+        assert.equal(quiet.stdout, "");
+        assert.equal(quiet.stderr, "");
+        assert.deepEqual(seenAuth, []);
+
+        // 2. Under NEXUS_TEST=1 + NEXUS_PRICE_REFRESH_IN_TEST=1 + loopback HTTP, hits the mock silently.
+        const optedIn = await execFileAsync(process.execPath, [runnerScript], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HOME: home,
+            NEXUS_CACHE_DIR: runnerCacheDir,
+            FIREWORKS_API_KEY: "",
+            NEXUS_TEST: "1",
+            NEXUS_PRICE_REFRESH_IN_TEST: "1",
+            NEXUS_GATEWAY_URL: loopbackUrl,
+            FIRECONNECT_GATEWAY_URL: "",
+            ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key",
+          },
+        });
+        assert.equal(optedIn.stdout, "");
+        assert.equal(optedIn.stderr, "");
+        assert.deepEqual(seenAuth.map((entry) => entry.auth), ["Bearer fw_test_header_key"]);
+
+        // 3. Outside test mode (NEXUS_TEST=0), attacker-controlled NEXUS_GATEWAY_URL /
+        //    FIRECONNECT_GATEWAY_URL (even with NEXUS_PRICE_REFRESH_IN_TEST=1 or a loopback URL)
+        //    cannot redirect credential-bearing requests away from https://api.fireworks.ai.
+        for (const attackerUrl of ["https://evil.example.com", loopbackUrl]) {
+          seenAuth.length = 0;
+          const probe = await execFileAsync(process.execPath, ["--input-type=module", "-e", `
+            import assert from "node:assert/strict";
+            const authed = [];
+            globalThis.fetch = async (url, init) => {
+              const target = String(url);
+              const auth = init?.headers?.Authorization ?? init?.headers?.authorization ?? "";
+              if (auth) authed.push({ url: target, auth });
+              if (target.endsWith("/verifyApiKey")) {
+                return new Response("", { status: 401 });
+              }
+              return new Response(JSON.stringify({ data: [] }), { status: 200 });
+            };
+            await import(${JSON.stringify(runnerHref)});
+            assert.ok(authed.length >= 2, JSON.stringify(authed));
+            assert.ok(
+              authed.every((entry) => entry.url.startsWith(${JSON.stringify(`${FIREWORKS_GATEWAY_URL}/`)})),
+              JSON.stringify(authed),
+            );
+          `], {
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              HOME: home,
+              NEXUS_CACHE_DIR: runnerCacheDir,
+              FIREWORKS_API_KEY: "",
+              NEXUS_TEST: "0",
+              NEXUS_PLAN_CATALOG_FILTER: "1",
+              NEXUS_PRICE_REFRESH_IN_TEST: "1",
+              NEXUS_GATEWAY_URL: attackerUrl,
+              FIRECONNECT_GATEWAY_URL: "https://legacy-evil.example.com",
+              ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_test_header_key",
+            },
+          });
+          assert.equal(probe.stdout, "");
+          assert.equal(probe.stderr, "");
+          assert.deepEqual(seenAuth, []);
+        }
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+  });
+
   it("spawns the detached runner once, releasing the marker on failure", () => {
     withTempHome((home) => {
       const prev = process.env.NEXUS_TEST;

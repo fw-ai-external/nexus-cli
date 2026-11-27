@@ -15,7 +15,6 @@ import {
   runClaudeUpgradePreflight,
 } from "../../lib/system/upgrade.mjs";
 import { runUpgradeFinalize } from "../../lib/system/upgrade-finalize.mjs";
-import { runCli, withTempHome } from "../helpers.mjs";
 
 function managedClaudeEvidence() {
   return {

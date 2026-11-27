@@ -114,11 +114,33 @@ describe("release notes", () => {
     assert.doesNotMatch(formatted, /\u2014/);
   });
 
+  it("formats the v0.12.3 user-facing summary", async () => {
+    const releases = await readReleaseNotes();
+    const release = releases.find((candidate) => candidate.version === "0.12.3");
+    assert.ok(release);
+    assert.equal(releases[0].version, "0.12.3");
+
+    const formatted = formatReleaseNotes(release);
+    assert.match(formatted, /What's new in Nexus CLI v0\.12\.3/);
+    // Keep the entry limited to the approved public summary.
+    assert.deepEqual(release, {
+      version: "0.12.3",
+      highlights: [
+        "Code cleanup and small reliability fixes. The Claude Code status line's background price refresh always uses `api.fireworks.ai`, so a project's Claude Code settings can't send your Fireworks key to another server.",
+      ],
+      improvements: [],
+    });
+    assert.deepEqual(releaseNotesForRange(releases, "0.12.2", "0.12.3").map((entry) => entry.version), ["0.12.3"]);
+    // Keep the notes simple: no placeholder harness commands or internals.
+    assert.doesNotMatch(formatted, /<harness>/);
+    assert.doesNotMatch(formatted, /\u2014/);
+    assert.doesNotMatch(formatted, /shim|https?:\/\/|\$\.http/i);
+  });
+
   it("formats the v0.12.2 user-facing summary", async () => {
     const releases = await readReleaseNotes();
     const release = releases.find((candidate) => candidate.version === "0.12.2");
     assert.ok(release);
-    assert.equal(releases[0].version, "0.12.2");
 
     const formatted = formatReleaseNotes(release);
     assert.match(formatted, /What's new in Nexus CLI v0\.12\.2/);

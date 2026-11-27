@@ -18,6 +18,7 @@ import {
   migrateOpencodeReasoningEffortOnUpgrade,
   migrateOpencodeFirerouterOnUpgrade,
   migrateOpencodePickerDuplicatesOnUpgrade,
+  migrateOpencodePluginOnUpgrade,
   migrateOpencodeV2ProvidersOnUpgrade,
 } from "../harnesses/opencode/upgrade-migrations.mjs";
 import { refreshPiCatalogForHome } from "../harnesses/pi/upgrade-migrations.mjs";
@@ -161,6 +162,11 @@ const HARNESS_FORWARD_MIGRATIONS = [
     run: migrateOpencodeV2ProvidersOnUpgrade,
     success: "Added Nexus CLI's provider to OpenCode v2's providers map so its models show up. Restart OpenCode to pick it up.",
     failure: "Couldn't update OpenCode's v2 providers map. Re-run nexus opencode on.",
+  },
+  {
+    run: migrateOpencodePluginOnUpgrade,
+    success: "Updated the Nexus plugin in OpenCode (Ultra-fast banner and badge). Restart OpenCode to pick it up.",
+    failure: "Couldn't update the Nexus plugin in OpenCode. Re-run nexus opencode on.",
   },
   {
     run: migrateOpencodePickerDuplicatesOnUpgrade,

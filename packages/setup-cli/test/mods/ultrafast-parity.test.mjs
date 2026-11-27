@@ -39,6 +39,8 @@ describe("the banner mod's copies of CLI rules", () => {
     const shapes = [
       { ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_header" },
       { ANTHROPIC_CUSTOM_HEADERS: "X-Other: 1\nX-Fireworks-Api-Key: fw_second_line" },
+      { ANTHROPIC_API_KEY: "fw_stale_env", ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_header_wins" },
+      { ANTHROPIC_AUTH_TOKEN: "fw_stale_token", ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_header_wins" },
       { ANTHROPIC_API_KEY: "fw_direct" },
       { ANTHROPIC_AUTH_TOKEN: "fw_token" },
       { ANTHROPIC_API_KEY: "sk-ant-not-fireworks" },

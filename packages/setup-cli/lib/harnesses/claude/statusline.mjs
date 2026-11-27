@@ -11,6 +11,7 @@
  * across a session that switched slots mid-flight.
  */
 
+import { readFileSync, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -20,6 +21,12 @@ import { shellQuote } from "../../cli/path.mjs";
 import { preferDataDirPath } from "../../system/data-dir.mjs";
 import { stableNodeExec } from "../../system/node-exec.mjs";
 import { keyExpiresSoon, readMintedKeyState } from "../../keys/mint-api-key.mjs";
+import {
+  creditKeyFingerprint,
+  readActiveCreditIndicator,
+  readStoredKeyFingerprint,
+} from "../../fireworks/credit-standing.mjs";
+import { claudeFireworksKeyFrom, isNexusApiKeyHelper } from "./env-key.mjs";
 import {
   appendLatestRouterSuffix,
   lookupModelSpec,
@@ -52,6 +59,7 @@ import {
 } from "./usage/format.mjs";
 import {
   claimSessionPriceHealing,
+  maybeSpawnCreditStandingRefresh,
   sessionIdFromTranscript,
   spawnPriceRefresh,
   waitForPricedUsage,
@@ -491,10 +499,10 @@ function formatTimeLeft(ms) {
  * @param {number} [now]
  * @returns {Promise<string>}
  */
-export async function claudeStatusLineKeyExpiry(home, now = Date.now(), { short = false } = {}) {
+export async function claudeStatusLineKeyExpiry(home, now = Date.now(), { short = false, minted } = {}) {
   try {
-    const minted = home ? await readMintedKeyState(home) : null;
-    const expiresAt = minted?.keyFingerprint ? minted.expiresAt : "";
+    const record = minted !== undefined ? minted : (home ? await readMintedKeyState(home) : null);
+    const expiresAt = record?.keyFingerprint ? record.expiresAt : "";
     if (!expiresAt || !keyExpiresSoon(expiresAt, now)) {
       return "";
     }
@@ -502,6 +510,117 @@ export async function claudeStatusLineKeyExpiry(home, now = Date.now(), { short 
     const text = left > 0 ? `key expires in ${formatTimeLeft(left)}` : "key expired";
     if (short) return paint("accent", `⚠ ${text}`);
     return `${paint("accent", `⚠ ${text}`)} ${paint("secondary", "· run")} ${paint("primary", "nexus login")}`;
+  } catch {
+    return "";
+  }
+}
+
+function readRegularJsonSync(filePath, maxBytes = 64 * 1024) {
+  try {
+    const info = statSync(filePath);
+    if (!info.isFile() || info.size > maxBytes) return null;
+    const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Inspect Claude Code's settings + Nexus provider state without reading the
+ * secret store, distinguishing Nexus's own `apiKeyHelper` from a user helper.
+ */
+function claudeHelperAuthStatusSync(home) {
+  if (!home) return { nexusHelper: false, customHelper: false };
+  const settings = readRegularJsonSync(path.join(home, ".claude", "settings.json"));
+  const helper = settings?.apiKeyHelper;
+  if (typeof helper !== "string" || !helper.trim()) {
+    return { nexusHelper: false, customHelper: false };
+  }
+  const state = readRegularJsonSync(path.join(home, ".nexus", "claude", "provider-state.json")) ?? {};
+  const nexusHelper = isNexusApiKeyHelper(helper, state);
+  return { nexusHelper, customHelper: !nexusHelper };
+}
+
+function hasStoredKeyRefSync(home) {
+  const config = readRegularJsonSync(path.join(home, ".nexus", "config.json"));
+  return typeof config?.apiKey === "string" && config.apiKey.trim() !== "";
+}
+
+/**
+ * Compact credit indicator for the status line: "using credits" when drawing
+ * down own-wallet Nexus credits past a plan cap, "⚠ credits used up" when
+ * depleted, and "" otherwise.
+ * @param {import("../../fireworks/credit-standing.mjs").ActiveCreditIndicator | null | undefined} indicator
+ * @returns {string}
+ */
+export function formatStatusLineCreditIndicator(indicator) {
+  if (!indicator) return "";
+  if (indicator.standing === "depleted") {
+    return COLOR ? `${COLOR.bold}${COLOR.accent}⚠ credits used up${COLOR.reset}` : "⚠ credits used up";
+  }
+  if (indicator.standing === "available") {
+    return paint("accent", "using credits");
+  }
+  return "";
+}
+
+/**
+ * Read the cached Nexus credit standing for the status line (0ms network) and
+ * trigger a non-blocking detached background refresh when the cache is stale
+ * or missing. Never reads the secret store and never throws.
+ * @param {string} home
+ * @param {number} [now]
+ * @param {{ env?: NodeJS.ProcessEnv, minted?: object | null, spawnFn?: typeof import("node:child_process").spawn }} [opts]
+ * @returns {Promise<string>}
+ */
+export async function claudeStatusLineCreditStanding(
+  home,
+  now = Date.now(),
+  { env = process.env, minted, spawnFn } = {},
+) {
+  try {
+    if (!home || env?.NEXUS_CREDIT_STATUS === "0") {
+      return "";
+    }
+    const headerKey = claudeFireworksKeyFrom({ env });
+    if (headerKey) {
+      // Active session key wins over any browser mint record so rotated or
+      // manually overridden keys validate against the key actually in use.
+      const expectedFingerprint = creditKeyFingerprint(headerKey);
+      const indicator = readActiveCreditIndicator(home, { expectedFingerprint, now, env });
+      maybeSpawnCreditStandingRefresh({ home, expectedFingerprint, now, env, spawnFn });
+      return formatStatusLineCreditIndicator(indicator);
+    }
+
+    const helper = claudeHelperAuthStatusSync(home);
+    if (!helper.nexusHelper) {
+      // Never attribute the browser/stored account to a user-defined helper
+      // or an unconfigured / non-Fireworks Claude session.
+      return "";
+    }
+
+    const record = minted !== undefined ? minted : await readMintedKeyState(home).catch(() => null);
+    if (record?.keyFingerprint) {
+      const expectedFingerprint = record.keyFingerprint;
+      const indicator = readActiveCreditIndicator(home, { expectedFingerprint, now, env });
+      maybeSpawnCreditStandingRefresh({ home, expectedFingerprint, now, env, spawnFn });
+      return formatStatusLineCreditIndicator(indicator);
+    }
+
+    if (hasStoredKeyRefSync(home)) {
+      // Nexus key-helper mode with a pasted key (no browser mint record):
+      // validate against the fingerprint confirmed by the detached worker
+      // without touching the secret store on the render path.
+      const expectedFingerprint = readStoredKeyFingerprint(home);
+      const indicator = expectedFingerprint
+        ? readActiveCreditIndicator(home, { expectedFingerprint, now, env })
+        : null;
+      maybeSpawnCreditStandingRefresh({ home, expectedFingerprint, now, env, spawnFn });
+      return formatStatusLineCreditIndicator(indicator);
+    }
+
+    return "";
   } catch {
     return "";
   }
@@ -527,26 +646,43 @@ function visibleWidth(text) {
 
 /**
  * The two rows, fitted to `width`: the Ultra-fast badge and the key-expiry
- * warning lead the first row while they fit. When they don't, the warning
- * moves to the front of the second row (shortened to "⚠ key expires in 14h"
- * if that row would overflow), and then the badge drops its percentage.
- * Claude Code cuts what still doesn't fit with "…".
- * @param {{ badge: { share: string, left: string } | null, keyExpiry: string, shortKeyExpiry: string, usage: string[], legend: string[], width: number }} parts
+ * warning lead the first row while they fit, and any credit-standing tag sits
+ * at the end of the first row. When row 1 overflows, the key-expiry warning
+ * moves to the front of row 2 (shortened to "⚠ key expires in 14h" if row 2
+ * would overflow), then the badge drops its percentage, then the credit tag
+ * moves to row 2 so it is not cut off on narrow terminals. Claude Code cuts
+ * what still doesn't fit with "…".
+ * @param {{ badge: { share: string, left: string } | null, keyExpiry: string, shortKeyExpiry: string, creditStanding?: string, usage: string[], legend: string[], width: number }} parts
  * @returns {[string, string]}
  */
-export function fitClaudeStatusLineRows({ badge, keyExpiry, shortKeyExpiry, usage, legend, width }) {
+export function fitClaudeStatusLineRows({
+  badge,
+  keyExpiry,
+  shortKeyExpiry,
+  creditStanding = "",
+  usage,
+  legend,
+  width,
+}) {
   const fits = (text) => visibleWidth(text) <= width;
   let compact = false;
   let warningBelow = "";
+  let creditBelow = "";
   const rows = () => [
-    joinParts([claudeStatusLineUltrafastBadge(badge, { compact }), warningBelow ? "" : keyExpiry, ...usage]),
-    joinParts([warningBelow, ...legend]),
+    joinParts([
+      claudeStatusLineUltrafastBadge(badge, { compact }),
+      warningBelow ? "" : keyExpiry,
+      ...usage,
+      creditBelow ? "" : creditStanding,
+    ]),
+    joinParts([warningBelow, creditBelow, ...legend]),
   ];
   if (!fits(rows()[0]) && keyExpiry) {
     warningBelow = keyExpiry;
     if (!fits(rows()[1])) warningBelow = shortKeyExpiry || keyExpiry;
   }
   if (!fits(rows()[0]) && badge) compact = true;
+  if (!fits(rows()[0]) && creditStanding) creditBelow = creditStanding;
   return rows();
 }
 
@@ -571,7 +707,7 @@ export function claudeStatusLineUltrafastBadge(badge, { compact = false } = {}) 
  * @param {{ home?: string }} [opts]
  * @returns {Promise<string>}
  */
-export async function renderClaudeStatusLine(input = {}, { home = process.env.HOME ?? "" } = {}) {
+export async function renderClaudeStatusLine(input = {}, { home = process.env.HOME ?? "", env = process.env } = {}) {
   const slotModelId = input.model?.id ?? "";
   const slotLabel = isClaudeNativeModel(slotModelId)
     ? (input.model?.display_name || "Claude default")
@@ -595,6 +731,7 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
       const child = spawnPriceRefresh({
         home,
         sessionId: sessionIdFromTranscript(input.transcript_path ?? ""),
+        env,
       });
     if (child) {
       // A failed heal resolves to null; keep the stale usage so the line
@@ -652,8 +789,12 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
     ? `${rateBar(usage.tps)} ${paintRate(usage.tps, rate)} ${paint("primary", "TPS")}`
     : "";
   const now = Date.now();
-  const keyExpiry = await claudeStatusLineKeyExpiry(home, now);
-  const shortKeyExpiry = keyExpiry ? await claudeStatusLineKeyExpiry(home, now, { short: true }) : "";
+  // HOME, or USERPROFILE where HOME isn't set (Windows), as the mod writes it.
+  const statusHome = home || env.USERPROFILE || "";
+  const minted = home ? await readMintedKeyState(home).catch(() => null) : null;
+  const keyExpiry = await claudeStatusLineKeyExpiry(home, now, { minted });
+  const shortKeyExpiry = keyExpiry ? await claudeStatusLineKeyExpiry(home, now, { short: true, minted }) : "";
+  const creditStanding = await claudeStatusLineCreditStanding(statusHome, now, { env, minted });
   const usageParts = [
     bar || paint("secondary", slotLabel),
     usage && (usage.cost == null
@@ -674,13 +815,13 @@ export async function renderClaudeStatusLine(input = {}, { home = process.env.HO
   // The badge (while the account's Ultra-fast boost is on, recorded by the
   // banner mod) and the key-expiry warning lead, fitted to the terminal.
   const [line1, line2] = fitClaudeStatusLineRows({
-    // HOME, or USERPROFILE where HOME isn't set (Windows), as the mod writes it.
-    badge: await readUltrafastBadge(home || process.env.USERPROFILE || "", now),
+    badge: await readUltrafastBadge(statusHome, now),
     keyExpiry,
     shortKeyExpiry,
+    creditStanding,
     usage: usageParts,
     legend,
-    width: claudeStatusLineWidth(),
+    width: claudeStatusLineWidth(env),
   });
 
   return withStatusLineLogo([line1, line2].filter(Boolean)).join("\n");

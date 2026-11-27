@@ -1161,6 +1161,9 @@ export async function detectSecretBackend(home = process.env.HOME ?? "") {
  */
 export async function getSecret(home, { fresh = false, migrateMacItems = true } = {}) {
   if (useMemoryStore()) {
+    if (fresh && memoryBackend) {
+      memoryBackend.delete(memoryKey(SECRET_ACCOUNT));
+    }
     await ensureMemoryStoreLoaded(home);
     return memoryGet();
   }

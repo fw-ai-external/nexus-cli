@@ -42,7 +42,7 @@ import { promptYesNo } from "../auth/login/prompts.mjs";
  */
 
 /** Default poll cadence while waiting for an IDE quit. */
-export const IDE_QUIT_POLL_MS = 750;
+const IDE_QUIT_POLL_MS = 750;
 /** Give the user this long to quit before offering continue-anyway. */
 export const IDE_QUIT_WAIT_MS = 90_000;
 
@@ -95,7 +95,7 @@ function readLinuxCmdline(pid) {
  * @param {(cmdline: string) => boolean} cmdlineMatches
  * @returns {boolean}
  */
-export function anyLinuxPgrepHitMatches(pgrepOutput, cmdlineMatches) {
+function anyLinuxPgrepHitMatches(pgrepOutput, cmdlineMatches) {
   for (const pid of pgrepOutput.trim().split("\n")) {
     if (!pid) {
       continue;
@@ -144,7 +144,7 @@ export function darwinSpecCmdlineMatches(pattern) {
  * @param {(cmdline: string) => boolean} cmdlineMatches
  * @returns {boolean}
  */
-export function anyDarwinPgrepHitMatches(pgrepOutput, cmdlineMatches) {
+function anyDarwinPgrepHitMatches(pgrepOutput, cmdlineMatches) {
   for (const pid of pgrepOutput.trim().split("\n")) {
     if (!pid) {
       continue;
@@ -229,7 +229,7 @@ export function assertIdeStopped(spec, runningMessage, { force = false } = {}) {
  * }} options
  * @returns {Promise<void>}
  */
-export function waitForEnterConfirm({
+function waitForEnterConfirm({
   stdin,
   stdout,
   signal,

@@ -8,6 +8,7 @@ import {
   sumUsage,
 } from "./cost.mjs";
 import { usageCostDigits } from "./format.mjs";
+import { formatCreditStandingUsageLines } from "../../../fireworks/credit-standing.mjs";
 
 const ANTHROPIC_PRICING_DOCS_URL = "https://platform.claude.com/docs/en/about-claude/pricing";
 const OPENAI_PRICING_DOCS_URL = "https://openai.com/api/pricing";
@@ -105,6 +106,15 @@ function formatInteractiveEstimateNote(width, stream = stdout, { estimated = fal
   return lines
     .flatMap((line) => wrapPlainLine(line, width))
     .map((line) => dim(line, stream));
+}
+
+function formatCreditStandingBanner(creditIndicator, width, stream = stdout) {
+  const lines = formatCreditStandingUsageLines(creditIndicator);
+  if (lines.length === 0) return [];
+  const color = creditIndicator?.standing === "depleted" ? PRIMARY : ACCENT;
+  return lines
+    .flatMap((line) => wrapPlainLine(line, width))
+    .map((line) => paint(color, line, stream));
 }
 
 function fmtInt(value) {
@@ -597,7 +607,7 @@ function clampFocus(state, sessionCount) {
   };
 }
 
-function layerTableLimit(input, state, stream = stdout) {
+function layerTableLimit(input, state, stream = stdout, { creditIndicator = null } = {}) {
   const viewportRows = Number(stream.rows) > 0 ? Math.max(12, Number(stream.rows) - 1) : Infinity;
   if (!Number.isFinite(viewportRows) || !state.detailSessionId) return Infinity;
 
@@ -609,15 +619,17 @@ function layerTableLimit(input, state, stream = stdout) {
   const width = lineWidth(stream);
   const heroRows = formatHero({ totals: group.totals, calls: group.calls, sessions: sessions.length }, width, stream).length;
   const estimateRows = formatInteractiveEstimateNote(width, stream, { estimated: group.estimated, unpriced: group.unpriced }).length;
+  const creditBannerRows = formatCreditStandingBanner(creditIndicator, width, stream).length;
+  const creditRows = creditBannerRows > 0 ? creditBannerRows + 1 : 0;
   const modelRows = formatInteractiveModelBreakdown(report, width, stream).length;
   const nameRows = formatSessionNameLines(report, width, stream).length > 0 ? 2 : 0;
-  const fixedRows = 1 + 1 + estimateRows + 1 + heroRows + 1 + 1 + 1
+  const fixedRows = 1 + 1 + estimateRows + 1 + heroRows + creditRows + 1 + 1 + 1
     + 1 + nameRows + 1 + modelRows + 1 + 1
     + 5;
   return Math.max(1, viewportRows - fixedRows);
 }
 
-export function formatClaudeUsageInteractiveFrame(input, state = {}, { stream = stdout } = {}) {
+export function formatClaudeUsageInteractiveFrame(input, state = {}, { stream = stdout, creditIndicator = null } = {}) {
   const group = usageGroupFromInput(input);
   const sessions = group.sessions ?? [];
   if (sessions.length === 0) return "No Claude Code session usage found.";
@@ -630,12 +642,14 @@ export function formatClaudeUsageInteractiveFrame(input, state = {}, { stream = 
     ? "nexus usage · last 1 session"
     : `nexus usage · last ${sessions.length} sessions`;
   const maxCost = Math.max(...sessions.map((report) => report.grandTotals.cost), 0);
+  const creditBanner = formatCreditStandingBanner(creditIndicator, width, stream);
   const lines = [
     dim(title, stream),
     "",
     ...formatInteractiveEstimateNote(width, stream, { estimated: group.estimated, unpriced: group.unpriced }),
     "",
     ...formatHero({ totals: group.totals, calls: group.calls, sessions: sessions.length }, width, stream),
+    ...(creditBanner.length > 0 ? ["", ...creditBanner] : []),
     "",
     horizontalRule(width, stream),
     "",
@@ -671,12 +685,12 @@ export function formatClaudeUsageInteractiveFrame(input, state = {}, { stream = 
           lines.push(...formatRequestDetailRows(report, width, stream, {
             source: view.requestSource,
             offset: view.requestScrollOffset,
-            limit: layerTableLimit(input, view, stream),
+            limit: layerTableLimit(input, view, stream, { creditIndicator }),
           }));
         } else {
           lines.push(...formatSourceBreakdown(report, width, stream, {
             offset: view.sourceScrollOffset,
-            limit: layerTableLimit(input, view, stream),
+            limit: layerTableLimit(input, view, stream, { creditIndicator }),
             focusIndex: view.sourceFocusIndex,
           }));
         }
@@ -691,8 +705,8 @@ export function formatClaudeUsageInteractiveFrame(input, state = {}, { stream = 
   return lines.map((line) => fitLine(line, width)).join("\n");
 }
 
-function renderInteractiveFrame(input, state, { stream, previousHeight }) {
-  const frame = formatClaudeUsageInteractiveFrame(input, state, { stream });
+function renderInteractiveFrame(input, state, { stream, previousHeight, creditIndicator = null }) {
+  const frame = formatClaudeUsageInteractiveFrame(input, state, { stream, creditIndicator });
   const maxRows = Number(stream.rows) > 0 ? Math.max(12, Number(stream.rows) - 1) : Infinity;
   let lines = frame.split("\n");
   if (Number.isFinite(maxRows) && lines.length > maxRows) {
@@ -722,7 +736,7 @@ export function canRunClaudeUsageInteractiveDisplay({ input = stdin, stream = st
   return Boolean(input.isTTY && stream.isTTY);
 }
 
-export async function runClaudeUsageInteractiveDisplay(input, { stdin: in_ = stdin, stream = stdout } = {}) {
+export async function runClaudeUsageInteractiveDisplay(input, { stdin: in_ = stdin, stream = stdout, creditIndicator = null } = {}) {
   if (!canRunClaudeUsageInteractiveDisplay({ input: in_, stream })) return false;
 
   const group = usageGroupFromInput(input);
@@ -741,7 +755,7 @@ export async function runClaudeUsageInteractiveDisplay(input, { stdin: in_ = std
     requestSource: "",
     requestScrollOffset: 0,
   };
-  let previousHeight = renderInteractiveFrame(input, state, { stream, previousHeight: 0 });
+  let previousHeight = renderInteractiveFrame(input, state, { stream, previousHeight: 0, creditIndicator });
 
   await new Promise((resolve) => {
     let done = false;
@@ -750,7 +764,7 @@ export async function runClaudeUsageInteractiveDisplay(input, { stdin: in_ = std
     const wasRaw = in_.isRaw;
     const sessionAtFocus = () => group.sessions[state.focusIndex];
     const activeReport = () => group.sessions.find((report) => sessionId(report) === state.detailSessionId);
-    const tableLimit = () => layerTableLimit(input, state, stream);
+    const tableLimit = () => layerTableLimit(input, state, stream, { creditIndicator });
     const pageStep = () => Math.max(1, tableLimit() - 1);
     const sourceRowsForActiveReport = () => {
       const report = activeReport();
@@ -823,7 +837,7 @@ export async function runClaudeUsageInteractiveDisplay(input, { stdin: in_ = std
     const rerender = () => {
       if (state.detailSessionId && state.requestSource) state.requestScrollOffset = clamp(state.requestScrollOffset, 0, maxRequestOffset());
       if (state.detailSessionId && !state.requestSource) ensureSourceFocusVisible();
-      previousHeight = renderInteractiveFrame(input, state, { stream, previousHeight });
+      previousHeight = renderInteractiveFrame(input, state, { stream, previousHeight, creditIndicator });
     };
     const finish = () => {
       if (done) return;
@@ -1022,10 +1036,11 @@ function formatSessionDetail(report, title, width, stream = stdout) {
   return lines;
 }
 
-function formatSummary({ sessions, totals, calls, estimated, unpriced = 0 }, stream = stdout) {
+function formatSummary({ sessions, totals, calls, estimated, unpriced = 0, creditIndicator = null }, stream = stdout) {
   const width = lineWidth(stream);
   const lines = [];
   const hasNames = sessions.some((report) => Boolean(sessionName(report)));
+  const creditBanner = formatCreditStandingBanner(creditIndicator, width, stream);
 
   if (sessions.length === 1) {
     lines.push(...formatSessionDetail(sessions[0], "nexus usage · last 1 session", width, stream));
@@ -1054,6 +1069,9 @@ function formatSummary({ sessions, totals, calls, estimated, unpriced = 0 }, str
     }
   }
 
+  if (creditBanner.length > 0) {
+    lines.push("", ...creditBanner);
+  }
   lines.push(...formatEstimateFooter({ estimated, unpriced }, stream));
   return lines.join("\n");
 }
@@ -1086,7 +1104,7 @@ export async function playUsageIntroAnimation(stream = stdout) {
   stream.write("\u001b[5A");
 }
 
-export function formatClaudeUsageSummaryDisplay(report, { stream = stdout } = {}) {
+export function formatClaudeUsageSummaryDisplay(report, { stream = stdout, creditIndicator = null } = {}) {
   if (report.rows.length === 0 && (report.subagents ?? []).length === 0) {
     return `No assistant entries found in ${report.path}`;
   }
@@ -1096,10 +1114,11 @@ export function formatClaudeUsageSummaryDisplay(report, { stream = stdout } = {}
     calls: report.grandRequests,
     estimated: report.estimated,
     unpriced: report.unpriced,
+    creditIndicator,
   }, stream);
 }
 
-export function formatClaudeUsageReportsSummaryDisplay(reportGroup, { stream = stdout } = {}) {
+export function formatClaudeUsageReportsSummaryDisplay(reportGroup, { stream = stdout, creditIndicator = null } = {}) {
   const sessions = reportGroup.sessions ?? [];
   if (sessions.length === 0) return "No Claude Code session usage found.";
   return formatSummary({
@@ -1108,5 +1127,6 @@ export function formatClaudeUsageReportsSummaryDisplay(reportGroup, { stream = s
     calls: reportGroup.grandRequests,
     estimated: reportGroup.estimated,
     unpriced: reportGroup.unpriced,
+    creditIndicator,
   }, stream);
 }

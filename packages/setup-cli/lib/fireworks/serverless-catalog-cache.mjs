@@ -19,7 +19,7 @@ let snapshotResolved = false;
 
 // How long a persisted catalog snapshot is considered fresh before an eligible
 // command refreshes it from the network. Overridable for tests.
-export const DEFAULT_CATALOG_TTL_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_CATALOG_TTL_MS = 60 * 60 * 1000; // 1 hour
 export function catalogTtlMs() {
   const raw = Number(process.env.NEXUS_CATALOG_TTL_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CATALOG_TTL_MS;

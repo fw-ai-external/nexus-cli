@@ -11,6 +11,18 @@
 import "../lib/system/legacy-env.mjs";
 import process from "node:process";
 
-import { refreshPriceCaches } from "../lib/harnesses/claude/statusline-refresh.mjs";
+import { FIREWORKS_GATEWAY_URL } from "../lib/fireworks/models.mjs";
+import { refreshPriceCaches, resolveRunnerGatewayUrl } from "../lib/harnesses/claude/statusline-refresh.mjs";
 
-await refreshPriceCaches({ home: process.env.HOME ?? "" }).catch(() => {});
+if (process.env.NEXUS_TEST === "1" && process.env.NEXUS_PRICE_REFRESH_IN_TEST !== "1") {
+  process.exit(0);
+}
+
+await refreshPriceCaches({
+  home: process.env.HOME || process.env.USERPROFILE || "",
+  env: process.env,
+  gatewayUrl: resolveRunnerGatewayUrl(process.env, {
+    testOptInEnv: "NEXUS_PRICE_REFRESH_IN_TEST",
+    defaultGatewayUrl: FIREWORKS_GATEWAY_URL,
+  }),
+}).catch(() => {});
