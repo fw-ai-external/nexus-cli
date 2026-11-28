@@ -37,6 +37,7 @@ import { promptYesNo } from "../../auth/login/prompts.mjs";
 import { signInForKeyManagement } from "../../auth/login/sign-in-token.mjs";
 import { KEY_ACTIONS_VERSION, revokeViaWebApp, usePasteCode, webAuthorizeVersion } from "../../auth/web-authorize.mjs";
 
+import { clearCreditStandingCache } from "../../fireworks/credit-standing.mjs";
 import { KEYS_URL } from "../../auth/login/output.mjs";
 
 export { KEYS_URL };
@@ -626,6 +627,7 @@ async function logout(home, ctx, { tty = stdin.isTTY, confirm = promptYesNo, rev
     if (config.accountType !== "unknown") {
       await writeGlobalConfig(home, { accountType: "unknown" });
     }
+    clearCreditStandingCache(home);
     if (providersToClear.length) {
       await unsetAutoProviderKeys(home, providersToClear);
       console.log("Logged out — removed the saved provider keys from this machine.");
@@ -696,6 +698,7 @@ async function logout(home, ctx, { tty = stdin.isTTY, confirm = promptYesNo, rev
   if (minted) {
     await clearMintedKeyState(home);
   }
+  clearCreditStandingCache(home);
 
   if (!(await deleteSecret(home))) {
     throw keychainCopyLeftError();

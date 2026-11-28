@@ -5,7 +5,7 @@
  */
 
 /** Loopback host names as URL.hostname spells them. */
-export const LOOPBACK_HOSTNAMES = Object.freeze(["127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK_HOSTNAMES = Object.freeze(["127.0.0.1", "localhost", "[::1]"]);
 
 /** @param {string} hostname a URL.hostname */
 export function isLoopbackHostname(hostname) {

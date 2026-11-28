@@ -1,6 +1,13 @@
 {
   "releases": [
     {
+      "version": "0.12.3",
+      "highlights": [
+        "Code cleanup and small reliability fixes. The Claude Code status line's background price refresh always uses `api.fireworks.ai`, so a project's Claude Code settings can't send your Fireworks key to another server."
+      ],
+      "improvements": []
+    },
+    {
       "version": "0.12.2",
       "highlights": [
         "Code cleanup and small reliability fixes. After `nexus codex off` and `nexus codex on`, Nexus keeps the Fireworks pet for your next Codex session if the saved pet status is still current."

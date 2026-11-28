@@ -10,10 +10,7 @@
 
 import process, { stdin, stdout } from "node:process";
 
-import {
-  attachAgentBackKey,
-  promptClaudeUsageAgent,
-} from "./agent-picker.mjs";
+import { attachAgentBackKey, promptClaudeUsageAgent } from "./agent-picker.mjs";
 import { listSessionAgents } from "./agents.mjs";
 import { sumCosts } from "./cost.mjs";
 import { findClaudeSessionLog } from "./report.mjs";
@@ -127,13 +124,15 @@ export async function runClaudeUsageLive({
   sessionLabelOf,
   refreshServed,
   harnessName = "Claude Code",
+  creditIndicator = null,
+  readCreditIndicator,
 } = {}) {
   if (!home) {
     throw new Error(`HOME is required to follow ${harnessName} session usage.`);
   }
 
-
   let sessionPath = await resolveSession({ home, session });
+  let activeCredit = creditIndicator;
   /** Meter options every run of this session shares. */
   const harnessMeterOptions = () => ({
     ...(translate ? { translate } : {}),
@@ -149,6 +148,8 @@ export async function runClaudeUsageLive({
       }
       : {}),
     ...(harnessName !== "Claude Code" ? { harnessName } : {}),
+    ...(activeCredit ? { creditIndicator: activeCredit } : {}),
+    ...(readCreditIndicator ? { readCreditIndicator } : {}),
   });
   // `listAgents` prices every subagent log in the session, so back-to-back
   // callers (find Main, then compute the first frame's peer total) would read
@@ -308,7 +309,7 @@ export async function runClaudeUsageLive({
       });
       // Stop repainting a dashboard whose run has ended.
       repaint = null;
-      void db;
+      activeCredit = readCreditIndicator ? null : db.creditIndicator;
     } finally {
       repaint = null;
       detach();

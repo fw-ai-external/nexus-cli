@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { describe } from "node:test";
 import assert from "node:assert/strict";
 
 import { fireconnectSecretId, findFireconnectProvider } from "../../../lib/harnesses/vscode/core.mjs";

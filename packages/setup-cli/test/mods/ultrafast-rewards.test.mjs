@@ -253,6 +253,10 @@ describe("the key and the mock", () => {
   test("finds the key where `nexus claude on` writes it", () => {
     assert.equal(fireworksKeyFromEnv({ ANTHROPIC_CUSTOM_HEADERS: "X-Other: 1\nX-Fireworks-Api-Key: fw_abc" }), "fw_abc");
     assert.equal(fireworksKeyFromEnv({ ANTHROPIC_CUSTOM_HEADERS: "x-fireworks-api-key:fw_lower" }), "fw_lower");
+    assert.equal(
+      fireworksKeyFromEnv({ ANTHROPIC_API_KEY: "fw_stale", ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: fw_header" }),
+      "fw_header",
+    );
     assert.equal(fireworksKeyFromEnv({ ANTHROPIC_API_KEY: "fw_direct" }), "fw_direct");
     assert.equal(fireworksKeyFromEnv({ ANTHROPIC_API_KEY: "sk-ant-not-fireworks" }), "");
     assert.equal(fireworksKeyFromEnv({ ANTHROPIC_CUSTOM_HEADERS: "X-Fireworks-Api-Key: not-a-key" }), "");

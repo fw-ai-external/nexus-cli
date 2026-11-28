@@ -25,7 +25,7 @@ import {
 } from "../../../lib/harnesses/vscode/core.mjs";
 import { detectVscodeInstall } from "../../../lib/harnesses/vscode/install.mjs";
 import vscode from "../../../lib/harnesses/vscode/index.mjs";
-import { FIRECONNECT_REFERER, isolatedProfileEnv, runCli, runCliJson, supportsVscodeSqlite, withIsolatedProfileEnv, withTempHome, itIfSqlite, mockServerlessModel, mockServerlessModelRows } from "../../helpers.mjs";
+import { FIRECONNECT_REFERER, isolatedProfileEnv, runCli, runCliJson, supportsVscodeSqlite, withIsolatedProfileEnv, withTempHome, itIfSqlite, mockServerlessModelRows } from "../../helpers.mjs";
 import { buildServerlessCatalogSnapshot } from "../../../lib/fireworks/models.mjs";
 import { setServerlessCatalogSnapshot } from "../../../lib/fireworks/serverless-catalog-cache.mjs";
 import { ensureItemTable, readItemTableValue, writeItemTableValue } from "../../../lib/harnesses/vscode/vscdb-sqlite.mjs";

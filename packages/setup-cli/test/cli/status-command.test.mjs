@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { statSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import process from "node:process";
 import { after, before, describe, it } from "node:test";
 import { HARNESSES } from "../../lib/harness/id.mjs";
 import { runCli, runCliJson, seedKeychainConfig, withTempHome, writeClaudeSettings } from "../helpers.mjs";
 import { writeMintedKeyState } from "../../lib/keys/mint-api-key.mjs";
+import {
+  NEXUS_BILLING_URL,
+  creditKeyFingerprint,
+  creditStandingLastAttemptPath,
+  refreshCreditStandingCache,
+  writeCreditStandingCache,
+} from "../../lib/fireworks/credit-standing.mjs";
 
 const VALID_KEY = "fw_status_test_key_0000000000000000";
 const REJECTED_KEY = "fw_status_rejected_key_0000000000";
@@ -223,6 +232,7 @@ describe("fireconnect status", () => {
       assert.match(help.stdout, /status\s+Show sign-in state, environment, key storage, and each harness/);
       const topic = await runCli(["help", "status"], { home });
       assert.match(topic.stdout, /--json/);
+      assert.match(topic.stdout, /--verbose/);
     });
   });
 
@@ -329,5 +339,170 @@ describe("fireconnect status", () => {
         assert.equal(typeof h.installed, "boolean", h.id);
       }
     });
+  });
+
+  it("reports Nexus plan credit standing in status text and --json when capped", async () => {
+    await withTempHome("status-credits-", async (home) => {
+      await seedKeychainConfig(home, VALID_KEY);
+      const fp = creditKeyFingerprint(VALID_KEY);
+
+      // Under cap -> no Plan credits field.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 40,
+        sessionUsedPercent: 80,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      const underCap = await runCli(["status"], { home, env: gatewayEnv });
+      assert.equal(underCap.code, 0, underCap.stderr);
+      assert.doesNotMatch(underCap.stdout, /Plan credits:|using credits|credits used up/);
+
+      // Capped + ACTIVE + UNSUSPENDED -> using credits.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 40,
+        sessionUsedPercent: 100,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      const activeText = await runCli(["status"], { home, env: gatewayEnv });
+      assert.equal(activeText.code, 0, activeText.stderr);
+      assert.match(activeText.stdout, /Plan credits:\s+using credits \(5-hour plan limit reached\)/);
+      const activeJson = await runCliJson(["status", "--json"], { home, env: gatewayEnv });
+      assert.equal(activeJson.code, 0, activeJson.stderr);
+      assert.deepEqual(activeJson.json.creditStanding, {
+        status: "available",
+        limit: "session",
+        label: "using credits",
+      });
+
+      // Capped + ACTIVE + CREDIT_DEPLETED -> credits used up + Billing URL.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 20,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+      const depletedText = await runCli(["status"], { home, env: gatewayEnv });
+      assert.equal(depletedText.code, 0, depletedText.stderr);
+      assert.match(depletedText.stdout, /Plan credits:\s+credits used up/);
+      assert.ok(depletedText.stdout.includes(NEXUS_BILLING_URL), depletedText.stdout);
+      const depletedJson = await runCliJson(["status", "--json"], { home, env: gatewayEnv });
+      assert.equal(depletedJson.code, 0, depletedJson.stderr);
+      assert.deepEqual(depletedJson.json.creditStanding, {
+        status: "depleted",
+        limit: "monthly",
+        label: "credits used up",
+        billingUrl: NEXUS_BILLING_URL,
+      });
+    });
+  });
+
+  it("records 0600 non-PII diagnostics on account 403 / refresh 500 and surfaces them in status --verbose", async () => {
+    const userName = `accounts/${ACCOUNT}/users/dev`;
+    let accountStatus = 403;
+    let usageStatus = 200;
+    const creditGateway = createServer((req, res) => {
+      if (req.url === `/v1/${userName}/nexusPlanUsage`) {
+        res.writeHead(usageStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          monthly: { usedPercent: 100 },
+          rollingWindow: { usedPercent: 20 },
+          overageStatus: "OVERAGE_STATUS_ACTIVE",
+        }));
+        return;
+      }
+      if (req.url === `/v1/accounts/${ACCOUNT}`) {
+        res.writeHead(accountStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(
+          accountStatus === 200
+            ? { name: `accounts/${ACCOUNT}`, suspendState: "UNSUSPENDED", organization: "" }
+            : { message: `forbidden for ${ACCOUNT} ${EMAIL}` },
+        ));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise((resolve) => creditGateway.listen(0, "127.0.0.1", resolve));
+    const creditUrl = `http://127.0.0.1:${creditGateway.address().port}`;
+    try {
+      await withTempHome("status-credit-verbose-", async (home) => {
+        await seedKeychainConfig(home, VALID_KEY);
+        await writeMintedKeyState(home, {
+          keyId: "key-1",
+          userName,
+          displayName: "nexus-cli-test",
+          apiKey: VALID_KEY,
+        });
+        const fp = creditKeyFingerprint(VALID_KEY);
+        const diagFile = creditStandingLastAttemptPath(home, fp);
+
+        // 1. Account endpoint returns 403 (2m ago) -> 0600 file with zero PII.
+        await refreshCreditStandingCache({
+          home,
+          apiKey: VALID_KEY,
+          gatewayUrl: creditUrl,
+          now: Date.now() - 120_000,
+        });
+        if (process.platform !== "win32") {
+          assert.equal(statSync(diagFile).mode & 0o777, 0o600);
+        }
+        const raw = readFileSync(diagFile, "utf8");
+        assert.doesNotMatch(raw, new RegExp(VALID_KEY));
+        assert.doesNotMatch(raw, new RegExp(`${ACCOUNT}|${EMAIL}|dev`));
+
+        // Default `nexus status` stays quiet without --verbose.
+        const quiet = await runCli(["status"], { home, env: gatewayEnv });
+        assert.equal(quiet.code, 0, quiet.stderr);
+        assert.doesNotMatch(quiet.stdout, /Plan credits:/);
+
+        // `nexus status --verbose` and `-v` surface the sanitized diagnostic line.
+        for (const flag of ["--verbose", "-v"]) {
+          const verbose = await runCli(["status", flag], { home, env: gatewayEnv });
+          assert.equal(verbose.code, 0, verbose.stderr);
+          assert.match(verbose.stdout, /Plan credits:\s+unknown \(account lookup returned 403, 2m ago\)/);
+        }
+
+        // 2. Plan usage endpoint returns 500 -> verbose shows 500 error diagnostic.
+        usageStatus = 500;
+        await refreshCreditStandingCache({
+          home,
+          apiKey: VALID_KEY,
+          gatewayUrl: creditUrl,
+          now: Date.now(),
+        });
+        const verbose500 = await runCli(["status", "--verbose"], { home, env: gatewayEnv });
+        assert.equal(verbose500.code, 0, verbose500.stderr);
+        assert.match(verbose500.stdout, /Plan credits:\s+unknown \(plan usage lookup returned 500, just now\)/);
+
+        // 3. Confirmed standing clears the diagnostic and renders normal Plan credits line.
+        usageStatus = 200;
+        accountStatus = 200;
+        await refreshCreditStandingCache({
+          home,
+          apiKey: VALID_KEY,
+          gatewayUrl: creditUrl,
+          now: Date.now(),
+        });
+        const recovered = await runCli(["status", "--verbose"], { home, env: gatewayEnv });
+        assert.equal(recovered.code, 0, recovered.stderr);
+        assert.match(recovered.stdout, /Plan credits:\s+using credits \(monthly plan limit reached\)/);
+        assert.doesNotMatch(recovered.stdout, /unknown \(/);
+      });
+    } finally {
+      await new Promise((resolve) => creditGateway.close(resolve));
+    }
   });
 });

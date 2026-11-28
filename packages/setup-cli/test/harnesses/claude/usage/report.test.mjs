@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +17,15 @@ import {
   readClaudeUsages,
   usageReportFromText,
 } from "../../../../lib/harnesses/claude/usage/report.mjs";
-import { runFireconnect } from "../../../helpers.mjs";
+import { mockServerlessModel, runFireconnect, withTempHome, withTempHomeEnv } from "../../../helpers.mjs";
+import {
+  NEXUS_BILLING_URL,
+  creditKeyFingerprint,
+  writeCreditStandingCache,
+} from "../../../../lib/fireworks/credit-standing.mjs";
+import { deletePersistedCatalogCache } from "../../../../lib/fireworks/serverless-catalog-cache.mjs";
+import { writeMintedKeyState } from "../../../../lib/keys/mint-api-key.mjs";
+import { deletePersistedListPriceCache } from "../../../../lib/pricing/list-price-cache.mjs";
 
 function jsonl(entries) {
   return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
@@ -1096,5 +1105,251 @@ describe("claude usage", () => {
     assert.equal(parsed.requests, 1);
     assert.equal(parsed.rows[0].model, "claude-opus-4-8");
     assert.equal(parsed.rows[0].rates.inputPerMillion, 5);
+    assert.equal(parsed.creditStanding, undefined);
+  });
+
+  it("shows credit standing and billing URL across nexus claude usage outputs when capped", async () => {
+    await withTempHome("claude-usage-credits", async (home) => {
+      const key = "fw_example_usage_key_00000000000";
+      const fp = creditKeyFingerprint(key);
+      await writeMintedKeyState(home, {
+        keyId: "key-1",
+        userName: "accounts/example-account/users/example-user",
+        displayName: "nexus-cli-test",
+        apiKey: key,
+      });
+      const claudeDir = path.join(home, ".claude");
+      const settingsPath = path.join(claudeDir, "settings.json");
+      const projectDir = path.join(claudeDir, "projects", "repo");
+      await mkdir(projectDir, { recursive: true });
+      await writeFile(path.join(projectDir, "9b86bac5-1234-4234-9234-123456789abc.jsonl"), jsonl([
+        {
+          type: "assistant",
+          message: {
+            id: "msg_1",
+            model: "claude-opus-4-8",
+            usage: { input_tokens: 20, output_tokens: 40 },
+          },
+        },
+      ]));
+
+      // Store the key and configure Claude with Nexus's apiKeyHelper so credit lookup
+      // binds to the active session's credential (never unrelated browser state).
+      const login = await runFireconnect(["login", "--api-key", key], { HOME: home, FIREWORKS_API_KEY: "" });
+      assert.equal(login.code, 0, login.stderr);
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "nexus key export" }));
+
+      // Under cap -> no credit notice in text or JSON.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 50,
+        sessionUsedPercent: 80,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      const underCap = await runFireconnect(["claude", "usage", "--session", "9b86", "--plain"], { HOME: home });
+      assert.equal(underCap.code, 0, underCap.stderr);
+      assert.doesNotMatch(underCap.stdout, /using credits|credits used up|settings\/billing/);
+
+      // Capped + ACTIVE + UNSUSPENDED -> using credits in --plain, --verbose, and --json.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 60,
+        sessionUsedPercent: 100,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "UNSUSPENDED",
+        ownsWallet: true,
+      });
+      const activePlain = await runFireconnect(["claude", "usage", "--session", "9b86", "--plain"], { HOME: home });
+      assert.equal(activePlain.code, 0, activePlain.stderr);
+      assert.match(activePlain.stdout, /5-hour plan limit reached — using credits/);
+      const activeVerbose = await runFireconnect(["claude", "usage", "--session", "9b86", "--verbose"], { HOME: home });
+      assert.equal(activeVerbose.code, 0, activeVerbose.stderr);
+      assert.match(activeVerbose.stdout, /5-hour plan limit reached — using credits/);
+      const activeJson = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], { HOME: home });
+      assert.equal(activeJson.code, 0, activeJson.stderr);
+      assert.deepEqual(JSON.parse(activeJson.stdout).creditStanding, {
+        status: "available",
+        limit: "session",
+        label: "using credits",
+      });
+
+      // Capped + ACTIVE + CREDIT_DEPLETED -> credits used up + Billing URL.
+      writeCreditStandingCache(home, {
+        fetchedAt: Date.now(),
+        keyFingerprint: fp,
+        status: "ok",
+        monthlyUsedPercent: 100,
+        sessionUsedPercent: 20,
+        overageStatus: "OVERAGE_STATUS_ACTIVE",
+        suspendState: "CREDIT_DEPLETED",
+        ownsWallet: true,
+      });
+      const depletedSummary = await runFireconnect(["claude", "usage", "--session", "9b86"], { HOME: home });
+      assert.equal(depletedSummary.code, 0, depletedSummary.stderr);
+      assert.match(depletedSummary.stdout, /credits used up/);
+      assert.ok(depletedSummary.stdout.includes(NEXUS_BILLING_URL), depletedSummary.stdout);
+      const depletedJson = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], { HOME: home });
+      assert.equal(depletedJson.code, 0, depletedJson.stderr);
+      assert.deepEqual(JSON.parse(depletedJson.stdout).creditStanding, {
+        status: "depleted",
+        limit: "monthly",
+        label: "credits used up",
+        billingUrl: NEXUS_BILLING_URL,
+      });
+
+      // Kill switch suppresses credit standing completely.
+      const disabled = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], {
+        HOME: home,
+        NEXUS_CREDIT_STATUS: "0",
+      });
+      assert.equal(disabled.code, 0, disabled.stderr);
+      assert.equal(JSON.parse(disabled.stdout).creditStanding, undefined);
+
+      // Custom third-party apiKeyHelper and unconfigured sessions must NEVER display browser-minted credits.
+      await writeMintedKeyState(home, {
+        keyId: "key-1",
+        userName: "accounts/example-account/users/example-user",
+        displayName: "nexus-cli-test",
+        apiKey: key,
+      });
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "/usr/local/bin/my-vault-helper" }));
+      const customHelperJson = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], { HOME: home });
+      assert.equal(customHelperJson.code, 0, customHelperJson.stderr);
+      assert.equal(JSON.parse(customHelperJson.stdout).creditStanding, undefined);
+
+      await writeFile(settingsPath, JSON.stringify({ env: {} }));
+      const unconfiguredJson = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], { HOME: home });
+      assert.equal(unconfiguredJson.code, 0, unconfiguredJson.stderr);
+      assert.equal(JSON.parse(unconfiguredJson.stdout).creditStanding, undefined);
+
+      // Restore Nexus helper, then verify logout clears the stored key and cached credit standing.
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "nexus key export" }));
+      const logout = await runFireconnect(["logout"], { HOME: home, FIREWORKS_API_KEY: "" });
+      assert.equal(logout.code, 0, logout.stderr);
+      const afterLogout = await runFireconnect(["claude", "usage", "--session", "9b86", "--json"], { HOME: home });
+      assert.equal(afterLogout.code, 0, afterLogout.stderr);
+      assert.equal(JSON.parse(afterLogout.stdout).creditStanding, undefined);
+    });
+  });
+
+  it("never sends the stored key to an env-selected gateway during pricing warm, while warming with Claude's configured key even when NEXUS_CREDIT_STATUS=0", async () => {
+    const storedKey = "fw_example_pricing_warm_stored_0";
+    const claudeHeaderKey = "fw_example_pricing_warm_header_0";
+    const catalogOnlyModel = "accounts/fireworks/models/nx780-catalog-only-model";
+    const catalogAuthHeaders = [];
+    const server = createServer((req, res) => {
+      if (req.url === "/verifyApiKey") {
+        res.writeHead(200, {
+          "x-fireworks-account-id": "example-account",
+          "x-fireworks-developer-email": "user@example.com",
+        });
+        res.end();
+        return;
+      }
+      if (req.url?.startsWith("/v1/serverless/models")) {
+        catalogAuthHeaders.push(req.headers.authorization ?? "");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          data: [
+            mockServerlessModel({
+              id: catalogOnlyModel,
+              display_name: "NX780 Catalog Model",
+              pricing: [
+                { sku: "LLM input tokens (uncached)", amount: "10", unit: "1M tokens" },
+                { sku: "LLM input tokens (cached)", amount: "1", unit: "1M tokens" },
+                { sku: "LLM output tokens", amount: "20", unit: "1M tokens" },
+              ],
+            }),
+          ],
+        }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+
+    try {
+      await withTempHomeEnv("claude-usage-stored-key-pricing", async (home) => {
+        const login = await runFireconnect(["login", "--api-key", storedKey], {
+          HOME: home,
+          FIREWORKS_API_KEY: "",
+          NEXUS_GATEWAY_URL: gatewayUrl,
+          NEXUS_PLAN_CATALOG_FILTER: "0",
+          NEXUS_ULTRAFAST_STANDARD_PRICING: "0",
+        });
+        assert.equal(login.code, 0, login.stderr);
+
+        // Remove the persisted catalog & list-price caches seeded by login so
+        // only a live pricing warm during `claude usage` can price the model.
+        deletePersistedCatalogCache();
+        deletePersistedListPriceCache();
+        catalogAuthHeaders.length = 0;
+
+        const projectDir = path.join(home, ".claude", "projects", "repo");
+        await mkdir(projectDir, { recursive: true });
+        await writeFile(path.join(projectDir, "7c86bac5-1234-4234-9234-123456789abc.jsonl"), jsonl([
+          {
+            type: "assistant",
+            message: {
+              id: "msg_1",
+              model: catalogOnlyModel,
+              usage: { input_tokens: 1_000_000, output_tokens: 500_000 },
+            },
+          },
+        ]));
+
+        const runEnv = {
+          HOME: home,
+          FIREWORKS_API_KEY: "",
+          NEXUS_CREDIT_STATUS: "0",
+          NEXUS_GATEWAY_URL: gatewayUrl,
+          NEXUS_PLAN_CATALOG_FILTER: "0",
+          NEXUS_ULTRAFAST_STANDARD_PRICING: "0",
+        };
+        const settingsPath = path.join(home, ".claude", "settings.json");
+
+        // 1. Unconfigured Claude, custom helper, AND Nexus apiKeyHelper must NEVER
+        //    send the machine's stored key to an env-selected NEXUS_GATEWAY_URL.
+        for (const settings of [
+          null,
+          { apiKeyHelper: "/usr/local/bin/custom-vault-helper" },
+          { apiKeyHelper: "nexus key export" },
+        ]) {
+          if (settings) await writeFile(settingsPath, JSON.stringify(settings));
+          const run = await runFireconnect(["claude", "usage", "--session", "7c86", "--json"], runEnv);
+          assert.equal(run.code, 0, run.stderr);
+          const parsedRun = JSON.parse(run.stdout);
+          assert.equal(parsedRun.creditStanding, undefined);
+          assert.deepEqual(catalogAuthHeaders, []);
+          assert.equal(parsedRun.rows[0].cost, null);
+        }
+
+        // 2. Claude's own configured header key warms pricing even when credit
+        //    status is disabled, pricing the previously-unpriced model.
+        await writeFile(settingsPath, JSON.stringify({
+          env: { ANTHROPIC_CUSTOM_HEADERS: `X-Fireworks-Api-Key: ${claudeHeaderKey}` },
+        }));
+        const result = await runFireconnect(["claude", "usage", "--session", "7c86", "--json"], runEnv);
+        assert.equal(result.code, 0, result.stderr);
+        const parsed = JSON.parse(result.stdout);
+        assert.equal(parsed.creditStanding, undefined);
+        assert.ok(
+          catalogAuthHeaders.includes(`Bearer ${claudeHeaderKey}`),
+          `expected /v1/serverless/models fetch with Claude's configured key, saw: ${JSON.stringify(catalogAuthHeaders)}`,
+        );
+        assert.equal(catalogAuthHeaders.includes(`Bearer ${storedKey}`), false);
+        assert.equal(parsed.rows[0].cost, 20);
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });

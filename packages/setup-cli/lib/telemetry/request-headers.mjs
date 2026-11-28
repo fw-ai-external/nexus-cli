@@ -88,7 +88,7 @@ export function hasFireconnectAttributionHeader(headers) {
   ) || isLegacyFireconnectUserAgent(name, value));
 }
 
-export function stripFireconnectTelemetryHeaders(headers = {}) {
+function stripFireconnectTelemetryHeaders(headers = {}) {
   return Object.fromEntries(
     Object.entries(headers).filter(
       ([name, value]) => !MANAGED_NAMES.has(name.toLowerCase())

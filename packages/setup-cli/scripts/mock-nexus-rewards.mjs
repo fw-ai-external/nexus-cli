@@ -10,6 +10,11 @@
  *
  *   NEXUS_ULTRAFAST_MOCK_URL=http://127.0.0.1:8799 claude
  *
+ * or OpenCode 2.x (after `nexus opencode on`), whose Nexus plugin plays the
+ * same banner:
+ *
+ *   NEXUS_ULTRAFAST_MOCK_URL=http://127.0.0.1:8799 opencode
+ *
  * The mod sends a placeholder key to a loopback mock, never the user's
  * Fireworks key, so nothing secret reaches whatever listens on this port, and
  * checks it every few seconds instead of every two minutes.

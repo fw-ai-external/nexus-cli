@@ -139,11 +139,15 @@ class FireworksHttpError extends Error {
  * @param {string} apiKey
  * @param {AbortSignal} [signal] Shared deadline for every attempt; when
  *   omitted each attempt gets the standard 30s gateway budget.
+ * @param {string} [gatewayUrl] Explicit gateway origin overriding
+ *   `NEXUS_GATEWAY_URL` (used by credential-pinned callers).
  */
-async function fetchGatewayPage(path, apiKey, signal) {
+async function fetchGatewayPage(path, apiKey, signal, gatewayUrl = "") {
   // Same dev/test override as verify-api-key.mjs — lets the mock gateway
-  // serve the catalog in specs.
-  const gatewayUrl = process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL;
+  // serve the catalog in specs. Callers that pin to the official gateway pass
+  // an explicit `gatewayUrl` so untrusted env overrides are ignored.
+  const resolvedGatewayUrl = (gatewayUrl?.trim() || process.env.NEXUS_GATEWAY_URL?.trim() || FIREWORKS_GATEWAY_URL)
+    .replace(/\/+$/, "");
   // The serverless listing is read-only and occasionally returns a transient
   // 5xx ("Error listing serverless models" from the Fireworks API). Retry once
   // so a single blip doesn't force every harness `on` into offline mode.
@@ -157,7 +161,7 @@ async function fetchGatewayPage(path, apiKey, signal) {
     if (attempt > 0) {
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
-    const response = await fetch(`${gatewayUrl}${path}`, {
+    const response = await fetch(`${resolvedGatewayUrl}${path}`, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         Accept: "application/json",
@@ -253,7 +257,7 @@ export function parseSkuPricing(skuInfos = []) {
  * @param {{ supportsImageInput?: boolean, supports_image_input?: boolean, inputModalities?: string[], input_modalities?: string[] }} model
  * @returns {boolean}
  */
-export function hasModalitySignal(model) {
+function hasModalitySignal(model) {
   const explicit = model.inputModalities ?? model.input_modalities;
   if (Array.isArray(explicit) && explicit.length > 0) {
     return true;
@@ -309,7 +313,7 @@ function buildPricingRecord(id, label, rates, tier) {
 }
 
 /** Newer `created` first; null timestamps sort last, then by shortId. */
-export function byRecencyThenShortId(left, right) {
+function byRecencyThenShortId(left, right) {
   const l = left?.created ?? 0;
   const r = right?.created ?? 0;
   if (l !== r) {
@@ -685,7 +689,7 @@ function dedupeCatalog(entries) {
  * with the retry) only to serve the cached snapshot anyway. Cold starts keep
  * the full per-request budget so a first `on` still gets a real catalog.
  */
-export const CACHED_CATALOG_FETCH_TIMEOUT_MS = 3_000;
+const CACHED_CATALOG_FETCH_TIMEOUT_MS = 3_000;
 
 export function cachedCatalogFetchTimeoutMs() {
   const raw = Number(process.env.NEXUS_CATALOG_CACHED_FETCH_TIMEOUT_MS);
@@ -698,11 +702,11 @@ function hasUsableCatalogCache(cache) {
 
 /**
  * @param {string} apiKey
- * @param {{ cacheAvailable?: boolean }} [options] Whether a cached snapshot
+ * @param {{ cacheAvailable?: boolean, gatewayUrl?: string }} [options] Whether a cached snapshot
  *   backs this fetch; read from disk when omitted. With one, the listing is
  *   bounded by {@link cachedCatalogFetchTimeoutMs} and callers fall back to it.
  */
-export async function fetchServerlessCatalog(apiKey, { cacheAvailable } = {}) {
+export async function fetchServerlessCatalog(apiKey, { cacheAvailable, gatewayUrl = "" } = {}) {
   const bounded = cacheAvailable ?? hasUsableCatalogCache(readCatalogCache());
   const signal = bounded ? AbortSignal.timeout(cachedCatalogFetchTimeoutMs()) : undefined;
   // The plan is only needed for the auto-only catalog and for Ultra-fast
@@ -719,9 +723,9 @@ export async function fetchServerlessCatalog(apiKey, { cacheAvailable } = {}) {
     ? { tier: previous.snapshot?.planTier ?? "", state: previous.snapshot?.planState ?? "" }
     : { tier: "", state: "" };
   const [models, plan] = await Promise.all([
-    fetchServerlessCatalogRaw(apiKey, { signal }),
+    fetchServerlessCatalogRaw(apiKey, { signal, gatewayUrl }),
     planNeeded
-      ? fetchNexusPlan(apiKey, { timeoutMs: bounded ? cachedCatalogFetchTimeoutMs() : 0 })
+      ? fetchNexusPlan(apiKey, { timeoutMs: bounded ? cachedCatalogFetchTimeoutMs() : 0, gatewayUrl })
       : Promise.resolve({ catalogTier: "", tier: "", state: "" }),
   ]);
   const autoOnly = planTierLimitsCatalogToAuto(plan ? plan.catalogTier : null);
@@ -813,9 +817,9 @@ export function buildPickerCatalogFromApiModels(apiModels) {
 
 /**
  * @param {string} apiKey
- * @param {{ signal?: AbortSignal }} [options] Deadline shared by every page.
+ * @param {{ signal?: AbortSignal, gatewayUrl?: string }} [options] Deadline shared by every page.
  */
-export async function fetchServerlessCatalogRaw(apiKey, { signal } = {}) {
+export async function fetchServerlessCatalogRaw(apiKey, { signal, gatewayUrl = "" } = {}) {
   const models = [];
   let pageToken = "";
 
@@ -824,7 +828,7 @@ export async function fetchServerlessCatalogRaw(apiKey, { signal } = {}) {
     if (pageToken) {
       query.set("pageToken", pageToken);
     }
-    const page = await fetchGatewayPage(`/v1/serverless/models?${query}`, apiKey, signal);
+    const page = await fetchGatewayPage(`/v1/serverless/models?${query}`, apiKey, signal, gatewayUrl);
     models.push(...(page.data ?? []));
     pageToken = page.nextPageToken ?? page.next_page_token ?? "";
   } while (pageToken);
@@ -1158,7 +1162,7 @@ function catalogFetchFailureReason(error) {
   return `Couldn't reach Fireworks (${error?.message || "network error"}). Check your network connection.`;
 }
 
-export async function loadServerlessCatalog({ apiKey, refresh = false, bounded = false }) {
+export async function loadServerlessCatalog({ apiKey, refresh = false, bounded = false, gatewayUrl = "" }) {
   // `bounded` caps the fetch at the cached-catalog budget even with no cache
   // to fall back on, for callers that only refresh opportunistically.
   // `apiKey` may be a resolver, called only when the catalog must be fetched:
@@ -1219,6 +1223,7 @@ export async function loadServerlessCatalog({ apiKey, refresh = false, bounded =
     void refreshListPriceCache({ force: refresh });
     const { catalog, rawModels, routersUnavailable, updatedAt } = await fetchServerlessCatalog(resolvedKey, {
       cacheAvailable: bounded || hasUsableCatalogCache(fallback),
+      gatewayUrl,
     });
     return {
       apiKey: resolvedKey,

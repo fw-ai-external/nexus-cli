@@ -14,8 +14,17 @@ import {
   FIRECONNECT_TELEMETRY_HEADER_NAMES,
   stripFireconnectTelemetryHeaderLines,
 } from "../telemetry/request-headers.mjs";
+import {
+  FIREROUTER_FIREWORKS_HEADER,
+  customHeaderValue,
+  fireworksKeyFromCustomHeaders,
+} from "./custom-headers.mjs";
 
-export const FIREROUTER_FIREWORKS_HEADER = "X-Fireworks-Api-Key";
+export {
+  FIREROUTER_FIREWORKS_HEADER,
+  customHeaderValue,
+  fireworksKeyFromCustomHeaders,
+};
 /** Fireworks key header FireConnect before 0.9 wrote in router mode. */
 export const LEGACY_FIREROUTER_FIREWORKS_HEADER = "x-firerouter-fireworks-key";
 export const AUTO_TAGLINE =
@@ -119,41 +128,6 @@ export function stripFirerouterOwnedEnv(env) {
     }
   }
   return { env: nextEnv, changed };
-}
-
-/**
- * Extract the Fireworks key value from an ANTHROPIC_CUSTOM_HEADERS string
- * (matches X-Fireworks-Api-Key or the legacy header name). Returns "" when
- * absent. Used to resolve the harness-local key now that Claude direct mode
- * authenticates via the custom header rather than apiKeyHelper.
- * @param {unknown} value
- * @returns {string}
- */
-/**
- * Extract the first matching header line's value from an ANTHROPIC_CUSTOM_HEADERS
- * string (case-insensitive on the header name). Returns "" when absent.
- * @param {unknown} value
- * @param {string[]} headerNames
- * @returns {string}
- */
-export function customHeaderValue(value, headerNames) {
-  if (typeof value !== "string") {
-    return "";
-  }
-  const wanted = headerNames.map((name) => name.toLowerCase());
-  for (const line of value.split("\n")) {
-    const colon = line.indexOf(":");
-    if (colon === -1) continue;
-    const name = line.slice(0, colon).trim().toLowerCase();
-    if (wanted.includes(name)) {
-      return line.slice(colon + 1).trim();
-    }
-  }
-  return "";
-}
-
-export function fireworksKeyFromCustomHeaders(value) {
-  return customHeaderValue(value, [FIREROUTER_FIREWORKS_HEADER]);
 }
 
 /**

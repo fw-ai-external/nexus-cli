@@ -40,7 +40,7 @@ export function printHarnessRows(rows, { indent = "  ", style = bold } = {}) {
   }
 }
 
-export const HARNESSES_DEPRECATION_MESSAGE =
+const HARNESSES_DEPRECATION_MESSAGE =
   "`nexus harnesses` is deprecated: `nexus status` lists every harness with whether it's on and installed.";
 
 /**

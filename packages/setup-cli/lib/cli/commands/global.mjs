@@ -434,6 +434,7 @@ export function printHelp(topic = "") {
       "",
       optBlock("Options", [
         ["--json", "Machine-readable JSON output."],
+        ["-v, --verbose", "Show last credit-standing refresh diagnostic when unavailable."],
         OPT_HOME,
       ]),
     ),

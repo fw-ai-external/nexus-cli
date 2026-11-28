@@ -1,4 +1,7 @@
-import { isHarnessEnabled } from "../../config/global-config.mjs";
+import { existsSync } from "node:fs";
+import path from "node:path";
+
+import { isHarnessEnabled, readGlobalConfig } from "../../config/global-config.mjs";
 import { dropRetiredModelId, fullFireworksResourceId, isRetiredModelId } from "../../fireworks/model-id.mjs";
 import { refreshModelsDevFireworksRegistry } from "../../fireworks/models-dev-registry.mjs";
 import { HARNESS } from "../../harness/id.mjs";
@@ -15,6 +18,8 @@ import {
   withoutModelsDevDuplicates,
   writeOpencodeConfig,
 } from "./core.mjs";
+import { opencodePluginDir, refreshOpencodePluginIfStale } from "./nexus-plugin.mjs";
+import { CONFIG_HINT_FILE, opencodeConfigPathFor, readConfigFile } from "./nexus-plugin/ultrafast.mjs";
 import { mirrorOpencodeV2Providers } from "./providers-v2.mjs";
 
 /**
@@ -181,4 +186,67 @@ export async function migrateOpencodePickerDuplicatesOnUpgrade(home) {
     provider: { ...config.provider, [OPENCODE_FIREWORKS_PROVIDER_ID]: { ...provider, models } },
   });
   return true;
+}
+
+/**
+ * Refresh the Nexus plugin folders of Fireworks-routed OpenCode configs when
+ * this release ships different plugin files (e.g. the Ultra-fast banner), so
+ * an upgrade alone brings them in. Covers the default config and every
+ * `on --config-path` config Nexus recorded; each folder is refreshed for the
+ * config its hint names, so it keeps its key source.
+ * @param {string} home
+ * @returns {Promise<boolean>} true when a plugin folder was updated
+ */
+export async function migrateOpencodePluginOnUpgrade(home) {
+  if (!home) {
+    return false;
+  }
+  const recorded = ((await readGlobalConfig(home)).harnesses[HARNESS.OPENCODE]?.customPaths ?? [])
+    .map((overrides) => overrides?.configPath)
+    .filter((value) => typeof value === "string" && value);
+  const candidates = [
+    ...(await isHarnessEnabled(home, HARNESS.OPENCODE) ? [opencodeConfigPath(home)] : []),
+    ...recorded,
+  ];
+  let refreshed = false;
+  const unreadable = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const dir = opencodePluginDir(candidate);
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const hinted = await opencodeConfigPathFor(dir);
+    // No hint is an install from before hints: refresh it for its own config.
+    // A hint that's there but unreadable (not a small regular file, or bad
+    // JSON) can't say which config it served, so say so instead of guessing.
+    if (!hinted && existsSync(path.join(dir, CONFIG_HINT_FILE))) {
+      unreadable.push(path.join(dir, CONFIG_HINT_FILE));
+      continue;
+    }
+    const configPath = hinted ?? candidate;
+    // The same bounded, non-blocking reader the plugin uses: a recorded
+    // config (possibly in a project folder) that became a FIFO, a device or
+    // a huge file can't hang or flood the upgrade. Gone: nothing to refresh.
+    // Not a small regular file: reported, as for a hint.
+    if (!existsSync(configPath)) continue;
+    let raw = "";
+    try {
+      raw = await readConfigFile(configPath);
+    } catch {
+      unreadable.push(configPath);
+      continue;
+    }
+    if (!raw.trim()) continue;
+    let status = "";
+    try {
+      status = opencodeProviderStatus(JSON.parse(raw));
+    } catch {
+      continue; // bad JSON is the user's to fix; the others still refresh
+    }
+    if (status !== "fireworks") continue;
+    if (await refreshOpencodePluginIfStale(configPath)) refreshed = true;
+  }
+  // After the others refreshed: the upgrade's failure note asks for `on`.
+  if (unreadable.length) throw new Error(`can't read ${unreadable.join(", ")}`);
+  return refreshed;
 }

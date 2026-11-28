@@ -58,7 +58,10 @@ import {
   withFireconnectModelPicker,
 } from "./settings-model-picker.mjs";
 import { fireworksModelDisplayFields } from "./picker-labels.mjs";
+import { claudeFireworksKeyFrom, isNexusApiKeyHelper } from "./env-key.mjs";
 import { activeAccountResidency, fireworksInferenceUrl, isFireworksInferenceUrl } from "../../fireworks/residency.mjs";
+
+export { claudeFireworksKeyFrom, isNexusApiKeyHelper };
 
 export const DEFAULT_DATA_DIR = ".nexus/claude";
 export const USER_SETTINGS_RELATIVE_PATH = ".claude/settings.json";
@@ -379,13 +382,6 @@ export async function restoreSettingsSnapshotBackup({ settingsPath, backupPath, 
   return true;
 }
 
-export function claudeFireworksKeyFrom({ env = {} } = {}) {
-  return fireworksKeyOrEmpty(env.ANTHROPIC_API_KEY)
-    || fireworksKeyOrEmpty(env.ANTHROPIC_AUTH_TOKEN)
-    // Direct mode stores the key in the X-Fireworks-Api-Key custom header.
-    || fireworksKeyOrEmpty(fireworksKeyFromCustomHeaders(env.ANTHROPIC_CUSTOM_HEADERS));
-}
-
 export function applyTopLevelBackup(settings, topLevelBackup) {
   const next = { ...settings };
   if (!topLevelBackup?.values) {
@@ -408,23 +404,6 @@ export function clearFireworksTopLevelWithoutBackup(settings) {
   }
   ({ settings: next } = stripFireconnectModelPicker(next));
   return next;
-}
-
-/**
- * Whether `helper` is Nexus's own apiKeyHelper — the one recorded at `on`, or
- * a `nexus`/`fireconnect` `key export` command — rather than the user's.
- * @param {unknown} helper
- * @param {{ managedApiKeyHelper?: string }} [state]
- */
-export function isNexusApiKeyHelper(helper, state = {}) {
-  if (typeof helper !== "string" || !helper) {
-    return false;
-  }
-  if (state.managedApiKeyHelper && helper === state.managedApiKeyHelper) {
-    return true;
-  }
-  return /(?:^|[/\\])(?:fireconnect|nexus)(?:\.mjs|\.cmd)?['"]?(?:\s|$)/.test(helper)
-    && /(?:^|\s)key\s+export(?:\s|$)/.test(helper);
 }
 
 /**

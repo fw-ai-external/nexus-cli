@@ -53,16 +53,15 @@ function fireworksKeyOrEmpty(value) {
  */
 export function fireworksKeyFromEnv(env) {
   if (!env || typeof env !== "object") return "";
-  const direct = fireworksKeyOrEmpty(env.ANTHROPIC_API_KEY) || fireworksKeyOrEmpty(env.ANTHROPIC_AUTH_TOKEN);
-  if (direct) return direct;
   const headers = typeof env.ANTHROPIC_CUSTOM_HEADERS === "string" ? env.ANTHROPIC_CUSTOM_HEADERS : "";
   for (const line of headers.split(/\r?\n/)) {
     const colon = line.indexOf(":");
     if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === FIREWORKS_KEY_HEADER) {
-      return fireworksKeyOrEmpty(line.slice(colon + 1));
+      const fromHeader = fireworksKeyOrEmpty(line.slice(colon + 1));
+      if (fromHeader) return fromHeader;
     }
   }
-  return "";
+  return fireworksKeyOrEmpty(env.ANTHROPIC_API_KEY) || fireworksKeyOrEmpty(env.ANTHROPIC_AUTH_TOKEN);
 }
 
 /**

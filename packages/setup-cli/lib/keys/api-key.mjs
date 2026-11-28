@@ -22,6 +22,7 @@ import { cannotStoreKeyMessage, keyStorageSummaryLine } from "./storage-report.m
 import { syncBakedKeys } from "./sync.mjs";
 import { FIREPASS_KEY_UNSUPPORTED_MESSAGE, isFirePassKey, isFireworksShapedKey } from "./key-type.mjs";
 import { apiKeyFingerprint, clearMintedKeyState, readMintedKeyState, writeMintedKeyState } from "./mint-api-key.mjs";
+import { clearCreditStandingCache } from "../fireworks/credit-standing.mjs";
 import { expireCatalogCache } from "../fireworks/serverless-catalog-cache.mjs";
 import { refreshServerlessCatalogCache } from "../fireworks/models.mjs";
 import { readSecret } from "../ui/read-secret.mjs";
@@ -336,8 +337,9 @@ export async function persistApiKeyToKeychain(home, apiKey, options = {}) {
     throw error;
   }
   if (keyChanged) {
-    // The model catalog belongs to the account the old key signed in to:
-    // refetch it for the new one, so the next harness `on` lists its models.
+    // The model catalog and credit standing cache belong to the account the old
+    // key signed in to: drop both so the next render/on reflects the new key.
+    clearCreditStandingCache(home);
     expireCatalogCache(home);
     await refreshCatalogCacheForHome(home, trimmed);
   }
@@ -393,8 +395,10 @@ export async function persistApiKeyFromFlag(home, apiKey, options = {}) {
 /**
  * Resolve stored config ref to a key value.
  * @param {string} stored
+ * @param {string} [home]
+ * @param {{ fresh?: boolean }} [options]
  */
-export async function resolveStoredApiKeyValue(stored, home) {
+export async function resolveStoredApiKeyValue(stored, home, { fresh = false } = {}) {
   if (!stored) {
     return "";
   }
@@ -403,10 +407,10 @@ export async function resolveStoredApiKeyValue(stored, home) {
   // the legacy ref still resolves (upgrade reconciliation will rewrite the
   // ref on the next migration pass).
   if (isEnvConfigRef(stored)) {
-    return tryReadKeychainSecret(home);
+    return tryReadKeychainSecret(home, { fresh });
   }
   if (isKeychainConfigRef(stored)) {
-    return tryReadKeychainSecret(home);
+    return tryReadKeychainSecret(home, { fresh });
   }
   if (isLegacyLiteralConfigRef(stored) && isFireworksShapedKey(stored)) {
     return stored.trim();
@@ -429,12 +433,13 @@ export async function resolveStoredApiKeyValue(stored, home) {
  * only key entry, and env-injected keys are ignored.
  * `resolveFireworksApiKeyValue` returns just the value; callers that need to
  * tell the user which key is in effect use `.source` here.
- * @param {{ apiKey?: string, home?: string }} args
+ * @param {{ apiKey?: string, home?: string, fresh?: boolean }} args
  * @returns {Promise<FireworksKeyResolution>}
  */
 export async function resolveFireworksKeyWithSource({
   apiKey = "",
   home = process.env.HOME ?? "",
+  fresh = false,
 }) {
   const flagKey = apiKey?.trim() ?? "";
   let config = null;
@@ -448,7 +453,7 @@ export async function resolveFireworksKeyWithSource({
   }
 
   if (config) {
-    const resolved = await resolveStoredApiKeyValue(config.apiKey, home);
+    const resolved = await resolveStoredApiKeyValue(config.apiKey, home, { fresh });
     if (resolved) {
       return { key: resolved, source: "stored" };
     }
@@ -489,13 +494,14 @@ export async function fireworksKeyPresent({
 }
 
 /**
- * @param {{ apiKey?: string, home?: string }} args
+ * @param {{ apiKey?: string, home?: string, fresh?: boolean }} args
  */
 export async function resolveFireworksApiKeyValue({
   apiKey = "",
   home = process.env.HOME ?? "",
+  fresh = false,
 }) {
-  return (await resolveFireworksKeyWithSource({ apiKey, home })).key;
+  return (await resolveFireworksKeyWithSource({ apiKey, home, fresh })).key;
 }
 
 /**
@@ -550,10 +556,11 @@ export async function promptForFireworksApiKey(home, options = {}) {
  * key resolution so the keychain-read logic lives in one place. A leftover
  * Fire Pass key reads as missing, so callers fall through to `login`.
  * @param {string} home
+ * @param {{ fresh?: boolean }} [options]
  * @returns {Promise<string>}
  */
-export async function tryReadKeychainSecret(home) {
-  const secret = (await getSecret(home))?.trim() ?? "";
+export async function tryReadKeychainSecret(home, { fresh = false } = {}) {
+  const secret = (await getSecret(home, { fresh }))?.trim() ?? "";
   const error = getLastSecretReadError();
   if (!secret && error instanceof MacKeychainAccessError) throw error;
   return isFirePassKey(secret) ? "" : secret;

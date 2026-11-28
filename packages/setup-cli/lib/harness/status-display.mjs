@@ -30,10 +30,6 @@ const AUTH_MODE_LABELS = {
   missing: "missing",
 };
 
-export function formatHarnessTitle(harnessId) {
-  return bold(harnessId);
-}
-
 /** Provider is the transport/account boundary (fireworks, azure, custom, default, none). */
 export function formatProvider(provider) {
   if (provider === "fireworks") {
@@ -45,7 +41,7 @@ export function formatProvider(provider) {
   return provider ?? "(unset)";
 }
 
-export function harnessLabel(harnessId) {
+function harnessLabel(harnessId) {
   return HARNESS_LABELS[harnessId] ?? harnessId;
 }
 
@@ -157,10 +153,6 @@ export function printStructuredHarnessStatus(harnessId, {
   printHarnessStatus(harnessLabel(harnessId), fields, sections);
 }
 
-export function printHarnessTitle(title) {
-  console.log(formatHarnessTitle(title));
-}
-
 export function printField(label, value) {
   console.log(`${label}: ${value}`);
 }
@@ -173,7 +165,7 @@ export function printSectionHeader(title) {
   console.log(bold(`${title}:`));
 }
 
-export function printMappingRow(slot, value, { dimValue = false, detail = "" } = {}) {
+function printMappingRow(slot, value, { dimValue = false, detail = "" } = {}) {
   const display = value ?? "(unset)";
   const formatted = dimValue ? dim(display) : display;
   const suffix = detail ? `  ${dim(detail)}` : "";
@@ -184,37 +176,25 @@ export function formatOnOff(enabled) {
   return enabled ? "on" : dim("off");
 }
 
-export function printMutedNote(text) {
-  console.log(muted(text));
-}
-
 /**
- * @typedef {{ label: string, value?: string, bool?: boolean }} StatusField
+ * @typedef {{ label: string, value: string }} StatusField
  * @typedef {{ slot: string, value?: string, dim?: boolean, detail?: string }} StatusMappingRow
- * @typedef {{ title: string, rows?: StatusMappingRow[], lines?: string[], muted?: boolean }} StatusSection
+ * @typedef {{ title: string, rows?: StatusMappingRow[], lines?: string[] }} StatusSection
  */
 
 /**
  * Data-driven harness status printer.
  * @param {string} title
  * @param {StatusField[]} fields
- * @param {StatusSection[]} [sections]
+ * @param {StatusSection[]} sections
  */
-export function printHarnessStatus(title, fields, sections = []) {
-  printHarnessTitle(title);
+function printHarnessStatus(title, fields, sections) {
+  console.log(bold(title));
   for (const field of fields) {
-    if (field.bool !== undefined) {
-      printBoolField(field.label, field.bool);
-    } else {
-      printField(field.label, field.value ?? "(unset)");
-    }
+    printField(field.label, field.value ?? "(unset)");
   }
   for (const section of sections) {
     console.log("");
-    if (section.muted && section.lines?.length === 1) {
-      printMutedNote(section.lines[0]);
-      continue;
-    }
     printSectionHeader(section.title);
     for (const row of section.rows ?? []) {
       printMappingRow(row.slot, row.value, { dimValue: row.dim, detail: row.detail });
